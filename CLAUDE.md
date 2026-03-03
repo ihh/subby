@@ -31,8 +31,8 @@ paper/            # Manuscript LaTeX source
 ## Key files
 
 - `Model.md` — detailed model specification (featurizations, architecture, loss)
-- `Holmes_Rubin_2002.tex` — reference for eigensubstitution accumulation algorithm
-- `toy_felsenstein_pruning.py` — prototype JAX implementation of Felsenstein pruning
+- `src/phylo/references/Holmes_Rubin_2002.tex` — reference for eigensubstitution accumulation algorithm
+- `scripts/toy_felsenstein_pruning.py` — prototype JAX implementation of Felsenstein pruning
 - `PLAN.md` — implementation, evaluation, and publication plan
 
 ## Architecture
