@@ -11,7 +11,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
-from ssmrecscan import ssm_recursive_scan, ssm_scan
+from .ssmrecscan import ssm_recursive_scan, ssm_scan
 
 def inverse_softplus(x):
     return x + jnp.log(1 - jnp.exp(-x))
