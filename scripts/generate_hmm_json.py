@@ -34,6 +34,7 @@ def make_transitions(state_id, targets):
 
     Each target is (dest_state, transition_param_name).
     Weight = transition_param * emission_param(label | state).
+    Output label = annotation label for this state (strand prefix stripped).
     """
     trans = []
     base = state_id.lstrip("fr")  # strip strand prefix for emission param naming
@@ -42,6 +43,7 @@ def make_transitions(state_id, targets):
             trans.append({
                 "to": dest,
                 "in": label,
+                "out": base,
                 "weight": {"*": [tparam, f"e_{base}_{label}"]},
             })
     return trans
