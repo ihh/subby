@@ -1,0 +1,8 @@
+The native Rust implementation shares its source with the WASM target.
+The crate is located at ../wasm/ — compile with native target for CLI use:
+
+    cd ../wasm && cargo build --release
+
+The WASM target uses:
+
+    cd ../wasm && cargo build --release --target wasm32-unknown-unknown --features wasm

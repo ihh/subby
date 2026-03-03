@@ -44,17 +44,27 @@
    - Implement mixture model posterior (SoftMax over components)
    - Comprehensive tests against known analytical results and brute-force enumeration
 
-2. **WebGPU implementation** (`src/phylo/webgpu/`)
-   - Compute shaders for the pruning recursion and eigensubstitution accumulation
-   - Vanilla JS wrapper providing the same `LogLike`, `Counts`, `RootProb` API
-   - Tests for numerical agreement with JAX implementation
+2. **Python oracle** (`src/phylo/oracle/`)
+   - Simple imperative Python implementation (numpy-only, explicit for-loops)
+   - Serves as the numerically trustworthy cross-language test oracle for WebGPU and WASM
+   - No vectorization, no einsum, no JAX — obviously correct at the expense of speed
+   - Golden test files generated from oracle outputs (`tests/test_phylo/golden/*.json`)
 
-3. **WASM fallback** (`src/phylo/wasm/`)
-   - Rust compiled to WASM, exposing the same API via wasm-bindgen
+3. **WebGPU implementation** (`src/phylo/webgpu/`) — *higher priority*
+   - WGSL compute shaders for the pruning recursion and eigensubstitution accumulation
+   - Vanilla JS wrapper (`PhyloGPU` class) providing the same `LogLike`, `Counts`, `RootProb` API
+   - Tree traversals dispatched one compute pass per branch step, all C columns parallel
+   - f32 precision with rescaling; tested against golden files at atol=1e-3
+   - Unified JS entry point (`createPhyloEngine()`) that feature-detects WebGPU
+
+4. **WASM fallback** (`src/phylo/wasm/`)
+   - Rust compiled to WASM via wasm-bindgen, exposing the same API
+   - Single crate, dual target: `cdylib` (WASM) + `rlib` (native Rust tests)
+   - f64 precision; tested against golden files at atol=1e-8
    - Fallback for browsers without WebGPU support
-   - JS wrapper unifying WebGPU and WASM behind a single interface
+   - `PhyloWASM` JS wrapper class mirroring `PhyloGPU` API, integrated into `createPhyloEngine()` fallback
 
-4. **Rust native** (`src/phylo/rust/`)
+5. **Rust native** (`src/phylo/rust/`)
    - Native Rust implementation for command-line preprocessing
    - Shared core with the WASM target (same crate, different compilation targets)
 
@@ -65,6 +75,8 @@
    - `[TRIPLETS]`: context-dependent triplet tokenization (previous/current/next non-gap nucleotide)
    - `[PHASE]`: gap-phase tokenization ({NUC, 0, 1, 2})
    - `[ANNOTATION]`: annotation label tokenization, root node as ungapped-unobserved
+
+Implement all four efficiently as a finite state transducer that consumes each row character-by-character and emits four different tokens at each position.
 
 2. **Feature extraction**: run `Counts`, `LogLike`, and/or `RootProb` for each tokenization on tiled MSA windows, concatenate feature vectors
 
@@ -92,7 +104,7 @@
    - Model weight loading from quantized ONNX or custom format
    - Tiled inference with overlap-and-stitch
 
-## 3. Dataset tiling
+## 3. Dataset tilling
 
 ### 3.1 Data source alternatives
 
