@@ -85,8 +85,8 @@ Implement all four efficiently as a finite state transducer that consumes each r
 ### 2.3 Model (`src/model/`)
 
 1. **Bidirectional Mamba tower** (JAX)
-   - Implement or adapt bidirectional Mamba with RmsNorm pre-normalization
-   - Reverse complement data augmentation
+   - Use existing bidirectional Mamba with RmsNorm pre-normalization
+   - Reverse complement to be handled by data augmentation during training (NOT baked into model)
    - Cross-attention layers for RNA-Seq integration
 
 2. **Track encoder** (JAX)
