@@ -124,3 +124,6 @@ target/
 # Node/WASM
 node_modules/
 pkg/
+
+# Built docs
+docs/_site/
