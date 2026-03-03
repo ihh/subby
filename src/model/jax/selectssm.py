@@ -261,6 +261,7 @@ class BidirectionalMamba(nn.Module):
     dt_rank: Union[int, str] = 'auto'
 
     # For an RC-equivariant model, set all of {complement,tie_in_proj,tie_gate,concatenate_fwd_rev} to True
+    # At the moment we do not want that for the subby project - we will handle RC-equivariance by data augmentation
     complement: bool = False
     tie_in_proj: bool = False
     tie_gate: bool = False
