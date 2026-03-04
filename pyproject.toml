@@ -10,6 +10,9 @@ jax = ["jax[cpu]"]
 [project.scripts]
 subby = "subby.__main__:main"
 
+[tool.setuptools.packages.find]
+include = ["subby*"]
+
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
