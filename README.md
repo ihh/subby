@@ -1,4 +1,5 @@
 # subby
+[![Tests](https://github.com/ihh/subby/actions/workflows/test.yml/badge.svg)](https://github.com/ihh/subby/actions/workflows/test.yml)
 
 Phylogenetic sufficient statistics via eigensubstitution accumulation.
 

@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install ".[jax]" pytest scipy
+      - run: pytest --ignore=tests/test_pruning.py
+        env:
+          JAX_ENABLE_X64: "1"
