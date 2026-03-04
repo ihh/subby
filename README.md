@@ -25,6 +25,8 @@ pip install -e ".[jax]"   # with JAX backend
 
 ## Quick start
 
+### Python (JAX)
+
 ```python
 import jax.numpy as jnp
 from subby.jax import LogLike, Counts
@@ -42,12 +44,50 @@ log_likelihoods = LogLike(alignment, tree, model)
 counts = Counts(alignment, tree, model)
 ```
 
+### JavaScript (browser)
+
+```javascript
+import { createPhyloEngine } from './subby/webgpu/index.js';
+
+// Auto-detects WebGPU; falls back to WASM
+const { engine, backend } = await createPhyloEngine({
+  shaderBasePath: './subby/webgpu/shaders/',
+  wasmUrl: './phylo_wasm_bg.wasm',
+});
+
+// Jukes-Cantor model (4 DNA states)
+const pi = new Float32Array([0.25, 0.25, 0.25, 0.25]);
+const eigenvalues = new Float32Array([0, -1.333, -1.333, -1.333]);
+const eigenvectors = new Float32Array([
+  0.5,  0.5,  0.5,  0.5,
+  0.5, -0.5,  0.5, -0.5,
+  0.5,  0.5, -0.5, -0.5,
+  0.5, -0.5, -0.5,  0.5,
+]);
+
+// Tree: 5 nodes, parentIndex[0] = -1 for root
+const parentIndex = new Int32Array([-1, 0, 0, 1, 1]);
+const distances = new Float32Array([0.0, 0.1, 0.2, 0.15, 0.25]);
+
+// Alignment: 5 nodes × 2 columns, row-major
+const alignment = new Int32Array([0,1, 2,3, 1,0, 3,2, 0,1]);
+
+const logLike = await engine.LogLike(
+  alignment, parentIndex, distances, eigenvalues, eigenvectors, pi
+);
+const counts = await engine.Counts(
+  alignment, parentIndex, distances, eigenvalues, eigenvectors, pi
+);
+
+engine.destroy();
+```
+
 ## Repository layout
 
 ```
 subby/              Phylogenetic sufficient statistics library
-  jax/              JAX implementation (training)
-  oracle/           Pure-Python reference implementation (testing)
+  jax/              JAX implementation
+  oracle/           Pure-Python reference implementation
   webgpu/           WebGPU compute shaders + JS wrapper (browser)
   wasm/             Rust crate compiled to WASM (browser fallback)
   rust/             Native Rust target (preprocessing)
