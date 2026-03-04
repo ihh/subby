@@ -88,7 +88,7 @@ class TestEigensubstitution:
         alignment = jnp.array([[-1], [0], [-1]], dtype=jnp.int32)
 
         model = jukes_cantor_model(A)
-        counts = Counts(alignment, tree, model)  # (A, A, 1)
+        counts = Counts(alignment, tree, model, branch_mask=None)  # (A, A, 1)
 
         # Brute-force for single branch of length t
         subRate = jnp.ones((A, A)) / (A - 1)

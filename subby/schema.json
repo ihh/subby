@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ihh/subby/blob/main/subby/schema.json",
+  "title": "subby input",
+  "description": "Input specification for subby phylogenetic sufficient statistics computation.",
+  "type": "object",
+  "required": ["model", "tree", "alignment"],
+  "properties": {
+    "model": {
+      "description": "Substitution model specification.",
+      "oneOf": [
+        {
+          "description": "Rate matrix model.",
+          "type": "object",
+          "required": ["rootProb", "subRate"],
+          "properties": {
+            "alphabet": {
+              "description": "State labels (e.g. [\"A\",\"C\",\"G\",\"T\"]). Required if alignment uses characters.",
+              "type": "array",
+              "items": { "type": "string" },
+              "minItems": 2
+            },
+            "rootProb": {
+              "description": "Root/equilibrium state distribution, length A.",
+              "type": "array",
+              "items": { "type": "number" },
+              "minItems": 2
+            },
+            "subRate": {
+              "description": "A x A substitution rate matrix. Rows sum to 0.",
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": { "type": "number" }
+              },
+              "minItems": 2
+            },
+            "reversible": {
+              "description": "true = reversible (eigh), false = irreversible (eig), null/omitted = auto-detect.",
+              "type": ["boolean", "null"]
+            }
+          }
+        },
+        {
+          "description": "Named model: Jukes-Cantor.",
+          "type": "object",
+          "required": ["name", "alphabetSize"],
+          "properties": {
+            "name": { "const": "jukes-cantor" },
+            "alphabetSize": { "type": "integer", "minimum": 2 },
+            "alphabet": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        {
+          "description": "Named model: HKY85.",
+          "type": "object",
+          "required": ["name", "kappa", "pi"],
+          "properties": {
+            "name": { "const": "hky85" },
+            "kappa": { "type": "number" },
+            "pi": {
+              "type": "array",
+              "items": { "type": "number" },
+              "minItems": 4,
+              "maxItems": 4
+            },
+            "alphabet": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        {
+          "description": "Named model: F81.",
+          "type": "object",
+          "required": ["name", "pi"],
+          "properties": {
+            "name": { "const": "f81" },
+            "pi": {
+              "type": "array",
+              "items": { "type": "number" },
+              "minItems": 2
+            },
+            "alphabet": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      ]
+    },
+    "tree": {
+      "description": "Phylogenetic tree in preorder.",
+      "type": "object",
+      "required": ["parentIndex", "distanceToParent"],
+      "properties": {
+        "parentIndex": {
+          "description": "Parent node index for each node. Root has -1. Preorder: parentIndex[i] < i.",
+          "type": "array",
+          "items": { "type": "integer" },
+          "minItems": 1
+        },
+        "distanceToParent": {
+          "description": "Branch length from each node to its parent. Root value is ignored.",
+          "type": "array",
+          "items": { "type": "number" },
+          "minItems": 1
+        }
+      }
+    },
+    "alignment": {
+      "description": "Multiple sequence alignment. One row per tree node. Either integer tokens (0..A-1, A=ungapped-unknown, A+1=gap) or character strings/matrix using alphabet labels ('-' for gap).",
+      "oneOf": [
+        {
+          "description": "Integer token matrix (R x C).",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" }
+          }
+        },
+        {
+          "description": "Character string sequences.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        {
+          "description": "Character matrix (R x C).",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "compute": {
+      "description": "Which outputs to compute. Default: all.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["logLike", "counts", "rootProb"]
+      },
+      "default": ["logLike", "counts", "rootProb"]
+    }
+  }
+}

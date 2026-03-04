@@ -7,6 +7,9 @@ dependencies = ["numpy"]
 [project.optional-dependencies]
 jax = ["jax[cpu]"]
 
+[project.scripts]
+subby = "subby.__main__:main"
+
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
