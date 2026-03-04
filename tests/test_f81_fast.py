@@ -6,13 +6,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.phylo.jax.types import Tree
-from src.phylo.jax.models import jukes_cantor_model, f81_model
-from src.phylo.jax import Counts
+from subby.jax.types import Tree
+from subby.jax.models import jukes_cantor_model, f81_model
+from subby.jax import Counts
 
 
 def _make_7node_tree():

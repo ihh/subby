@@ -6,13 +6,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.phylo.jax import LogLike, Counts, RootProb, MixturePosterior
-from src.phylo.jax.types import Tree, RateModel
-from src.phylo.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model
+from subby.jax import LogLike, Counts, RootProb, MixturePosterior
+from subby.jax.types import Tree, RateModel
+from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model
 
 
 def _make_medium_tree(n_leaves=10, key=None):

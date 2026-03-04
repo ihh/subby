@@ -6,17 +6,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.phylo.jax.types import Tree, DiagModel
-from src.phylo.jax.diagonalize import compute_sub_matrices
-from src.phylo.jax.pruning import upward_pass
-from src.phylo.jax.models import hky85_diag, jukes_cantor_model
+from subby.jax.types import Tree, DiagModel
+from subby.jax.diagonalize import compute_sub_matrices
+from subby.jax.pruning import upward_pass
+from subby.jax.models import hky85_diag, jukes_cantor_model
 
 # Import the toy implementation for reference comparison
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import toy_felsenstein_pruning as toy
 
 

@@ -5,13 +5,11 @@ os.environ['JAX_ENABLE_X64'] = '1'
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.phylo.jax.models import hky85_diag, jukes_cantor_model, f81_model
-from src.phylo.jax.diagonalize import reconstruct_rate_matrix, compute_sub_matrices
-from src.phylo.jax.types import Tree
+from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model
+from subby.jax.diagonalize import reconstruct_rate_matrix, compute_sub_matrices
+from subby.jax.types import Tree
 
 
 class TestHKY85:

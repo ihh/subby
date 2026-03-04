@@ -5,11 +5,9 @@ os.environ['JAX_ENABLE_X64'] = '1'
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.phylo.jax.components import compute_branch_mask
+from subby.jax.components import compute_branch_mask
 
 
 class TestBranchMask:

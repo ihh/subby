@@ -3,7 +3,7 @@
 ## Repository layout
 
 ```
-src/phylo/
+subby/
 ├── jax/                    # JAX training implementation (f64, GPU-accelerated)
 │   ├── __init__.py         # Public API: LogLike, Counts, RootProb, MixturePosterior
 │   ├── types.py            # Tree, DiagModel, RateModel named tuples
@@ -26,26 +26,8 @@ src/phylo/
 │   ├── phylo_gpu.js        # PhyloGPU class — WebGPU backend
 │   ├── phylo_wasm.js       # PhyloWASM class — WASM fallback backend
 │   └── shaders/            # WGSL compute shaders (one per kernel)
-│       ├── token_to_likelihood.wgsl
-│       ├── compute_sub_matrices.wgsl
-│       ├── upward_step.wgsl
-│       ├── downward_step.wgsl
-│       ├── compute_J.wgsl
-│       ├── eigenbasis_project.wgsl
-│       ├── accumulate_C.wgsl
-│       ├── back_transform.wgsl
-│       ├── f81_fast.wgsl
-│       └── mixture_posterior.wgsl
 │
 ├── wasm/                   # Rust → WASM crate (f64)
-│   ├── Cargo.toml
-│   └── src/
-│       ├── lib.rs          # Public API + wasm-bindgen entry points
-│       ├── tree.rs          ├── model.rs
-│       ├── token.rs         ├── sub_matrices.rs
-│       ├── pruning.rs       ├── outside.rs
-│       ├── eigensub.rs      ├── f81_fast.rs
-│       ├── mixture.rs       └── branch_mask.rs
 │
 └── rust/                   # Symlink/pointer to wasm/ for native compilation
     └── README
@@ -132,35 +114,23 @@ U, D, logNormU, logNormD, logLike ──→ f81_counts ──→ counts
 
 - One WGSL shader per algorithmic kernel
 - Tree traversals dispatch one compute pass per branch step (R-1 sequential passes), all C columns parallel within each pass
-- WebGPU guarantees sequential execution of passes within a command buffer
-- Buffer layout: all arrays flattened to 1D `storage` buffers, row-major
 - f32 precision with rescaling; test tolerance atol=1e-3
-- `computeBranchMask` runs on CPU (simple boolean logic, small output)
 
 ### Rust/WASM
 
 - Single crate, dual target: `cdylib` (WASM via wasm-bindgen) + `rlib` (native)
-- Feature flag `wasm` gates wasm-bindgen dependencies
 - All internal computation in f64
-- Flat typed arrays across the wasm-bindgen boundary — no serde
 - Same algorithm as oracle, but in idiomatic Rust
-
-### Unified JS wrapper
-
-`createPhyloEngine()` in `index.js`:
-1. Try WebGPU (`navigator.gpu`)
-2. Fall back to WASM
-3. Both return objects with the same async API: `LogLike()`, `Counts()`, `RootProb()`, `MixturePosterior()`
 
 ## Testing architecture
 
 ```
                     ┌─────────────┐
-                    │   JAX impl  │ ◄── 57 unit tests
+                    │   JAX impl  │ ◄── unit tests
                     └──────┬──────┘
                            │ atol=1e-8
                     ┌──────▼──────┐
-                    │   Oracle    │ ◄── 99 comparison tests
+                    │   Oracle    │ ◄── comparison tests
                     └──────┬──────┘
                            │ generates
                     ┌──────▼──────┐
@@ -171,11 +141,3 @@ U, D, logNormU, logNormD, logLike ──→ f81_counts ──→ counts
                  │ WebGPU │ │  WASM  │
                  └────────┘ └────────┘
 ```
-
-Golden test cases:
-- `5node_jc4` — basic Jukes-Cantor, 4 states
-- `7node_hky85_4` — HKY85, 4 states
-- `7node_jc64` — Jukes-Cantor, 64 states (triplet tokenization)
-- `7node_jc4_mixed_gaps` — gap handling
-- `7node_jc4_all_gaps` — all-gap column edge case
-- `7node_mixture_jc4` — mixture of 3 rate categories

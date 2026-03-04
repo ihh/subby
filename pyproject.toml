@@ -1,0 +1,12 @@
+[project]
+name = "subby"
+version = "0.1.0"
+description = "Phylogenetic sufficient statistics via eigensubstitution accumulation"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+jax = ["jax[cpu]"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"

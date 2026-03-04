@@ -1,6 +1,6 @@
 # subby Phylogenetic Sufficient Statistics Library
 
-Phylogenetically-informed gene annotation using the Holmes & Rubin (2002) eigensubstitution-accumulation algorithm, with implementations in JAX, Python, WebGPU, and Rust/WASM.
+Phylogenetic sufficient statistics via the Holmes & Rubin (2002) eigensubstitution-accumulation algorithm, with implementations in JAX, Python, WebGPU, and Rust/WASM.
 
 ## What is this?
 
@@ -26,7 +26,7 @@ The core algorithm is the **eigensubstitution accumulation** method of [Holmes &
 
 ```python
 import numpy as np
-from src.phylo.oracle import LogLike, Counts, RootProb, jukes_cantor_model
+from subby.oracle import LogLike, Counts, RootProb, jukes_cantor_model
 
 # Define a 5-node binary tree (preorder parent indices)
 tree = {

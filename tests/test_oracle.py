@@ -10,16 +10,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.phylo.jax import LogLike as jax_LogLike
-from src.phylo.jax import Counts as jax_Counts
-from src.phylo.jax import RootProb as jax_RootProb
-from src.phylo.jax import MixturePosterior as jax_MixturePosterior
-from src.phylo.jax.types import Tree as JaxTree
-from src.phylo.jax.models import (
+from subby.jax import LogLike as jax_LogLike
+from subby.jax import Counts as jax_Counts
+from subby.jax import RootProb as jax_RootProb
+from subby.jax import MixturePosterior as jax_MixturePosterior
+from subby.jax.types import Tree as JaxTree
+from subby.jax.models import (
     hky85_diag as jax_hky85_diag,
     jukes_cantor_model as jax_jukes_cantor_model,
     f81_model as jax_f81_model,
@@ -28,24 +26,24 @@ from src.phylo.jax.models import (
     irrev_model_from_rate_matrix as jax_irrev_model_from_rate_matrix,
     model_from_rate_matrix as jax_model_from_rate_matrix,
 )
-from src.phylo.jax.diagonalize import check_detailed_balance as jax_check_detailed_balance
-from src.phylo.jax.diagonalize import compute_sub_matrices as jax_compute_sub_matrices
-from src.phylo.jax.pruning import upward_pass as jax_upward_pass
-from src.phylo.jax.outside import downward_pass as jax_downward_pass
-from src.phylo.jax.eigensub import (
+from subby.jax.diagonalize import check_detailed_balance as jax_check_detailed_balance
+from subby.jax.diagonalize import compute_sub_matrices as jax_compute_sub_matrices
+from subby.jax.pruning import upward_pass as jax_upward_pass
+from subby.jax.outside import downward_pass as jax_downward_pass
+from subby.jax.eigensub import (
     compute_J as jax_compute_J,
     eigenbasis_project as jax_eigenbasis_project,
     accumulate_C as jax_accumulate_C,
     back_transform as jax_back_transform,
 )
-from src.phylo.jax._utils import (
+from subby.jax._utils import (
     token_to_likelihood as jax_token_to_likelihood,
     children_of as jax_children_of,
 )
-from src.phylo.jax.f81_fast import f81_counts as jax_f81_counts
-from src.phylo.jax.mixture import mixture_posterior as jax_mixture_posterior
+from subby.jax.f81_fast import f81_counts as jax_f81_counts
+from subby.jax.mixture import mixture_posterior as jax_mixture_posterior
 
-import src.phylo.oracle as oracle
+import subby.oracle as oracle
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +445,7 @@ class TestBranchMask:
         parentIndex, _ = _make_tree(R, seed=100)
         alignment = _make_alignment(R, C, A, seed=101)
 
-        from src.phylo.jax.components import compute_branch_mask as jax_branch_mask
+        from subby.jax.components import compute_branch_mask as jax_branch_mask
         jax_bm = np.array(jax_branch_mask(jnp.array(alignment), jnp.array(parentIndex), A))
         ora_bm = oracle.compute_branch_mask(alignment, parentIndex, A)
 
@@ -850,28 +848,28 @@ class TestTriStateReversibility:
     def test_model_from_rate_matrix_auto_reversible(self):
         """model_from_rate_matrix with reversible=None auto-detects reversible."""
         R_mat, pi = self._make_reversible_rate_matrix()
-        from src.phylo.jax.types import DiagModel
+        from subby.jax.types import DiagModel
         model = jax_model_from_rate_matrix(jnp.array(R_mat), jnp.array(pi), reversible=None)
         assert isinstance(model, DiagModel)
 
     def test_model_from_rate_matrix_auto_irreversible(self):
         """model_from_rate_matrix with reversible=None auto-detects irreversible."""
         R_mat, pi = _make_irrev_rate_matrix(4, seed=303)
-        from src.phylo.jax.types import IrrevDiagModel
+        from subby.jax.types import IrrevDiagModel
         model = jax_model_from_rate_matrix(jnp.array(R_mat), jnp.array(pi), reversible=None)
         assert isinstance(model, IrrevDiagModel)
 
     def test_model_from_rate_matrix_force_reversible(self):
         """model_from_rate_matrix with reversible=True forces DiagModel."""
         R_mat, pi = self._make_reversible_rate_matrix()
-        from src.phylo.jax.types import DiagModel
+        from subby.jax.types import DiagModel
         model = jax_model_from_rate_matrix(jnp.array(R_mat), jnp.array(pi), reversible=True)
         assert isinstance(model, DiagModel)
 
     def test_model_from_rate_matrix_force_irreversible(self):
         """model_from_rate_matrix with reversible=False forces IrrevDiagModel."""
         R_mat, pi = self._make_reversible_rate_matrix()
-        from src.phylo.jax.types import IrrevDiagModel
+        from subby.jax.types import IrrevDiagModel
         model = jax_model_from_rate_matrix(jnp.array(R_mat), jnp.array(pi), reversible=False)
         assert isinstance(model, IrrevDiagModel)
 

@@ -43,8 +43,6 @@ NAV = [
         ("Oracle", "api/oracle.md"),
         ("WebGPU", "api/webgpu.md"),
         ("Rust/WASM", "api/wasm.md"),
-        ("RNA-Seq", "api/rnaseq.md"),
-        ("Model", "api/model.md"),
     ]),
 ]
 

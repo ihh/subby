@@ -18,16 +18,14 @@ Usage:
 
 import json
 import os
-import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from src.phylo.oracle import oracle
+from subby.oracle import oracle
 
 
 OUTPUT_DIR = os.path.join(
-    os.path.dirname(__file__), '..', 'tests', 'test_phylo', 'golden'
+    os.path.dirname(__file__), '..', 'tests', 'golden'
 )
 
 

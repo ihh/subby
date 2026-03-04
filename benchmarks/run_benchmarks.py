@@ -157,9 +157,9 @@ def _make_irrev_rate_matrix(A, seed=42):
 def _get_jax_backend():
     """Return (LogLike, Counts, make_tree_fn, make_model_fns) for JAX."""
     import jax.numpy as jnp
-    from src.phylo.jax import LogLike, Counts
-    from src.phylo.jax.types import Tree
-    from src.phylo.jax.models import jukes_cantor_model, irrev_model_from_rate_matrix
+    from subby.jax import LogLike, Counts
+    from subby.jax.types import Tree
+    from subby.jax.models import jukes_cantor_model, irrev_model_from_rate_matrix
 
     def make_tree_jax(parent_index, distances):
         return Tree(
@@ -181,9 +181,9 @@ def _get_jax_backend():
 
 def _get_oracle_backend():
     """Return (LogLike, Counts, make_tree_fn, make_model_fns) for oracle."""
-    from src.phylo.oracle import LogLike, Counts
-    from src.phylo.oracle import jukes_cantor_model as oracle_jc
-    from src.phylo.oracle import irrev_model_from_rate_matrix as oracle_irrev
+    from subby.oracle import LogLike, Counts
+    from subby.oracle import jukes_cantor_model as oracle_jc
+    from subby.oracle import irrev_model_from_rate_matrix as oracle_irrev
 
     def make_tree_oracle(parent_index, distances):
         return {

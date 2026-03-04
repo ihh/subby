@@ -1,0 +1,94 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{float}
+
+\title{Eigensubstitution Accumulation: Performance Benchmarks}
+\author{subby benchmark suite}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Methodology}
+
+We benchmark two functions from the phylogenetic sufficient-statistics library:
+\begin{itemize}
+  \item \texttt{LogLike()}: upward pass only (Felsenstein pruning), computing per-column log-likelihoods.
+  \item \texttt{Counts()}: full eigensubstitution pipeline (upward pass, downward pass, eigensubstitution accumulation, back-transform), computing expected substitution counts and dwell times.
+\end{itemize}
+
+Both functions are timed across a parameter grid:
+\begin{itemize}
+  \item Alphabet size $A \in \{4, 20, 64\}$
+  \item Alignment width $C \in \{100, 1000, 10000\}$ columns
+  \item Tree depth $R \in \{7, 15, 31\}$ nodes (balanced binary)
+\end{itemize}
+
+Input data are synthetic: Jukes--Cantor models with random balanced binary trees and random alignments with occasional gaps.
+For JAX backends, a warmup call is made before timing to allow JIT compilation.
+Each configuration is timed over multiple repetitions; we report mean $\pm$ standard deviation.
+
+\section{Hardware}
+
+\input{tables/machine_stats}
+
+\section{Results: LogLike()}
+
+\input{tables/loglike_includes}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{figures/scaling_C_LogLike.pdf}
+  \caption{\texttt{LogLike()} scaling by alignment width $C$, faceted by tree size $R$ (rows) and alphabet size $A$ (columns). Log-log scale.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{figures/scaling_A_LogLike.pdf}
+  \caption{\texttt{LogLike()} scaling by alphabet size $A$, faceted by tree size $R$ (rows) and alignment width $C$ (columns). Log-log scale.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{figures/scaling_R_LogLike.pdf}
+  \caption{\texttt{LogLike()} scaling by tree size $R$, faceted by alphabet size $A$ (rows) and alignment width $C$ (columns). Log-log scale.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{figures/backend_comparison_LogLike.pdf}
+  \caption{\texttt{LogLike()} time relative to JAX CPU, grouped by configuration.}
+\end{figure}
+
+\section{Results: Counts()}
+
+\input{tables/counts_includes}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{figures/scaling_C_Counts.pdf}
+  \caption{\texttt{Counts()} scaling by alignment width $C$, faceted by tree size $R$ (rows) and alphabet size $A$ (columns). Log-log scale.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{figures/scaling_A_Counts.pdf}
+  \caption{\texttt{Counts()} scaling by alphabet size $A$, faceted by tree size $R$ (rows) and alignment width $C$ (columns). Log-log scale.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{figures/scaling_R_Counts.pdf}
+  \caption{\texttt{Counts()} scaling by tree size $R$, faceted by alphabet size $A$ (rows) and alignment width $C$ (columns). Log-log scale.}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{figures/backend_comparison_Counts.pdf}
+  \caption{\texttt{Counts()} time relative to JAX CPU, grouped by configuration.}
+\end{figure}
+
+\end{document}

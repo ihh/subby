@@ -6,15 +6,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from src.phylo.jax.types import Tree
-from src.phylo.jax.diagonalize import compute_sub_matrices
-from src.phylo.jax.pruning import upward_pass
-from src.phylo.jax.outside import downward_pass
-from src.phylo.jax.models import jukes_cantor_model, hky85_diag
+from subby.jax.types import Tree
+from subby.jax.diagonalize import compute_sub_matrices
+from subby.jax.pruning import upward_pass
+from subby.jax.outside import downward_pass
+from subby.jax.models import jukes_cantor_model, hky85_diag
 
 
 def _make_simple_tree():
