@@ -45,6 +45,11 @@ export class PhyloGPU {
       'back_transform',
       'f81_fast',
       'mixture_posterior',
+      'compute_sub_matrices_complex',
+      'compute_J_complex',
+      'eigenbasis_project_complex',
+      'accumulate_C_complex',
+      'back_transform_complex',
     ];
 
     const shaders = {};
@@ -262,6 +267,174 @@ export class PhyloGPU {
   }
 
   /**
+   * Detect whether the 4th argument is a model object or positional eigenvalues.
+   * @returns {{ irrev: boolean, model: Object }|null} null if positional args
+   */
+  static _parseModelArg(arg4, arg5) {
+    if (arg4 && typeof arg4 === 'object' && arg4.pi !== undefined && arg5 === undefined) {
+      const irrev = arg4.eigenvalues_complex !== undefined;
+      return { irrev, model: arg4 };
+    }
+    return null;
+  }
+
+  /**
+   * Run compute_sub_matrices_complex shader (irreversible model).
+   * @returns {GPUBuffer} (R*A*A) f32 real output
+   */
+  _computeSubMatricesComplex(encoder, eigenvalsBuf, eigenvecsBuf, eigenvecsInvBuf, distancesBuf, R, A) {
+    const pipeline = this._getOrCreatePipeline('compute_sub_matrices_complex');
+    const params = this._createUniformBuffer(new Uint32Array([R, A, 0, 0]));
+    const outBuf = this._createStorageBuffer(R * A * A * 4);
+
+    const bindGroup = this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: eigenvalsBuf } },
+        { binding: 2, resource: { buffer: eigenvecsBuf } },
+        { binding: 3, resource: { buffer: eigenvecsInvBuf } },
+        { binding: 4, resource: { buffer: distancesBuf } },
+        { binding: 5, resource: { buffer: outBuf } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(R / 64));
+    pass.end();
+
+    return outBuf;
+  }
+
+  /**
+   * Eigensub counts pipeline for irreversible (complex) model.
+   */
+  async _eigensubCountsComplex(UData, DData, logNormUData, logNormDData,
+                                logLike, model, distances, R, C, A) {
+    // compute_J_complex
+    const eigenvalsBuf = this._createBuffer(new Float32Array(model.eigenvalues_complex));
+    const distBuf = this._createBuffer(new Float32Array(distances));
+    const JBuf = this._createStorageBuffer(2 * R * A * A * 4);
+
+    const encoder = this.device.createCommandEncoder();
+    {
+      const pipeline = this._getOrCreatePipeline('compute_J_complex');
+      const params = this._createUniformBuffer(new Uint32Array([R, A, 0, 0]));
+      const bg = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 1, resource: { buffer: eigenvalsBuf } },
+          { binding: 2, resource: { buffer: distBuf } },
+          { binding: 3, resource: { buffer: JBuf } },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(Math.ceil(R / 64));
+      pass.end();
+    }
+
+    // eigenbasis_project_complex
+    const UBuf = this._createBuffer(new Float32Array(UData));
+    const DBuf = this._createBuffer(new Float32Array(DData));
+    const eigenvecsBuf = this._createBuffer(new Float32Array(model.eigenvectors_complex));
+    const eigenvecsInvBuf = this._createBuffer(new Float32Array(model.eigenvectors_inv_complex));
+    const U_tildeBuf = this._createStorageBuffer(2 * R * C * A * 4);
+    const D_tildeBuf = this._createStorageBuffer(2 * R * C * A * 4);
+
+    {
+      const pipeline = this._getOrCreatePipeline('eigenbasis_project_complex');
+      const params = this._createUniformBuffer(new Uint32Array([R, C, A, 0]));
+      const bg = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 1, resource: { buffer: eigenvecsBuf } },
+          { binding: 2, resource: { buffer: eigenvecsInvBuf } },
+          { binding: 3, resource: { buffer: UBuf } },
+          { binding: 4, resource: { buffer: DBuf } },
+          { binding: 5, resource: { buffer: U_tildeBuf } },
+          { binding: 6, resource: { buffer: D_tildeBuf } },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(Math.ceil((R * C) / 64));
+      pass.end();
+    }
+
+    // accumulate_C_complex
+    const logNormUBuf = this._createBuffer(new Float32Array(logNormUData));
+    const logNormDBuf = this._createBuffer(new Float32Array(logNormDData));
+    const logLikeBuf = this._createBuffer(new Float32Array(logLike));
+    const C_eigenBuf = this._createStorageBuffer(2 * A * A * C * 4);
+
+    {
+      const pipeline = this._getOrCreatePipeline('accumulate_C_complex');
+      const params = this._createUniformBuffer(new Uint32Array([R, C, A, 0]));
+      const bg = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 1, resource: { buffer: D_tildeBuf } },
+          { binding: 2, resource: { buffer: U_tildeBuf } },
+          { binding: 3, resource: { buffer: JBuf } },
+          { binding: 4, resource: { buffer: logNormUBuf } },
+          { binding: 5, resource: { buffer: logNormDBuf } },
+          { binding: 6, resource: { buffer: logLikeBuf } },
+          { binding: 7, resource: { buffer: C_eigenBuf } },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(Math.ceil((A * A * C) / 64));
+      pass.end();
+    }
+
+    // back_transform_complex
+    const countsBuf = this._createStorageBuffer(A * A * C * 4);
+    {
+      const pipeline = this._getOrCreatePipeline('back_transform_complex');
+      const params = this._createUniformBuffer(new Uint32Array([C, A, 0, 0]));
+      const bg = this.device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 1, resource: { buffer: eigenvecsBuf } },
+          { binding: 2, resource: { buffer: eigenvecsInvBuf } },
+          { binding: 3, resource: { buffer: eigenvalsBuf } },
+          { binding: 4, resource: { buffer: C_eigenBuf } },
+          { binding: 5, resource: { buffer: countsBuf } },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(Math.ceil((A * A * C) / 64));
+      pass.end();
+    }
+
+    this.device.queue.submit([encoder.finish()]);
+    await this.device.queue.onSubmittedWorkDone();
+
+    const result = await this._readBuffer(countsBuf, A * A * C * 4);
+
+    for (const b of [eigenvalsBuf, distBuf, JBuf, UBuf, DBuf, eigenvecsBuf, eigenvecsInvBuf,
+                      U_tildeBuf, D_tildeBuf, logNormUBuf, logNormDBuf, logLikeBuf,
+                      C_eigenBuf, countsBuf]) {
+      b.destroy();
+    }
+
+    return result;
+  }
+
+  /**
    * Run the full upward pass (R-1 sequential dispatches).
    */
   _upwardPass(encoder, likelihoodBuf, logNormUBuf, subMatBuf, parentIndex, R, C, A) {
@@ -354,23 +527,20 @@ export class PhyloGPU {
   /**
    * Compute per-column log-likelihoods.
    *
-   * @param {Int32Array} alignment - (R*C) flat, row-major
-   * @param {Int32Array} parentIndex - (R,)
-   * @param {Float32Array} distances - (R,)
-   * @param {Float32Array} eigenvalues - (A,)
-   * @param {Float32Array} eigenvectors - (A*A,) row-major
-   * @param {Float32Array} pi - (A,)
+   * Accepts either:
+   *   LogLike(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi)
+   *   LogLike(alignment, parentIndex, distances, model)
+   *
    * @returns {Float32Array} (C,) log-likelihoods
    */
-  async LogLike(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi) {
+  async LogLike(alignment, parentIndex, distances, arg4, arg5, arg6) {
+    const parsed = PhyloGPU._parseModelArg(arg4, arg5);
+    const pi = parsed ? parsed.model.pi : arg6;
     const R = parentIndex.length;
     const A = pi.length;
     const C = alignment.length / R;
 
     const alignBuf = this._createBuffer(new Int32Array(alignment));
-    const eigenvalsBuf = this._createBuffer(new Float32Array(eigenvalues));
-    const eigenvecsBuf = this._createBuffer(new Float32Array(eigenvectors));
-    const piBuf = this._createBuffer(new Float32Array(pi));
     const distBuf = this._createBuffer(new Float32Array(distances));
 
     const encoder = this.device.createCommandEncoder();
@@ -378,12 +548,27 @@ export class PhyloGPU {
     // 1. Token to likelihood
     const likeBuf = this._tokenToLikelihood(encoder, alignBuf, R, C, A);
 
-    // 2. Compute sub-matrices
-    const subMatBuf = this._computeSubMatrices(encoder, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf, R, A);
+    // 2. Compute sub-matrices (reversible or complex)
+    let subMatBuf, extraBufs;
+    if (parsed && parsed.irrev) {
+      const m = parsed.model;
+      const evBuf = this._createBuffer(new Float32Array(m.eigenvalues_complex));
+      const vecBuf = this._createBuffer(new Float32Array(m.eigenvectors_complex));
+      const invBuf = this._createBuffer(new Float32Array(m.eigenvectors_inv_complex));
+      subMatBuf = this._computeSubMatricesComplex(encoder, evBuf, vecBuf, invBuf, distBuf, R, A);
+      extraBufs = [evBuf, vecBuf, invBuf];
+    } else {
+      const eigenvalues = parsed ? parsed.model.eigenvalues : arg4;
+      const eigenvectors = parsed ? parsed.model.eigenvectors : arg5;
+      const eigenvalsBuf = this._createBuffer(new Float32Array(eigenvalues));
+      const eigenvecsBuf = this._createBuffer(new Float32Array(eigenvectors));
+      const piBuf = this._createBuffer(new Float32Array(pi));
+      subMatBuf = this._computeSubMatrices(encoder, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf, R, A);
+      extraBufs = [eigenvalsBuf, eigenvecsBuf, piBuf];
+    }
 
     // 3. LogNormU buffer
     const logNormUBuf = this._createStorageBuffer(R * C * 4);
-    // Zero it
     this.device.queue.writeBuffer(logNormUBuf, 0, new Float32Array(R * C));
 
     // 4. Upward pass
@@ -407,8 +592,7 @@ export class PhyloGPU {
     }
 
     // Cleanup
-    for (const b of [alignBuf, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf,
-                      likeBuf, subMatBuf, logNormUBuf]) {
+    for (const b of [alignBuf, distBuf, likeBuf, subMatBuf, logNormUBuf, ...extraBufs]) {
       b.destroy();
     }
 
@@ -418,37 +602,58 @@ export class PhyloGPU {
   /**
    * Compute expected substitution counts and dwell times.
    *
+   * Accepts either:
+   *   Counts(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi, f81Fast?)
+   *   Counts(alignment, parentIndex, distances, model)
+   *
    * @returns {Float32Array} (A*A*C,) row-major counts tensor
    */
-  async Counts(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi, f81Fast = false) {
+  async Counts(alignment, parentIndex, distances, arg4, arg5, arg6, arg7) {
+    const parsed = PhyloGPU._parseModelArg(arg4, arg5);
+    const pi = parsed ? parsed.model.pi : arg6;
+    const eigenvalues = parsed ? parsed.model.eigenvalues : arg4;
+    const eigenvectors = parsed ? parsed.model.eigenvectors : arg5;
+    const f81Fast = parsed ? false : (arg7 || false);
+    const isIrrev = parsed && parsed.irrev;
     const R = parentIndex.length;
     const A = pi.length;
     const C = alignment.length / R;
 
     const alignBuf = this._createBuffer(new Int32Array(alignment));
-    const eigenvalsBuf = this._createBuffer(new Float32Array(eigenvalues));
-    const eigenvecsBuf = this._createBuffer(new Float32Array(eigenvectors));
-    const piBuf = this._createBuffer(new Float32Array(pi));
     const distBuf = this._createBuffer(new Float32Array(distances));
 
     const encoder = this.device.createCommandEncoder();
 
     const likeBuf = this._tokenToLikelihood(encoder, alignBuf, R, C, A);
-    const subMatBuf = this._computeSubMatrices(encoder, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf, R, A);
+
+    // Compute sub-matrices
+    let subMatBuf, smExtraBufs;
+    if (isIrrev) {
+      const m = parsed.model;
+      const evBuf = this._createBuffer(new Float32Array(m.eigenvalues_complex));
+      const vecBuf = this._createBuffer(new Float32Array(m.eigenvectors_complex));
+      const invBuf = this._createBuffer(new Float32Array(m.eigenvectors_inv_complex));
+      subMatBuf = this._computeSubMatricesComplex(encoder, evBuf, vecBuf, invBuf, distBuf, R, A);
+      smExtraBufs = [evBuf, vecBuf, invBuf];
+    } else {
+      const eigenvalsBuf = this._createBuffer(new Float32Array(eigenvalues));
+      const eigenvecsBuf = this._createBuffer(new Float32Array(eigenvectors));
+      const piBuf = this._createBuffer(new Float32Array(pi));
+      subMatBuf = this._computeSubMatrices(encoder, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf, R, A);
+      smExtraBufs = [eigenvalsBuf, eigenvecsBuf, piBuf];
+    }
+
     const logNormUBuf = this._createStorageBuffer(R * C * 4);
     this.device.queue.writeBuffer(logNormUBuf, 0, new Float32Array(R * C));
 
     this._upwardPass(encoder, likeBuf, logNormUBuf, subMatBuf, parentIndex, R, C, A);
 
-    // We need to read logLike first, then do downward pass, so submit here
     this.device.queue.submit([encoder.finish()]);
     await this.device.queue.onSubmittedWorkDone();
 
-    // Read U, logNormU for logLike computation
     const UData = await this._readBuffer(likeBuf, R * C * A * 4);
     const logNormUData = await this._readBuffer(logNormUBuf, R * C * 4);
 
-    // Compute logLike on CPU
     const logLike = new Float32Array(C);
     for (let c = 0; c < C; c++) {
       let s = 0;
@@ -456,14 +661,11 @@ export class PhyloGPU {
       logLike[c] = logNormUData[c] + Math.log(s);
     }
 
-    // Re-upload U (it's been read-back from likeBuf which was read-write)
     const UBuf = this._createBuffer(new Float32Array(UData));
     const logNormUBuf2 = this._createBuffer(new Float32Array(logNormUData));
 
-    // Observation likelihood for downward pass
     const obsLikeBuf = this._createStorageBuffer(R * C * A * 4);
     {
-      // Re-compute obsLike from alignment
       const obsLike = new Float32Array(R * C * A);
       for (let r = 0; r < R; r++) {
         for (let c = 0; c < C; c++) {
@@ -482,13 +684,11 @@ export class PhyloGPU {
 
     const rootProbBuf = this._createBuffer(new Float32Array(pi));
 
-    // Downward pass
     const DBuf = this._createStorageBuffer(R * C * A * 4);
     this.device.queue.writeBuffer(DBuf, 0, new Float32Array(R * C * A));
     const logNormDBuf = this._createStorageBuffer(R * C * 4);
     this.device.queue.writeBuffer(logNormDBuf, 0, new Float32Array(R * C));
 
-    // Re-compute sub-matrices (same as before, need a fresh buffer)
     const subMatBuf2 = this._createBuffer(new Float32Array(
       await this._readBuffer(subMatBuf, R * A * A * 4)
     ));
@@ -502,9 +702,11 @@ export class PhyloGPU {
     const DData = await this._readBuffer(DBuf, R * C * A * 4);
     const logNormDData = await this._readBuffer(logNormDBuf, R * C * 4);
 
-    // Now accumulate counts
     let countsData;
-    if (f81Fast) {
+    if (isIrrev) {
+      countsData = await this._eigensubCountsComplex(UData, DData, logNormUData, logNormDData,
+                                                      logLike, parsed.model, distances, R, C, A);
+    } else if (f81Fast) {
       countsData = await this._f81Fast(UData, DData, logNormUData, logNormDData,
                                         logLike, distances, pi, R, C, A);
     } else {
@@ -512,10 +714,9 @@ export class PhyloGPU {
                                                logLike, eigenvalues, eigenvectors, distances, pi, R, C, A);
     }
 
-    // Cleanup
-    for (const b of [alignBuf, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf,
-                      likeBuf, subMatBuf, logNormUBuf, UBuf, logNormUBuf2,
-                      obsLikeBuf, rootProbBuf, DBuf, logNormDBuf, subMatBuf2]) {
+    for (const b of [alignBuf, distBuf, likeBuf, subMatBuf, logNormUBuf,
+                      UBuf, logNormUBuf2, obsLikeBuf, rootProbBuf, DBuf, logNormDBuf,
+                      subMatBuf2, ...smExtraBufs]) {
       b.destroy();
     }
 
@@ -703,23 +904,43 @@ export class PhyloGPU {
   /**
    * Compute posterior root state distribution.
    *
+   * Accepts either:
+   *   RootProb(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi)
+   *   RootProb(alignment, parentIndex, distances, model)
+   *
    * @returns {Float32Array} (A*C,) row-major
    */
-  async RootProb(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi) {
+  async RootProb(alignment, parentIndex, distances, arg4, arg5, arg6) {
+    const parsed = PhyloGPU._parseModelArg(arg4, arg5);
+    const pi = parsed ? parsed.model.pi : arg6;
     const R = parentIndex.length;
     const A = pi.length;
     const C = alignment.length / R;
 
-    // Reuse LogLike path to get U and logNormU
     const alignBuf = this._createBuffer(new Int32Array(alignment));
-    const eigenvalsBuf = this._createBuffer(new Float32Array(eigenvalues));
-    const eigenvecsBuf = this._createBuffer(new Float32Array(eigenvectors));
-    const piBuf = this._createBuffer(new Float32Array(pi));
     const distBuf = this._createBuffer(new Float32Array(distances));
 
     const encoder = this.device.createCommandEncoder();
     const likeBuf = this._tokenToLikelihood(encoder, alignBuf, R, C, A);
-    const subMatBuf = this._computeSubMatrices(encoder, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf, R, A);
+
+    let subMatBuf, extraBufs;
+    if (parsed && parsed.irrev) {
+      const m = parsed.model;
+      const evBuf = this._createBuffer(new Float32Array(m.eigenvalues_complex));
+      const vecBuf = this._createBuffer(new Float32Array(m.eigenvectors_complex));
+      const invBuf = this._createBuffer(new Float32Array(m.eigenvectors_inv_complex));
+      subMatBuf = this._computeSubMatricesComplex(encoder, evBuf, vecBuf, invBuf, distBuf, R, A);
+      extraBufs = [evBuf, vecBuf, invBuf];
+    } else {
+      const eigenvalues = parsed ? parsed.model.eigenvalues : arg4;
+      const eigenvectors = parsed ? parsed.model.eigenvectors : arg5;
+      const eigenvalsBuf = this._createBuffer(new Float32Array(eigenvalues));
+      const eigenvecsBuf = this._createBuffer(new Float32Array(eigenvectors));
+      const piBuf = this._createBuffer(new Float32Array(pi));
+      subMatBuf = this._computeSubMatrices(encoder, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf, R, A);
+      extraBufs = [eigenvalsBuf, eigenvecsBuf, piBuf];
+    }
+
     const logNormUBuf = this._createStorageBuffer(R * C * 4);
     this.device.queue.writeBuffer(logNormUBuf, 0, new Float32Array(R * C));
     this._upwardPass(encoder, likeBuf, logNormUBuf, subMatBuf, parentIndex, R, C, A);
@@ -730,7 +951,6 @@ export class PhyloGPU {
     const UData = await this._readBuffer(likeBuf, R * C * A * 4);
     const logNormUData = await this._readBuffer(logNormUBuf, R * C * 4);
 
-    // Compute logLike and root posterior on CPU
     const result = new Float32Array(A * C);
     for (let c = 0; c < C; c++) {
       let s = 0;
@@ -743,8 +963,7 @@ export class PhyloGPU {
       }
     }
 
-    for (const b of [alignBuf, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf,
-                      likeBuf, subMatBuf, logNormUBuf]) {
+    for (const b of [alignBuf, distBuf, likeBuf, subMatBuf, logNormUBuf, ...extraBufs]) {
       b.destroy();
     }
 
@@ -767,8 +986,7 @@ export class PhyloGPU {
     const logLikes = new Float32Array(K * C);
     for (let k = 0; k < K; k++) {
       const ll = await this.LogLike(
-        alignment, parentIndex, distances,
-        models[k].eigenvalues, models[k].eigenvectors, models[k].pi,
+        alignment, parentIndex, distances, models[k],
       );
       logLikes.set(ll, k * C);
     }
