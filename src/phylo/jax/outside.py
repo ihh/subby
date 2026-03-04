@@ -1,9 +1,19 @@
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
+from .types import Tree
 from ._utils import children_of, token_to_likelihood
 
 
-def downward_pass(U, logNormU, tree, subMatrices, rootProb, alignment):
+def downward_pass(
+    U: jnp.ndarray,
+    logNormU: jnp.ndarray,
+    tree: Tree,
+    subMatrices: jnp.ndarray,
+    rootProb: jnp.ndarray,
+    alignment: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Compute outside (D) vectors for all nodes.
 
     D^(n)_a = [sum_j M_{aj}(t_{p,s}) U^(s)_j] * L(x_p|a) *

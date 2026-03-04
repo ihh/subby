@@ -1,9 +1,18 @@
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
+from .types import Tree
 from ._utils import token_to_likelihood
 
 
-def upward_pass(alignment, tree, subMatrices, rootProb, maxChunkSize=128):
+def upward_pass(
+    alignment: jnp.ndarray,
+    tree: Tree,
+    subMatrices: jnp.ndarray,
+    rootProb: jnp.ndarray,
+    maxChunkSize: int = 128,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Felsenstein pruning: compute inside (U) vectors for all nodes.
 
     Args:

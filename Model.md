@@ -4,7 +4,7 @@ Suppose we have an MSA with C columns, R rows, and a binary tree with branch len
 There is one MSA row for each leaf node in the tree.
 Each (leafRow,column) position in the MSA contains a value from 0 to A-1 (representing ungapped positions containing observed tokens), A (representing ungapped and unobserved), or A+1 (representing gapped and unobserved).
 
-Let Model denote the model, comprising a rate matrix and equilibrium distribution for an A-state stationary reversible continuous-time Markov chain.
+Let Model denote the model, comprising a rate matrix and equilibrium distribution for an A-state stationary continuous-time Markov chain. The model may be reversible (satisfying detailed balance: pi_i R_ij = pi_j R_ji) or irreversible. For reversible models, the symmetrized matrix S = diag(sqrt(pi)) R diag(1/sqrt(pi)) is diagonalized via eigh (real eigenvalues, orthonormal eigenvectors); for irreversible models, R is diagonalized directly via eig (complex eigenvalues, V^{-1} stored explicitly). Auto-detection of reversibility is supported via a detailed balance check with configurable tolerance.
 
 For any given column of the MSA, we can identify the "unambiguously ungapped” branches: the minimum subset of branches between ungapped nodes such that deleting any more branches fragments the subtree.
 
@@ -16,7 +16,7 @@ Thus, by combining the posterior distribution P(i,j|MSA,tree) and the expectatio
 
 In doing so we will already have computed the marginal likelihood of the observed leaves in every column.
 
-Holmes and Rubin (“An expectation maximization algorithm for training hidden substitution models”, 2002) show how the sum-product algorithm and the accumulation of posterior-expected counts and dwell times can be performed in the eigenbasis of R, counting “eigensubstitutions”, with the expensive transformation back to the natural basis postponed until the sum-product recursion over the tree is complete.
+Holmes and Rubin (“An expectation maximization algorithm for training hidden substitution models”, 2002) show how the sum-product algorithm and the accumulation of posterior-expected counts and dwell times can be performed in the eigenbasis of R, counting “eigensubstitutions”, with the expensive transformation back to the natural basis postponed until the sum-product recursion over the tree is complete. This extends naturally to irreversible models using complex eigenvalues; all intermediate quantities become complex-valued, with the final counts guaranteed real by conjugate pairing.
 
 The accompanying latex file Holmes_Rubin_2002.tex details that eigensubstitution-accumulation algorithm.
 (NB this file was reverse-engineered from a PDF and may have issues.)

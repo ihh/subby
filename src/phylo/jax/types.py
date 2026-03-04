@@ -1,4 +1,5 @@
-from typing import NamedTuple
+from __future__ import annotations
+from typing import NamedTuple, Union
 import jax.numpy as jnp
 
 
@@ -23,3 +24,8 @@ class IrrevDiagModel(NamedTuple):
 class RateModel(NamedTuple):
     subRate: jnp.ndarray   # (*H, A, A)
     rootProb: jnp.ndarray  # (*H, A)
+
+
+# Union type for any diagonalized model
+AnyDiagModel = Union[DiagModel, IrrevDiagModel]
+AnyModel = Union[DiagModel, IrrevDiagModel, RateModel]

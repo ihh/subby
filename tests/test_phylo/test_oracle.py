@@ -26,7 +26,9 @@ from src.phylo.jax.models import (
     gamma_rate_categories as jax_gamma_rate_categories,
     scale_model as jax_scale_model,
     irrev_model_from_rate_matrix as jax_irrev_model_from_rate_matrix,
+    model_from_rate_matrix as jax_model_from_rate_matrix,
 )
+from src.phylo.jax.diagonalize import check_detailed_balance as jax_check_detailed_balance
 from src.phylo.jax.diagonalize import compute_sub_matrices as jax_compute_sub_matrices
 from src.phylo.jax.pruning import upward_pass as jax_upward_pass
 from src.phylo.jax.outside import downward_pass as jax_downward_pass
@@ -798,3 +800,118 @@ class TestIrreversible:
         col_sums = ora_rp.sum(axis=0)
         np.testing.assert_allclose(col_sums, 1.0, atol=1e-8,
                                    err_msg=f"Irrev RootProb doesn't sum to 1")
+
+
+# ---------------------------------------------------------------------------
+# Tri-state reversibility tests
+# ---------------------------------------------------------------------------
+
+class TestTriStateReversibility:
+    """Tests for auto-detection of reversibility (reversible=None)."""
+
+    def _make_reversible_rate_matrix(self, A=4, seed=300):
+        """Build a reversible rate matrix satisfying detailed balance."""
+        rng = np.random.RandomState(seed)
+        pi = rng.dirichlet(np.ones(A))
+        # Build symmetric S, then R_ij = S_ij * sqrt(pi_j / pi_i)
+        S = rng.uniform(0.1, 1.0, (A, A))
+        S = 0.5 * (S + S.T)
+        np.fill_diagonal(S, 0.0)
+        # R_ij = S_ij * sqrt(pi_j/pi_i)
+        sqrt_pi = np.sqrt(pi)
+        R = S * (sqrt_pi[None, :] / sqrt_pi[:, None])
+        np.fill_diagonal(R, 0.0)
+        np.fill_diagonal(R, -R.sum(axis=1))
+        # Normalize to expected rate = 1
+        rate = -np.sum(pi * np.diag(R))
+        R /= rate
+        return R, pi
+
+    def test_detailed_balance_reversible_jax(self):
+        """JAX check_detailed_balance returns True for a reversible matrix."""
+        R, pi = self._make_reversible_rate_matrix()
+        assert jax_check_detailed_balance(jnp.array(R), jnp.array(pi)) is True
+
+    def test_detailed_balance_irreversible_jax(self):
+        """JAX check_detailed_balance returns False for an irreversible matrix."""
+        R, pi = _make_irrev_rate_matrix(4, seed=301)
+        assert jax_check_detailed_balance(jnp.array(R), jnp.array(pi)) is False
+
+    def test_detailed_balance_reversible_oracle(self):
+        """Oracle check_detailed_balance returns True for a reversible matrix."""
+        R, pi = self._make_reversible_rate_matrix()
+        assert oracle.check_detailed_balance(R, pi) is True
+
+    def test_detailed_balance_irreversible_oracle(self):
+        """Oracle check_detailed_balance returns False for an irreversible matrix."""
+        R, pi = _make_irrev_rate_matrix(4, seed=302)
+        assert oracle.check_detailed_balance(R, pi) is False
+
+    def test_model_from_rate_matrix_auto_reversible(self):
+        """model_from_rate_matrix with reversible=None auto-detects reversible."""
+        R_mat, pi = self._make_reversible_rate_matrix()
+        from src.phylo.jax.types import DiagModel
+        model = jax_model_from_rate_matrix(jnp.array(R_mat), jnp.array(pi), reversible=None)
+        assert isinstance(model, DiagModel)
+
+    def test_model_from_rate_matrix_auto_irreversible(self):
+        """model_from_rate_matrix with reversible=None auto-detects irreversible."""
+        R_mat, pi = _make_irrev_rate_matrix(4, seed=303)
+        from src.phylo.jax.types import IrrevDiagModel
+        model = jax_model_from_rate_matrix(jnp.array(R_mat), jnp.array(pi), reversible=None)
+        assert isinstance(model, IrrevDiagModel)
+
+    def test_model_from_rate_matrix_force_reversible(self):
+        """model_from_rate_matrix with reversible=True forces DiagModel."""
+        R_mat, pi = self._make_reversible_rate_matrix()
+        from src.phylo.jax.types import DiagModel
+        model = jax_model_from_rate_matrix(jnp.array(R_mat), jnp.array(pi), reversible=True)
+        assert isinstance(model, DiagModel)
+
+    def test_model_from_rate_matrix_force_irreversible(self):
+        """model_from_rate_matrix with reversible=False forces IrrevDiagModel."""
+        R_mat, pi = self._make_reversible_rate_matrix()
+        from src.phylo.jax.types import IrrevDiagModel
+        model = jax_model_from_rate_matrix(jnp.array(R_mat), jnp.array(pi), reversible=False)
+        assert isinstance(model, IrrevDiagModel)
+
+    def test_oracle_model_from_rate_matrix_auto(self):
+        """Oracle model_from_rate_matrix auto-detects reversibility."""
+        # Reversible
+        R_mat, pi = self._make_reversible_rate_matrix()
+        model = oracle.model_from_rate_matrix(R_mat, pi, reversible=None)
+        assert model.get('reversible', True) is True
+
+        # Irreversible
+        R_mat, pi = _make_irrev_rate_matrix(4, seed=304)
+        model = oracle.model_from_rate_matrix(R_mat, pi, reversible=None)
+        assert model['reversible'] is False
+
+    @pytest.mark.parametrize("R", TREE_SIZES)
+    def test_auto_detect_counts_match(self, R):
+        """Counts via auto-detected reversible model match explicit reversible model."""
+        A = 4
+        C = 6
+        R_mat, pi = self._make_reversible_rate_matrix(A, seed=310)
+        parentIndex, distances = _make_tree(R, seed=311)
+        alignment = _make_alignment(R, C, A, seed=312)
+
+        jax_tree = _jax_tree(parentIndex, distances)
+
+        # Auto-detected model
+        model_auto = jax_model_from_rate_matrix(
+            jnp.array(R_mat), jnp.array(pi), reversible=None
+        )
+        counts_auto = np.array(jax_Counts(
+            jnp.array(alignment), jax_tree, model_auto, branch_mask=None
+        ))
+
+        # Explicitly reversible model
+        model_rev = jax_model_from_rate_matrix(
+            jnp.array(R_mat), jnp.array(pi), reversible=True
+        )
+        counts_rev = np.array(jax_Counts(
+            jnp.array(alignment), jax_tree, model_rev, branch_mask=None
+        ))
+
+        np.testing.assert_allclose(counts_auto, counts_rev, atol=1e-8)

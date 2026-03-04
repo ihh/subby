@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 
 
-def validate_binary_tree(parentIndex):
+def validate_binary_tree(parentIndex: jnp.ndarray) -> None:
     """Assert every non-leaf node has exactly 2 children. Raise on violation."""
     R = parentIndex.shape[0]
     child_count = jnp.zeros(R, dtype=jnp.int32)
@@ -18,7 +20,9 @@ def validate_binary_tree(parentIndex):
         )
 
 
-def children_of(parentIndex):
+def children_of(
+    parentIndex: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Compute left_child, right_child, sibling arrays for a binary tree.
 
     Returns:
@@ -48,7 +52,7 @@ def children_of(parentIndex):
     return left_child, right_child, sibling
 
 
-def token_to_likelihood(alignment, A):
+def token_to_likelihood(alignment: jnp.ndarray, A: int) -> jnp.ndarray:
     """Convert integer token alignment to likelihood vectors.
 
     Token encoding:
@@ -74,7 +78,9 @@ def token_to_likelihood(alignment, A):
     return lookup[alignment + 1]
 
 
-def rescale(vec, log_norm):
+def rescale(
+    vec: jnp.ndarray, log_norm: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Rescale vector to prevent underflow, accumulate log-normalizer.
 
     Args:

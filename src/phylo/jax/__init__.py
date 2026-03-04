@@ -1,9 +1,13 @@
+from __future__ import annotations
+from typing import Optional, Union
+
 import jax.numpy as jnp
 
-from .types import Tree, DiagModel, IrrevDiagModel, RateModel
+from .types import Tree, DiagModel, IrrevDiagModel, RateModel, AnyDiagModel, AnyModel
 from .diagonalize import (
     diagonalize_rate_matrix, compute_sub_matrices,
     diagonalize_irreversible, compute_sub_matrices_irrev,
+    check_detailed_balance, diagonalize_rate_matrix_auto,
 )
 from .pruning import upward_pass
 from .outside import downward_pass
@@ -13,9 +17,14 @@ from .eigensub import (
 )
 from .f81_fast import f81_counts
 from .mixture import mixture_posterior
+from .models import (
+    hky85_diag, jukes_cantor_model, f81_model,
+    gamma_rate_categories, scale_model,
+    irrev_model_from_rate_matrix, model_from_rate_matrix,
+)
 
 
-def _ensure_diag(model):
+def _ensure_diag(model: AnyModel) -> AnyDiagModel:
     """Auto-diagonalize if given a RateModel."""
     if isinstance(model, RateModel):
         return diagonalize_rate_matrix(model.subRate, model.rootProb)
@@ -24,13 +33,18 @@ def _ensure_diag(model):
     return model
 
 
-def LogLike(alignment, tree, model, maxChunkSize=128):
+def LogLike(
+    alignment: jnp.ndarray,
+    tree: Tree,
+    model: AnyModel,
+    maxChunkSize: int = 128,
+) -> jnp.ndarray:
     """Compute per-column log-likelihoods.
 
     Args:
         alignment: (R, C) int32 tokens
         tree: Tree
-        model: DiagModel or RateModel
+        model: DiagModel, IrrevDiagModel, or RateModel
         maxChunkSize: chunk columns for memory
 
     Returns:
@@ -45,14 +59,20 @@ def LogLike(alignment, tree, model, maxChunkSize=128):
     return logLike
 
 
-def Counts(alignment, tree, model, maxChunkSize=128, f81_fast_flag=False,
-           branch_mask="auto"):
+def Counts(
+    alignment: jnp.ndarray,
+    tree: Tree,
+    model: AnyModel,
+    maxChunkSize: int = 128,
+    f81_fast_flag: bool = False,
+    branch_mask: Optional[Union[str, jnp.ndarray]] = "auto",
+) -> jnp.ndarray:
     """Compute expected substitution counts and dwell times per column.
 
     Args:
         alignment: (R, C) int32 tokens
         tree: Tree
-        model: DiagModel or RateModel
+        model: DiagModel, IrrevDiagModel, or RateModel
         maxChunkSize: chunk columns for memory
         f81_fast_flag: if True, use O(CRA^2) F81/JC fast path
         branch_mask: "auto" (compute from alignment), None (no masking),
@@ -98,7 +118,12 @@ def Counts(alignment, tree, model, maxChunkSize=128, f81_fast_flag=False,
         return back_transform(C, model)
 
 
-def RootProb(alignment, tree, model, maxChunkSize=128):
+def RootProb(
+    alignment: jnp.ndarray,
+    tree: Tree,
+    model: AnyModel,
+    maxChunkSize: int = 128,
+) -> jnp.ndarray:
     """Compute posterior root state distribution per column.
 
     q_b = pi_b * U^(root)_b / P(x)
@@ -106,7 +131,7 @@ def RootProb(alignment, tree, model, maxChunkSize=128):
     Args:
         alignment: (R, C) int32 tokens
         tree: Tree
-        model: DiagModel or RateModel
+        model: DiagModel, IrrevDiagModel, or RateModel
         maxChunkSize: chunk columns for memory
 
     Returns:
@@ -130,13 +155,19 @@ def RootProb(alignment, tree, model, maxChunkSize=128):
     return q
 
 
-def MixturePosterior(alignment, tree, models, log_weights, maxChunkSize=128):
+def MixturePosterior(
+    alignment: jnp.ndarray,
+    tree: Tree,
+    models: list[AnyModel],
+    log_weights: jnp.ndarray,
+    maxChunkSize: int = 128,
+) -> jnp.ndarray:
     """Compute posterior over mixture components per column.
 
     Args:
         alignment: (R, C) int32 tokens
         tree: Tree
-        models: list of K DiagModel or RateModel instances
+        models: list of K DiagModel, IrrevDiagModel, or RateModel instances
         log_weights: (K,) log prior weights
         maxChunkSize: chunk columns for memory
 

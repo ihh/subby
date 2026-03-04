@@ -1,8 +1,20 @@
+from __future__ import annotations
+from typing import Optional
+
 import jax.numpy as jnp
 
 
-def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex,
-               branch_mask=None):
+def f81_counts(
+    U: jnp.ndarray,
+    D: jnp.ndarray,
+    logNormU: jnp.ndarray,
+    logNormD: jnp.ndarray,
+    logLike: jnp.ndarray,
+    distances: jnp.ndarray,
+    pi: jnp.ndarray,
+    parentIndex: jnp.ndarray,
+    branch_mask: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
     """O(CRA^2) direct computation of expected counts for F81/JC models.
 
     For F81: M_ij(t) = delta_ij * e^{-mu*t} + pi_j * (1 - e^{-mu*t})

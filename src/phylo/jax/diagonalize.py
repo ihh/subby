@@ -1,8 +1,9 @@
+from __future__ import annotations
 import jax.numpy as jnp
-from .types import DiagModel, IrrevDiagModel, RateModel
+from .types import DiagModel, IrrevDiagModel, RateModel, AnyDiagModel
 
 
-def diagonalize_rate_matrix(subRate, rootProb):
+def diagonalize_rate_matrix(subRate: jnp.ndarray, rootProb: jnp.ndarray) -> DiagModel:
     """Eigendecompose a reversible rate matrix.
 
     S_ij = R_ij * sqrt(pi_i / pi_j) is symmetric.
@@ -25,7 +26,7 @@ def diagonalize_rate_matrix(subRate, rootProb):
     return DiagModel(eigenvalues=eigenvalues, eigenvectors=eigenvectors, pi=rootProb)
 
 
-def reconstruct_rate_matrix(model):
+def reconstruct_rate_matrix(model: DiagModel) -> RateModel:
     """Reconstruct rate matrix from DiagModel. For testing.
 
     R_ij = sqrt(pi_j/pi_i) * sum_k v_ik * mu_k * v_jk
@@ -45,7 +46,7 @@ def reconstruct_rate_matrix(model):
     return RateModel(subRate=subRate, rootProb=pi)
 
 
-def diagonalize_irreversible(subRate, rootProb):
+def diagonalize_irreversible(subRate: jnp.ndarray, rootProb: jnp.ndarray) -> IrrevDiagModel:
     """Eigendecompose an irreversible rate matrix.
 
     R = V diag(mu) V^{-1} directly (no symmetrization).
@@ -67,7 +68,50 @@ def diagonalize_irreversible(subRate, rootProb):
     )
 
 
-def compute_sub_matrices_irrev(model, distances):
+def check_detailed_balance(subRate: jnp.ndarray, pi: jnp.ndarray,
+                           tol: float = 1e-10) -> bool:
+    """Check whether a rate matrix satisfies detailed balance: pi_i R_ij = pi_j R_ji.
+
+    Args:
+        subRate: (A, A) or (*H, A, A) rate matrix
+        pi: (A,) or (*H, A) equilibrium distribution
+        tol: absolute tolerance for symmetry check
+
+    Returns:
+        True if the matrix satisfies detailed balance to within tol.
+    """
+    # pi_i R_ij should equal pi_j R_ji
+    piR = pi[..., :, None] * subRate              # (*H, A, A)
+    piR_T = jnp.swapaxes(piR, -2, -1)
+    return bool(jnp.all(jnp.abs(piR - piR_T) < tol))
+
+
+def diagonalize_rate_matrix_auto(
+    subRate: jnp.ndarray, rootProb: jnp.ndarray,
+    reversible: bool | None = None,
+    tol: float = 1e-10,
+) -> AnyDiagModel:
+    """Eigendecompose a rate matrix, auto-detecting reversibility if needed.
+
+    Args:
+        subRate: (*H, A, A) rate matrix
+        rootProb: (*H, A) equilibrium distribution
+        reversible: True → force reversible (eigh), False → force irreversible (eig),
+                    None → auto-detect via detailed balance check
+        tol: tolerance for detailed balance check when reversible=None
+
+    Returns:
+        DiagModel if reversible, IrrevDiagModel if irreversible.
+    """
+    if reversible is None:
+        reversible = check_detailed_balance(subRate, rootProb, tol=tol)
+    if reversible:
+        return diagonalize_rate_matrix(subRate, rootProb)
+    else:
+        return diagonalize_irreversible(subRate, rootProb)
+
+
+def compute_sub_matrices_irrev(model: IrrevDiagModel, distances: jnp.ndarray) -> jnp.ndarray:
     """Compute substitution probability matrices M(t) for irreversible model.
 
     M_ij(t) = Re(sum_k V_ik exp(mu_k t) V_inv_kj)
@@ -94,7 +138,7 @@ def compute_sub_matrices_irrev(model, distances):
     return M.real
 
 
-def compute_sub_matrices(model, distances):
+def compute_sub_matrices(model: DiagModel, distances: jnp.ndarray) -> jnp.ndarray:
     """Compute substitution probability matrices M(t) from eigendecomposition.
 
     M_ij(t) = sqrt(pi_j/pi_i) * sum_k v_ik * exp(mu_k * t) * v_jk

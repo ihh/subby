@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 import jax.numpy as jnp
 
 
-def mixture_posterior(log_likes, log_weights):
+def mixture_posterior(
+    log_likes: jnp.ndarray,
+    log_weights: jnp.ndarray,
+) -> jnp.ndarray:
     """Compute posterior probabilities over mixture components.
 
     P(component k | column c) = softmax_k(log_likes[k,c] + log_weights[k])

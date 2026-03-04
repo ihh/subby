@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import jax
 import jax.numpy as jnp
 
 
-def compute_branch_mask(alignment, parentIndex, A):
+def compute_branch_mask(
+    alignment: jnp.ndarray,
+    parentIndex: jnp.ndarray,
+    A: int,
+) -> jnp.ndarray:
     """Identify active branches per column (minimum Steiner tree of ungapped leaves).
 
     A branch parent->child is active if both endpoints are in the Steiner tree

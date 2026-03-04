@@ -301,6 +301,86 @@ def irrev_model_from_rate_matrix(subRate, pi):
     return diagonalize_irreversible(subRate, pi)
 
 
+def diagonalize_rate_matrix(subRate, rootProb):
+    """Eigendecompose a reversible rate matrix.
+
+    S_ij = R_ij * sqrt(pi_i / pi_j) is symmetric.
+    S = V diag(mu) V^T.
+
+    Args:
+        subRate: (A, A) rate matrix
+        rootProb: (A,) equilibrium distribution
+
+    Returns:
+        dict with 'eigenvalues', 'eigenvectors', 'pi', 'reversible': True
+    """
+    subRate = np.asarray(subRate, dtype=np.float64)
+    rootProb = np.asarray(rootProb, dtype=np.float64)
+    A = len(rootProb)
+    sqrt_pi = np.sqrt(rootProb)
+    inv_sqrt_pi = 1.0 / sqrt_pi
+    # S_ij = R_ij * sqrt(pi_i / pi_j)
+    S = np.zeros((A, A), dtype=np.float64)
+    for i in range(A):
+        for j in range(A):
+            S[i, j] = subRate[i, j] * sqrt_pi[i] * inv_sqrt_pi[j]
+    # Symmetrize
+    S = 0.5 * (S + S.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(S)
+    return {
+        'eigenvalues': eigenvalues,
+        'eigenvectors': eigenvectors,
+        'pi': rootProb,
+        'reversible': True,
+    }
+
+
+def check_detailed_balance(subRate, pi, tol=1e-10):
+    """Check whether a rate matrix satisfies detailed balance: pi_i R_ij = pi_j R_ji.
+
+    Args:
+        subRate: (A, A) rate matrix
+        pi: (A,) equilibrium distribution
+        tol: absolute tolerance
+
+    Returns:
+        True if detailed balance holds.
+    """
+    subRate = np.asarray(subRate, dtype=np.float64)
+    pi = np.asarray(pi, dtype=np.float64)
+    A = len(pi)
+    for i in range(A):
+        for j in range(A):
+            if abs(pi[i] * subRate[i, j] - pi[j] * subRate[j, i]) > tol:
+                return False
+    return True
+
+
+def model_from_rate_matrix(subRate, pi, reversible=None, tol=1e-10):
+    """Construct a diagonalized model from a rate matrix.
+
+    Auto-detects reversibility via detailed balance when reversible=None.
+
+    Args:
+        subRate: (A, A) rate matrix
+        pi: (A,) equilibrium distribution
+        reversible: True → reversible (eigh), False → irreversible (eig),
+                    None → auto-detect via detailed balance check
+        tol: tolerance for detailed balance check when reversible=None
+
+    Returns:
+        dict — reversible model if reversible, irreversible otherwise.
+    """
+    subRate = np.asarray(subRate, dtype=np.float64)
+    pi = np.asarray(pi, dtype=np.float64)
+    if reversible is None:
+        reversible = check_detailed_balance(subRate, pi, tol=tol)
+    if reversible:
+        return diagonalize_rate_matrix(subRate, pi)
+    else:
+        return diagonalize_irreversible(subRate, pi)
+
+
 # ---------------------------------------------------------------------------
 # 6c. Irreversible substitution matrices
 # ---------------------------------------------------------------------------

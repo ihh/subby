@@ -1,9 +1,10 @@
+from __future__ import annotations
 import jax.numpy as jnp
-from .types import DiagModel, IrrevDiagModel
-from .diagonalize import diagonalize_irreversible
+from .types import DiagModel, IrrevDiagModel, AnyDiagModel
+from .diagonalize import diagonalize_irreversible, diagonalize_rate_matrix_auto
 
 
-def hky85_diag(kappa, pi):
+def hky85_diag(kappa: float, pi: jnp.ndarray) -> DiagModel:
     """HKY85 model with closed-form eigendecomposition.
 
     Args:
@@ -72,7 +73,7 @@ def hky85_diag(kappa, pi):
     return DiagModel(eigenvalues=eigenvalues, eigenvectors=eigenvectors, pi=pi)
 
 
-def jukes_cantor_model(A):
+def jukes_cantor_model(A: int) -> DiagModel:
     """Jukes-Cantor model for an A-state alphabet.
 
     R_ij = mu * (1/A) for i!=j, normalized so expected rate = 1.
@@ -96,7 +97,7 @@ def jukes_cantor_model(A):
     return DiagModel(eigenvalues=eigenvalues, eigenvectors=eigenvectors, pi=pi)
 
 
-def f81_model(pi):
+def f81_model(pi: jnp.ndarray) -> DiagModel:
     """F81 model: R_ij = mu * pi_j for i!=j, normalized to expected rate = 1.
 
     Args:
@@ -112,12 +113,9 @@ def f81_model(pi):
     # Eigenvalues: 0 (once), -mu (A-1 times)
     eigenvalues = jnp.concatenate([jnp.zeros(1), jnp.full(A - 1, -mu)])
     # Eigenvectors of S where S_ij = R_ij * sqrt(pi_i/pi_j)
-    # For F81: S_ij = mu*pi_j * sqrt(pi_i/pi_j) = mu*sqrt(pi_i*pi_j) for i!=j
-    # S_ii = -mu*(1-pi_i)
     # v^(0) = sqrt(pi)
     sqrt_pi = jnp.sqrt(pi)
     # Remaining eigenvectors: orthonormal in subspace perp to sqrt(pi)
-    # Use modified Gram-Schmidt starting from columns of I
     basis = jnp.eye(A)
     augmented = jnp.concatenate([sqrt_pi[:, None], basis], axis=1)
     Q, _ = jnp.linalg.qr(augmented)
@@ -125,7 +123,7 @@ def f81_model(pi):
     return DiagModel(eigenvalues=eigenvalues, eigenvectors=eigenvectors, pi=pi)
 
 
-def gamma_rate_categories(alpha, K):
+def gamma_rate_categories(alpha: float, K: int) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Yang (1994) discretized gamma rate categories using quantile medians.
 
     Args:
@@ -139,10 +137,6 @@ def gamma_rate_categories(alpha, K):
     # Quantile boundaries
     boundaries = jnp.linspace(0, 1, K + 1)
     midpoints = 0.5 * (boundaries[:-1] + boundaries[1:])
-    # Inverse CDF of Gamma(alpha, 1/alpha) at midpoints
-    # Use binary search since JAX doesn't have gammaincinv
-    # Approximate using the chi-squared relationship: Gamma(alpha, beta) ~ chi2(2*alpha)/(2*beta)
-    # For simplicity, use a grid-based approach
     rates = _gamma_quantiles(alpha, midpoints)
     # Normalize so mean rate = 1
     rates = rates * K / jnp.sum(rates)
@@ -150,11 +144,9 @@ def gamma_rate_categories(alpha, K):
     return rates, weights
 
 
-def _gamma_quantiles(alpha, probs):
+def _gamma_quantiles(alpha: float, probs: jnp.ndarray) -> jnp.ndarray:
     """Compute quantiles of Gamma(alpha, 1/alpha) distribution via bisection."""
     from jax.scipy.special import gammainc
-    # Gamma(alpha, 1/alpha) CDF at x = gammainc(alpha, x*alpha)
-    # We want x such that gammainc(alpha, x*alpha) = p
     lo = jnp.zeros_like(probs)
     hi = jnp.ones_like(probs) * jnp.maximum(50.0, 10.0 / alpha)
     for _ in range(64):
@@ -165,7 +157,7 @@ def _gamma_quantiles(alpha, probs):
     return 0.5 * (lo + hi)
 
 
-def scale_model(model, rate_multiplier):
+def scale_model(model: DiagModel, rate_multiplier: float | jnp.ndarray) -> DiagModel:
     """Scale eigenvalues by a rate multiplier.
 
     Args:
@@ -194,8 +186,10 @@ def scale_model(model, rate_multiplier):
     return DiagModel(eigenvalues=eigenvalues, eigenvectors=eigenvectors, pi=pi)
 
 
-def irrev_model_from_rate_matrix(subRate, pi):
+def irrev_model_from_rate_matrix(subRate: jnp.ndarray, pi: jnp.ndarray) -> IrrevDiagModel:
     """Construct an IrrevDiagModel from a (possibly irreversible) rate matrix.
+
+    Always uses irreversible decomposition (eig, not eigh).
 
     Args:
         subRate: (*H, A, A) rate matrix
@@ -207,3 +201,27 @@ def irrev_model_from_rate_matrix(subRate, pi):
     subRate = jnp.asarray(subRate, dtype=jnp.float64)
     pi = jnp.asarray(pi, dtype=jnp.float64)
     return diagonalize_irreversible(subRate, pi)
+
+
+def model_from_rate_matrix(
+    subRate: jnp.ndarray, pi: jnp.ndarray,
+    reversible: bool | None = None,
+    tol: float = 1e-10,
+) -> AnyDiagModel:
+    """Construct a diagonalized model from a rate matrix.
+
+    Auto-detects reversibility via detailed balance when reversible=None.
+
+    Args:
+        subRate: (*H, A, A) rate matrix
+        pi: (*H, A) stationary distribution
+        reversible: True → reversible (eigh), False → irreversible (eig),
+                    None → auto-detect via detailed balance check
+        tol: tolerance for detailed balance check when reversible=None
+
+    Returns:
+        DiagModel if reversible, IrrevDiagModel if irreversible.
+    """
+    subRate = jnp.asarray(subRate, dtype=jnp.float64)
+    pi = jnp.asarray(pi, dtype=jnp.float64)
+    return diagonalize_rate_matrix_auto(subRate, pi, reversible=reversible, tol=tol)

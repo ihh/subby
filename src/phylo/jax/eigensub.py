@@ -1,7 +1,10 @@
+from __future__ import annotations
+from typing import Optional
 import jax.numpy as jnp
+from .types import DiagModel, IrrevDiagModel
 
 
-def compute_J(eigenvalues, distances):
+def compute_J(eigenvalues: jnp.ndarray, distances: jnp.ndarray) -> jnp.ndarray:
     """Compute J^{kl}(T) interaction matrix between decay modes.
 
     J^{kl}(T) = T * exp(mu_k * T)           if mu_k ≈ mu_l
@@ -26,9 +29,6 @@ def compute_J(eigenvalues, distances):
     # mu_k - mu_l: (*H, A, A)
     mu_diff = mu[..., :, None] - mu[..., None, :]  # (*H, A, A)
 
-    # Degenerate case: J = T * exp(mu_k * T)
-    # Non-degenerate: J = (exp(mu_k*T) - exp(mu_l*T)) / (mu_k - mu_l)
-
     # exp(mu_k*T) and exp(mu_l*T): (*H, R, A, 1) and (*H, R, 1, A)
     exp_k = exp_mu_t[..., :, None]   # (*H, R, A, 1)
     exp_l = exp_mu_t[..., None, :]   # (*H, R, 1, A)
@@ -50,7 +50,9 @@ def compute_J(eigenvalues, distances):
     return J
 
 
-def eigenbasis_project(U, D, model):
+def eigenbasis_project(
+    U: jnp.ndarray, D: jnp.ndarray, model: DiagModel,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Project inside/outside vectors into eigenbasis.
 
     U_tilde^(n)_l = sum_b U_b * v_{bl} * sqrt(pi_b)
@@ -82,8 +84,13 @@ def eigenbasis_project(U, D, model):
     return U_tilde, D_tilde
 
 
-def accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, parentIndex,
-                 branch_mask=None):
+def accumulate_C(
+    D_tilde: jnp.ndarray, U_tilde: jnp.ndarray,
+    J: jnp.ndarray,
+    logNormU: jnp.ndarray, logNormD: jnp.ndarray,
+    logLike: jnp.ndarray, parentIndex: jnp.ndarray,
+    branch_mask: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
     """Accumulate eigenbasis counts C_{kl} over branches.
 
     C_{kl,c} = sum_{n>0} D_tilde_k^(n) * J^{kl}(t_n) * U_tilde_l^(n) * scale[n,c]
@@ -104,8 +111,6 @@ def accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, parentIndex,
     Returns:
         C: (*H, A, A, C) eigenbasis counts
     """
-    *H, R, C, A = U_tilde.shape
-
     # Scale factors per branch per column: exp(logNormD + logNormU - logLike)
     # Only for branches n > 0 (non-root)
     log_scale = (
@@ -130,7 +135,7 @@ def accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, parentIndex,
     return C
 
 
-def back_transform(C, model):
+def back_transform(C: jnp.ndarray, model: DiagModel) -> jnp.ndarray:
     """Transform eigenbasis counts to natural basis.
 
     w_i = sum_{kl} v_{ik} * v_{il} * C_{kl}
@@ -146,18 +151,10 @@ def back_transform(C, model):
         (*H, A, A, C) counts tensor
     """
     V = model.eigenvectors  # (*H, A, A)
-    pi = model.pi           # (*H, A)
 
     # VCV = V C V^T per column: (*H, A, A, C)
-    # V^T C V in matrix notation, but here C is per-column
     # result_{ij,c} = sum_{kl} V_{ik} C_{kl,c} V_{jl}
     VCV = jnp.einsum('...ik,...klc,...jl->...ijc', V, C, V)
-
-    # Dwell times: diag of VCV
-    # Substitution counts: S_{ij} * VCV_{ij} for i != j
-    # S_{ij} = R_{ij} * sqrt(pi_i/pi_j)
-    # For reversible model: S is symmetric, S_{ij} = mu_ij * sqrt(pi_i * pi_j) / normalization
-    # Actually S_{ij} = R_{ij} * sqrt(pi_i/pi_j), and R is the rate matrix
 
     # Reconstruct S from eigendecomposition: S = V diag(mu) V^T
     mu = model.eigenvalues
@@ -165,7 +162,6 @@ def back_transform(C, model):
 
     # Off-diagonal: u_{ij} = S_{ij} * VCV_{ij}
     # Diagonal: w_i = VCV_{ii}
-    # Build result
     diag_mask = jnp.eye(V.shape[-1], dtype=bool)
     counts = jnp.where(
         diag_mask[..., None],
@@ -176,7 +172,7 @@ def back_transform(C, model):
     return counts
 
 
-def compute_J_complex(eigenvalues, distances):
+def compute_J_complex(eigenvalues: jnp.ndarray, distances: jnp.ndarray) -> jnp.ndarray:
     """Compute J^{kl}(T) interaction matrix for complex eigenvalues.
 
     Same formula as compute_J but operates on complex eigenvalues.
@@ -212,7 +208,9 @@ def compute_J_complex(eigenvalues, distances):
     return J
 
 
-def eigenbasis_project_irrev(U, D, model):
+def eigenbasis_project_irrev(
+    U: jnp.ndarray, D: jnp.ndarray, model: IrrevDiagModel,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Project inside/outside vectors into eigenbasis for irreversible model.
 
     U_tilde_k = sum_b U_b * V_bk         (no sqrt(pi) weighting)
@@ -242,8 +240,13 @@ def eigenbasis_project_irrev(U, D, model):
     return U_tilde, D_tilde
 
 
-def accumulate_C_complex(D_tilde, U_tilde, J, logNormU, logNormD, logLike,
-                         parentIndex, branch_mask=None):
+def accumulate_C_complex(
+    D_tilde: jnp.ndarray, U_tilde: jnp.ndarray,
+    J: jnp.ndarray,
+    logNormU: jnp.ndarray, logNormD: jnp.ndarray,
+    logLike: jnp.ndarray, parentIndex: jnp.ndarray,
+    branch_mask: Optional[jnp.ndarray] = None,
+) -> jnp.ndarray:
     """Accumulate eigenbasis counts C_{kl} over branches (complex variant).
 
     Same structure as accumulate_C but D_tilde, U_tilde, J are complex.
@@ -280,7 +283,7 @@ def accumulate_C_complex(D_tilde, U_tilde, J, logNormU, logNormD, logLike,
     return C
 
 
-def back_transform_irrev(C, model):
+def back_transform_irrev(C: jnp.ndarray, model: IrrevDiagModel) -> jnp.ndarray:
     """Transform eigenbasis counts to natural basis for irreversible model.
 
     VCV = V C V^{-1} per column
