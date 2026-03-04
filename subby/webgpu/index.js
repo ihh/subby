@@ -76,3 +76,4 @@ export async function createPhyloEngine(options = {}) {
 
 export { PhyloGPU } from './phylo_gpu.js';
 export { PhyloWASM } from './phylo_wasm.js';
+export { jukesCantor, f81, hky85 } from './models.js';
