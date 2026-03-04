@@ -13,8 +13,9 @@ pub mod eigensub;
 pub mod f81_fast;
 pub mod mixture;
 pub mod branch_mask;
+pub mod complex;
 
-use model::DiagModel;
+use model::{DiagModel, IrrevDiagModel};
 
 /// Compute per-column log-likelihoods.
 pub fn log_like(
@@ -66,6 +67,34 @@ pub fn counts(
         );
         eigensub::back_transform(&c_eigen, model, c)
     }
+}
+
+/// Compute expected substitution counts and dwell times (irreversible model).
+pub fn counts_irrev(
+    alignment: &[i32],
+    parent_index: &[i32],
+    distances: &[f64],
+    model: &IrrevDiagModel,
+) -> Vec<f64> {
+    let r = parent_index.len();
+    let a = model.pi.len();
+    let c = alignment.len() / r;
+
+    let sub_mats = sub_matrices::compute_sub_matrices_irrev(model, distances);
+    let (u, log_norm_u, ll) = pruning::upward_pass(
+        alignment, parent_index, &sub_mats, &model.pi, r, c, a,
+    );
+    let (d, log_norm_d) = outside::downward_pass(
+        &u, &log_norm_u, parent_index, &sub_mats, &model.pi, alignment, r, c, a,
+    );
+
+    let j = eigensub::compute_j_complex(&model.eigenvalues_complex, distances);
+    let (u_tilde, d_tilde) = eigensub::eigenbasis_project_irrev(&u, &d, model, r, c, a);
+    let c_eigen = eigensub::accumulate_c_complex(
+        &d_tilde, &u_tilde, &j, &log_norm_u, &log_norm_d, &ll,
+        parent_index, r, c, a,
+    );
+    eigensub::back_transform_irrev(&c_eigen, model, c)
 }
 
 /// Compute posterior root state distribution.
@@ -157,6 +186,25 @@ mod wasm_api {
             pi: pi.to_vec(),
         };
         crate::counts(alignment, parent_index, distances, &m, f81_fast)
+    }
+
+    #[wasm_bindgen]
+    pub fn wasm_counts_irrev(
+        alignment: &[i32],
+        parent_index: &[i32],
+        distances: &[f64],
+        eigenvalues_complex: &[f64],
+        eigenvectors_complex: &[f64],
+        eigenvectors_inv_complex: &[f64],
+        pi: &[f64],
+    ) -> Vec<f64> {
+        let m = crate::model::IrrevDiagModel {
+            eigenvalues_complex: eigenvalues_complex.to_vec(),
+            eigenvectors_complex: eigenvectors_complex.to_vec(),
+            eigenvectors_inv_complex: eigenvectors_inv_complex.to_vec(),
+            pi: pi.to_vec(),
+        };
+        crate::counts_irrev(alignment, parent_index, distances, &m)
     }
 
     #[wasm_bindgen]

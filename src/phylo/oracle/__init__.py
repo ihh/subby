@@ -21,4 +21,11 @@ from .oracle import (
     f81_counts,
     mixture_posterior,
     compute_branch_mask,
+    diagonalize_irreversible,
+    irrev_model_from_rate_matrix,
+    compute_sub_matrices_irrev,
+    compute_J_complex,
+    eigenbasis_project_irrev,
+    accumulate_C_complex,
+    back_transform_irrev,
 )

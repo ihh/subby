@@ -259,6 +259,239 @@ def scale_model(model, rate_multiplier):
 
 
 # ---------------------------------------------------------------------------
+# 6b. Irreversible model construction
+# ---------------------------------------------------------------------------
+
+def diagonalize_irreversible(subRate, rootProb):
+    """Eigendecompose an irreversible rate matrix.
+
+    R = V diag(mu) V^{-1} via numpy eig.
+
+    Args:
+        subRate: (A, A) rate matrix
+        rootProb: (A,) stationary distribution
+
+    Returns:
+        dict with complex eigenvalues, eigenvectors, eigenvectors_inv, pi,
+        and 'reversible': False
+    """
+    subRate = np.asarray(subRate, dtype=np.float64)
+    rootProb = np.asarray(rootProb, dtype=np.float64)
+    eigenvalues, eigenvectors = np.linalg.eig(subRate)
+    eigenvectors_inv = np.linalg.inv(eigenvectors)
+    return {
+        'eigenvalues': eigenvalues,
+        'eigenvectors': eigenvectors,
+        'eigenvectors_inv': eigenvectors_inv,
+        'pi': rootProb,
+        'reversible': False,
+    }
+
+
+def irrev_model_from_rate_matrix(subRate, pi):
+    """Construct an irreversible model from a rate matrix.
+
+    Args:
+        subRate: (A, A) rate matrix
+        pi: (A,) stationary distribution
+
+    Returns:
+        dict with complex arrays and 'reversible': False
+    """
+    return diagonalize_irreversible(subRate, pi)
+
+
+# ---------------------------------------------------------------------------
+# 6c. Irreversible substitution matrices
+# ---------------------------------------------------------------------------
+
+def compute_sub_matrices_irrev(model, distances):
+    """Compute substitution probability matrices M(t) for irreversible model.
+
+    M_ij(t) = Re(sum_k V_ik * exp(mu_k * t) * V_inv_kj)
+
+    Args:
+        model: dict with complex 'eigenvalues', 'eigenvectors', 'eigenvectors_inv', 'pi'
+        distances: (R,) branch lengths
+
+    Returns:
+        (R, A, A) substitution matrices (real)
+    """
+    V = model['eigenvectors']         # (A, A) complex
+    V_inv = model['eigenvectors_inv']  # (A, A) complex
+    mu = model['eigenvalues']         # (A,) complex
+    R = len(distances)
+    A = len(mu)
+
+    M = np.zeros((R, A, A), dtype=np.float64)
+    for r in range(R):
+        t = distances[r]
+        for i in range(A):
+            for j in range(A):
+                s = 0.0 + 0.0j
+                for k in range(A):
+                    s += V[i, k] * np.exp(mu[k] * t) * V_inv[k, j]
+                M[r, i, j] = s.real
+    return M
+
+
+# ---------------------------------------------------------------------------
+# 6d. Irreversible eigensub functions
+# ---------------------------------------------------------------------------
+
+def compute_J_complex(eigenvalues, distances):
+    """Compute J^{kl}(T) interaction matrix for complex eigenvalues.
+
+    Args:
+        eigenvalues: (A,) complex eigenvalues
+        distances: (R,) branch lengths
+
+    Returns:
+        (R, A, A) complex J matrices per branch
+    """
+    A = len(eigenvalues)
+    R = len(distances)
+    J = np.zeros((R, A, A), dtype=np.complex128)
+
+    for r in range(R):
+        t = distances[r]
+        for k in range(A):
+            mu_k = eigenvalues[k]
+            exp_k = np.exp(mu_k * t)
+            for l in range(A):
+                mu_l = eigenvalues[l]
+                diff = mu_k - mu_l
+                if abs(diff) < 1e-8:
+                    J[r, k, l] = t * exp_k
+                else:
+                    J[r, k, l] = (exp_k - np.exp(mu_l * t)) / diff
+    return J
+
+
+def eigenbasis_project_irrev(U, D, model):
+    """Project inside/outside vectors into eigenbasis for irreversible model.
+
+    U_tilde_k = sum_b U_b * V_bk         (no pi weighting)
+    D_tilde_k = sum_a D_a * V_inv_ka     (using V^{-1})
+
+    Args:
+        U: (R, C, A) inside vectors (real)
+        D: (R, C, A) outside vectors (real)
+        model: dict with complex 'eigenvectors', 'eigenvectors_inv'
+
+    Returns:
+        U_tilde: (R, C, A) complex projected inside
+        D_tilde: (R, C, A) complex projected outside
+    """
+    V = model['eigenvectors']         # (A, A) complex
+    V_inv = model['eigenvectors_inv']  # (A, A) complex
+    R, C, A = U.shape
+
+    U_tilde = np.zeros((R, C, A), dtype=np.complex128)
+    D_tilde = np.zeros((R, C, A), dtype=np.complex128)
+
+    for r in range(R):
+        for c in range(C):
+            for k in range(A):
+                su = 0.0 + 0.0j
+                sd = 0.0 + 0.0j
+                for b in range(A):
+                    su += U[r, c, b] * V[b, k]
+                    sd += D[r, c, b] * V_inv[k, b]
+                U_tilde[r, c, k] = su
+                D_tilde[r, c, k] = sd
+
+    return U_tilde, D_tilde
+
+
+def accumulate_C_complex(D_tilde, U_tilde, J, logNormU, logNormD, logLike,
+                         parentIndex, branch_mask=None):
+    """Accumulate eigenbasis counts C_{kl} over branches (complex).
+
+    Args:
+        D_tilde: (R, C, A) complex projected outside vectors
+        U_tilde: (R, C, A) complex projected inside vectors
+        J: (R, A, A) complex J matrices per branch
+        logNormU: (R, C) real
+        logNormD: (R, C) real
+        logLike: (C,) real
+        parentIndex: (R,) parent indices
+        branch_mask: (R, C) bool or None
+
+    Returns:
+        C: (A, A, C) complex eigenbasis counts
+    """
+    R, C, A = U_tilde.shape
+    Cout = np.zeros((A, A, C), dtype=np.complex128)
+
+    for n in range(1, R):
+        for c in range(C):
+            if branch_mask is not None and not branch_mask[n, c]:
+                continue
+            log_s = logNormD[n, c] + logNormU[n, c] - logLike[c]
+            scale = np.exp(log_s)
+            for k in range(A):
+                for l in range(A):
+                    Cout[k, l, c] += D_tilde[n, c, k] * J[n, k, l] * U_tilde[n, c, l] * scale
+
+    return Cout
+
+
+def back_transform_irrev(C, model):
+    """Transform eigenbasis counts to natural basis for irreversible model.
+
+    VCV_{ij,c} = sum_{kl} V_{ik} C_{kl,c} V_inv_{lj}
+    R = V diag(mu) V^{-1}
+    Off-diagonal: R_ij * VCV_ij, diagonal: VCV_ii
+    Takes .real of final result.
+
+    Args:
+        C: (A, A, C) complex eigenbasis counts
+        model: dict with complex 'eigenvalues', 'eigenvectors', 'eigenvectors_inv'
+
+    Returns:
+        (A, A, C) real counts tensor
+    """
+    V = model['eigenvectors']         # (A, A) complex
+    V_inv = model['eigenvectors_inv']  # (A, A) complex
+    mu = model['eigenvalues']         # (A,) complex
+    A = len(mu)
+    Ccols = C.shape[2]
+
+    # Reconstruct R = V diag(mu) V^{-1}
+    R_mat = np.zeros((A, A), dtype=np.complex128)
+    for i in range(A):
+        for j in range(A):
+            s = 0.0 + 0.0j
+            for k in range(A):
+                s += V[i, k] * mu[k] * V_inv[k, j]
+            R_mat[i, j] = s
+
+    # VCV = V C V^{-1} per column
+    VCV = np.zeros((A, A, Ccols), dtype=np.complex128)
+    for col in range(Ccols):
+        for i in range(A):
+            for j in range(A):
+                s = 0.0 + 0.0j
+                for k in range(A):
+                    for l in range(A):
+                        s += V[i, k] * C[k, l, col] * V_inv[l, j]
+                VCV[i, j, col] = s
+
+    # Build result
+    counts = np.zeros((A, A, Ccols), dtype=np.float64)
+    for col in range(Ccols):
+        for i in range(A):
+            for j in range(A):
+                if i == j:
+                    counts[i, j, col] = VCV[i, j, col].real
+                else:
+                    counts[i, j, col] = (R_mat[i, j] * VCV[i, j, col]).real
+
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # 7. Substitution matrices
 # ---------------------------------------------------------------------------
 
@@ -525,7 +758,8 @@ def eigenbasis_project(U, D, model):
 # 12. Accumulate eigenbasis counts
 # ---------------------------------------------------------------------------
 
-def accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, parentIndex):
+def accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, parentIndex,
+                 branch_mask=None):
     """Accumulate eigenbasis counts C_{kl} over branches.
 
     C_{kl,c} = sum_{n>0} D_tilde_k^(n) * J^{kl}(t_n) * U_tilde_l^(n) * scale[n,c]
@@ -540,6 +774,7 @@ def accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, parentIndex):
         logNormD: (R, C) per-node outside log-normalizers
         logLike: (C,) log-likelihoods
         parentIndex: (R,) parent indices
+        branch_mask: (R, C) bool or None — if provided, skip inactive branches
 
     Returns:
         C: (A, A, C) eigenbasis counts
@@ -549,6 +784,8 @@ def accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, parentIndex):
 
     for n in range(1, R):
         for c in range(C):
+            if branch_mask is not None and not branch_mask[n, c]:
+                continue
             log_s = logNormD[n, c] + logNormU[n, c] - logLike[c]
             scale = np.exp(log_s)
             for k in range(A):
@@ -619,7 +856,8 @@ def back_transform(C, model):
 # 14. F81 fast path (direct O(CRA^2) computation)
 # ---------------------------------------------------------------------------
 
-def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex):
+def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex,
+               branch_mask=None):
     """O(CRA^2) direct computation of expected counts for F81/JC models.
 
     Args:
@@ -631,6 +869,7 @@ def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex):
         distances: (R,) branch lengths
         pi: (A,) equilibrium frequencies
         parentIndex: (R,) parent indices
+        branch_mask: (R, C) bool or None — if provided, skip inactive branches
 
     Returns:
         (A, A, C) counts tensor (diag=dwell, off-diag=substitutions)
@@ -654,6 +893,8 @@ def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex):
         gamma_n = t * (1.0 + e_t) - 2.0 * p / mu
 
         for c in range(C):
+            if branch_mask is not None and not branch_mask[n, c]:
+                continue
             log_s = logNormD[n, c] + logNormU[n, c] - logLike[c]
             scale = np.exp(log_s)
 
@@ -796,6 +1037,18 @@ def compute_branch_mask(alignment, parentIndex, A):
 # 17-20. Public API
 # ---------------------------------------------------------------------------
 
+def _is_irrev(model):
+    """Check if model is irreversible."""
+    return not model.get('reversible', True)
+
+
+def _get_sub_matrices(model, distances):
+    """Get substitution matrices, dispatching on model type."""
+    if _is_irrev(model):
+        return compute_sub_matrices_irrev(model, distances)
+    return compute_sub_matrices(model, distances)
+
+
 def LogLike(alignment, tree, model):
     """Compute per-column log-likelihoods.
 
@@ -807,12 +1060,12 @@ def LogLike(alignment, tree, model):
     Returns:
         (C,) log-likelihoods
     """
-    subMats = compute_sub_matrices(model, tree['distanceToParent'])
+    subMats = _get_sub_matrices(model, tree['distanceToParent'])
     _, _, logLike = upward_pass(alignment, tree, subMats, model['pi'])
     return logLike
 
 
-def Counts(alignment, tree, model, f81_fast=False):
+def Counts(alignment, tree, model, f81_fast=False, branch_mask="auto"):
     """Compute expected substitution counts and dwell times per column.
 
     Args:
@@ -820,11 +1073,22 @@ def Counts(alignment, tree, model, f81_fast=False):
         tree: dict with 'parentIndex', 'distanceToParent'
         model: dict with 'eigenvalues', 'eigenvectors', 'pi'
         f81_fast: if True, use O(CRA^2) F81/JC fast path
+        branch_mask: "auto" (compute from alignment), None (no masking),
+            or (R, C) bool array
 
     Returns:
         (A, A, C) counts tensor (diag=dwell, off-diag=substitution counts)
     """
-    subMats = compute_sub_matrices(model, tree['distanceToParent'])
+    is_irrev = _is_irrev(model)
+
+    if isinstance(branch_mask, str) and branch_mask == "auto":
+        A = len(model['pi'])
+        branch_mask = compute_branch_mask(alignment, tree['parentIndex'], A)
+
+    if is_irrev:
+        assert not f81_fast, "F81 fast path is reversible-only"
+
+    subMats = _get_sub_matrices(model, tree['distanceToParent'])
     U, logNormU, logLike = upward_pass(alignment, tree, subMats, model['pi'])
     D, logNormD = downward_pass(U, logNormU, tree, subMats, model['pi'], alignment)
 
@@ -832,11 +1096,19 @@ def Counts(alignment, tree, model, f81_fast=False):
         return f81_counts(
             U, D, logNormU, logNormD, logLike,
             tree['distanceToParent'], model['pi'], tree['parentIndex'],
+            branch_mask=branch_mask,
         )
+    elif is_irrev:
+        J = compute_J_complex(model['eigenvalues'], tree['distanceToParent'])
+        U_tilde, D_tilde = eigenbasis_project_irrev(U, D, model)
+        C = accumulate_C_complex(D_tilde, U_tilde, J, logNormU, logNormD, logLike,
+                                 tree['parentIndex'], branch_mask=branch_mask)
+        return back_transform_irrev(C, model)
     else:
         J = compute_J(model['eigenvalues'], tree['distanceToParent'])
         U_tilde, D_tilde = eigenbasis_project(U, D, model)
-        C = accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree['parentIndex'])
+        C = accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree['parentIndex'],
+                         branch_mask=branch_mask)
         return back_transform(C, model)
 
 
@@ -851,7 +1123,7 @@ def RootProb(alignment, tree, model):
     Returns:
         (A, C) posterior root distribution
     """
-    subMats = compute_sub_matrices(model, tree['distanceToParent'])
+    subMats = _get_sub_matrices(model, tree['distanceToParent'])
     U, logNormU, logLike = upward_pass(alignment, tree, subMats, model['pi'])
 
     A = len(model['pi'])

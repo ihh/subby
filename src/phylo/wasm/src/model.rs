@@ -10,6 +10,16 @@ pub struct DiagModel {
     pub pi: Vec<f64>,            // (A,)
 }
 
+/// Irreversible diagonalized substitution model.
+/// Complex arrays stored as interleaved (re, im) pairs.
+#[derive(Clone, Debug)]
+pub struct IrrevDiagModel {
+    pub eigenvalues_complex: Vec<f64>,       // (2*A,) interleaved re/im
+    pub eigenvectors_complex: Vec<f64>,      // (2*A*A,) interleaved re/im, row-major
+    pub eigenvectors_inv_complex: Vec<f64>,  // (2*A*A,) interleaved re/im, row-major
+    pub pi: Vec<f64>,                        // (A,)
+}
+
 /// HKY85 model with closed-form eigendecomposition.
 pub fn hky85_diag(kappa: f64, pi: &[f64]) -> DiagModel {
     let (pi_a, pi_c, pi_g, pi_t) = (pi[0], pi[1], pi[2], pi[3]);

@@ -25,6 +25,7 @@ from src.phylo.jax.models import (
     f81_model as jax_f81_model,
     gamma_rate_categories as jax_gamma_rate_categories,
     scale_model as jax_scale_model,
+    irrev_model_from_rate_matrix as jax_irrev_model_from_rate_matrix,
 )
 from src.phylo.jax.diagonalize import compute_sub_matrices as jax_compute_sub_matrices
 from src.phylo.jax.pruning import upward_pass as jax_upward_pass
@@ -452,6 +453,133 @@ class TestBranchMask:
                                       err_msg=f"BranchMask mismatch for R={R}")
 
 
+class TestCountsBranchMask:
+
+    @pytest.mark.parametrize('R', TREE_SIZES)
+    @pytest.mark.parametrize('model_name,model_fn,A',
+                             [c for c in MODEL_CONFIGS if c[2] == 4])
+    def test_masked_counts_jax_vs_oracle(self, R, model_name, model_fn, A):
+        """Both backends produce same result with branch_mask='auto'."""
+        C = 6
+        parentIndex, distances = _make_tree(R, seed=110)
+        alignment = _make_alignment(R, C, A, seed=111)
+
+        jax_model = model_fn()
+        ora_model = _oracle_model_from_jax(jax_model)
+        jax_tree = _jax_tree(parentIndex, distances)
+        ora_tree = _oracle_tree(parentIndex, distances)
+
+        jax_c = np.array(jax_Counts(
+            jnp.array(alignment), jax_tree, jax_model, branch_mask="auto"
+        ))
+        ora_c = oracle.Counts(alignment, ora_tree, ora_model, branch_mask="auto")
+
+        np.testing.assert_allclose(ora_c, jax_c, atol=1e-6,
+                                   err_msg=f"Masked counts mismatch for R={R}, {model_name}")
+
+    @pytest.mark.parametrize('R', TREE_SIZES)
+    def test_masked_counts_f81_fast(self, R):
+        """F81 fast path with branch_mask='auto' matches oracle."""
+        C = 6
+        parentIndex, distances = _make_tree(R, seed=112)
+        alignment = _make_alignment(R, C, 4, seed=113)
+
+        jax_model = jax_jukes_cantor_model(4)
+        ora_model = _oracle_model_from_jax(jax_model)
+        jax_tree = _jax_tree(parentIndex, distances)
+        ora_tree = _oracle_tree(parentIndex, distances)
+
+        jax_c = np.array(jax_Counts(
+            jnp.array(alignment), jax_tree, jax_model,
+            f81_fast_flag=True, branch_mask="auto"
+        ))
+        ora_c = oracle.Counts(alignment, ora_tree, ora_model,
+                              f81_fast=True, branch_mask="auto")
+
+        np.testing.assert_allclose(ora_c, jax_c, atol=1e-6,
+                                   err_msg=f"F81 fast masked counts mismatch for R={R}")
+
+    def test_masked_vs_unmasked_differ(self):
+        """Gappy alignment: masked and unmasked counts differ."""
+        R = 7
+        C = 8
+        A = 4
+        parentIndex, distances = _make_tree(R, seed=114)
+        # Create alignment with gaps to ensure masking has an effect
+        rng = np.random.RandomState(115)
+        alignment = rng.randint(0, A, size=(R, C)).astype(np.int32)
+        # Make some leaves fully gapped in some columns
+        n_leaves = (R + 1) // 2
+        leaf_start = R - n_leaves
+        alignment[leaf_start, :4] = A + 1  # gap token
+        alignment[leaf_start + 1, 2:6] = A + 1
+
+        ora_model = oracle.jukes_cantor_model(A)
+        ora_tree = _oracle_tree(parentIndex, distances)
+
+        masked = oracle.Counts(alignment, ora_tree, ora_model, branch_mask="auto")
+        unmasked = oracle.Counts(alignment, ora_tree, ora_model, branch_mask=None)
+
+        assert not np.allclose(masked, unmasked), \
+            "Masked and unmasked counts should differ for gappy alignment"
+
+    def test_no_gaps_masked_equals_unmasked(self):
+        """Fully-observed alignment: masked and unmasked identical."""
+        R = 7
+        C = 6
+        A = 4
+        parentIndex, distances = _make_tree(R, seed=116)
+        # All tokens in {0..A-1}: no gaps
+        rng = np.random.RandomState(117)
+        alignment = rng.randint(0, A, size=(R, C)).astype(np.int32)
+
+        ora_model = oracle.jukes_cantor_model(A)
+        ora_tree = _oracle_tree(parentIndex, distances)
+
+        masked = oracle.Counts(alignment, ora_tree, ora_model, branch_mask="auto")
+        unmasked = oracle.Counts(alignment, ora_tree, ora_model, branch_mask=None)
+
+        np.testing.assert_allclose(masked, unmasked, atol=1e-12,
+                                   err_msg="No-gap alignment: masked should equal unmasked")
+
+    def test_single_ungapped_leaf_zero_counts(self):
+        """3-node tree, one leaf gapped → Steiner tree has no edges → all-zero counts."""
+        # Tree: root(0) -> leaf1(1), leaf2(2)
+        parentIndex = np.array([-1, 0, 0], dtype=np.int32)
+        distances = np.array([0.0, 0.1, 0.2])
+        A = 4
+        C = 3
+        # leaf1 observed, leaf2 fully gapped
+        alignment = np.zeros((3, C), dtype=np.int32)
+        alignment[1, :] = 0  # observed
+        alignment[2, :] = A + 1  # gapped
+
+        ora_model = oracle.jukes_cantor_model(A)
+        ora_tree = _oracle_tree(parentIndex, distances)
+
+        counts = oracle.Counts(alignment, ora_tree, ora_model, branch_mask="auto")
+
+        # Single ungapped leaf: Steiner tree is just that leaf (no edges)
+        np.testing.assert_allclose(counts, 0.0, atol=1e-15,
+                                   err_msg="Single ungapped leaf should yield zero counts")
+
+    def test_masked_counts_nonneg(self):
+        """Counts with masking are non-negative."""
+        R = 7
+        C = 8
+        A = 4
+        parentIndex, distances = _make_tree(R, seed=118)
+        alignment = _make_alignment(R, C, A, seed=119)
+
+        ora_model = oracle.jukes_cantor_model(A)
+        ora_tree = _oracle_tree(parentIndex, distances)
+
+        counts = oracle.Counts(alignment, ora_tree, ora_model, branch_mask="auto")
+
+        assert np.all(counts >= -1e-10), \
+            f"Masked counts should be non-negative, min={counts.min()}"
+
+
 class TestModels:
 
     def test_hky85_eigenvalues(self):
@@ -477,3 +605,196 @@ class TestModels:
         ora_rates, ora_weights = oracle.gamma_rate_categories(0.5, 4)
         np.testing.assert_allclose(ora_rates, np.array(jax_rates), atol=1e-4)
         np.testing.assert_allclose(ora_weights, np.array(jax_weights), atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Irreversible model tests
+# ---------------------------------------------------------------------------
+
+def _make_irrev_rate_matrix(A, seed):
+    """Random valid irreversible rate matrix: off-diag >= 0, rows sum to 0."""
+    rng = np.random.RandomState(seed)
+    R = rng.uniform(0.01, 1.0, (A, A))
+    np.fill_diagonal(R, 0.0)
+    np.fill_diagonal(R, -R.sum(axis=1))
+    # Normalize to expected rate = 1 under uniform pi
+    pi = np.ones(A) / A
+    rate = -np.sum(pi * np.diag(R))
+    R /= rate
+    return R, pi
+
+
+def _oracle_irrev_model(subRate, pi):
+    return oracle.irrev_model_from_rate_matrix(subRate, pi)
+
+
+def _jax_irrev_model(subRate, pi):
+    return jax_irrev_model_from_rate_matrix(subRate, pi)
+
+
+class TestIrreversible:
+
+    def test_irrev_diag_roundtrip(self):
+        """Diagonalize, reconstruct M(t), compare to matrix exponential."""
+        from scipy.linalg import expm
+        A = 4
+        R_mat, pi = _make_irrev_rate_matrix(A, seed=200)
+        model = _oracle_irrev_model(R_mat, pi)
+        distances = np.array([0.1, 0.5, 1.0, 2.0])
+        M = oracle.compute_sub_matrices_irrev(model, distances)
+        for r, t in enumerate(distances):
+            M_exact = expm(R_mat * t)
+            np.testing.assert_allclose(M[r], M_exact, atol=1e-10,
+                                       err_msg=f"M(t={t}) roundtrip failed")
+
+    def test_irrev_sub_matrices_row_stochastic(self):
+        """M(t) rows sum to 1, all entries non-negative."""
+        A = 4
+        R_mat, pi = _make_irrev_rate_matrix(A, seed=201)
+        model = _oracle_irrev_model(R_mat, pi)
+        distances = np.array([0.01, 0.1, 0.5, 1.0])
+        M = oracle.compute_sub_matrices_irrev(model, distances)
+        for r in range(len(distances)):
+            row_sums = M[r].sum(axis=1)
+            np.testing.assert_allclose(row_sums, 1.0, atol=1e-10,
+                                       err_msg=f"M(t={distances[r]}) rows don't sum to 1")
+            assert np.all(M[r] >= -1e-12), \
+                f"M(t={distances[r]}) has negative entries: min={M[r].min()}"
+
+    @pytest.mark.parametrize('R', TREE_SIZES)
+    def test_irrev_loglike_jax_vs_oracle(self, R):
+        """Both backends agree on log-likelihood with irreversible model."""
+        A = 4
+        C = 6
+        R_mat, pi = _make_irrev_rate_matrix(A, seed=202)
+        parentIndex, distances = _make_tree(R, seed=203)
+        alignment = _make_alignment(R, C, A, seed=204)
+
+        ora_model = _oracle_irrev_model(R_mat, pi)
+        jax_model = _jax_irrev_model(R_mat, pi)
+        ora_tree = _oracle_tree(parentIndex, distances)
+        jax_tree = _jax_tree(parentIndex, distances)
+
+        ora_ll = oracle.LogLike(alignment, ora_tree, ora_model)
+        jax_ll = np.array(jax_LogLike(jnp.array(alignment), jax_tree, jax_model))
+
+        np.testing.assert_allclose(ora_ll, jax_ll, atol=1e-8,
+                                   err_msg=f"Irrev LogLike mismatch for R={R}")
+
+    @pytest.mark.parametrize('R', TREE_SIZES)
+    def test_irrev_counts_jax_vs_oracle(self, R):
+        """Counts match between JAX and oracle at atol=1e-6."""
+        A = 4
+        C = 6
+        R_mat, pi = _make_irrev_rate_matrix(A, seed=205)
+        parentIndex, distances = _make_tree(R, seed=206)
+        alignment = _make_alignment(R, C, A, seed=207)
+
+        ora_model = _oracle_irrev_model(R_mat, pi)
+        jax_model = _jax_irrev_model(R_mat, pi)
+        ora_tree = _oracle_tree(parentIndex, distances)
+        jax_tree = _jax_tree(parentIndex, distances)
+
+        ora_c = oracle.Counts(alignment, ora_tree, ora_model, branch_mask=None)
+        jax_c = np.array(jax_Counts(jnp.array(alignment), jax_tree, jax_model,
+                                    branch_mask=None))
+
+        np.testing.assert_allclose(ora_c, jax_c, atol=1e-6,
+                                   err_msg=f"Irrev Counts mismatch for R={R}")
+
+    def test_irrev_counts_real(self):
+        """Counts output is real-valued (imaginary part < 1e-12)."""
+        A = 4
+        C = 6
+        R_mat, pi = _make_irrev_rate_matrix(A, seed=208)
+        parentIndex, distances = _make_tree(7, seed=209)
+        alignment = _make_alignment(7, C, A, seed=210)
+
+        jax_model = _jax_irrev_model(R_mat, pi)
+        jax_tree = _jax_tree(parentIndex, distances)
+
+        jax_c = jax_Counts(jnp.array(alignment), jax_tree, jax_model, branch_mask=None)
+        assert jnp.isrealobj(jax_c) or jnp.all(jnp.abs(jnp.imag(jax_c)) < 1e-12), \
+            "Counts output should be real"
+
+    def test_irrev_counts_nonneg(self):
+        """Counts non-negative (within tolerance)."""
+        A = 4
+        C = 6
+        R_mat, pi = _make_irrev_rate_matrix(A, seed=211)
+        parentIndex, distances = _make_tree(7, seed=212)
+        alignment = _make_alignment(7, C, A, seed=213)
+
+        ora_model = _oracle_irrev_model(R_mat, pi)
+        ora_tree = _oracle_tree(parentIndex, distances)
+
+        counts = oracle.Counts(alignment, ora_tree, ora_model, branch_mask=None)
+        assert np.all(counts >= -1e-10), \
+            f"Irrev counts should be non-negative, min={counts.min()}"
+
+    @pytest.mark.parametrize('R', TREE_SIZES)
+    def test_irrev_with_branch_mask(self, R):
+        """Counts with branch_mask='auto' still match JAX vs oracle."""
+        A = 4
+        C = 6
+        R_mat, pi = _make_irrev_rate_matrix(A, seed=214)
+        parentIndex, distances = _make_tree(R, seed=215)
+        alignment = _make_alignment(R, C, A, seed=216)
+
+        ora_model = _oracle_irrev_model(R_mat, pi)
+        jax_model = _jax_irrev_model(R_mat, pi)
+        ora_tree = _oracle_tree(parentIndex, distances)
+        jax_tree = _jax_tree(parentIndex, distances)
+
+        ora_c = oracle.Counts(alignment, ora_tree, ora_model, branch_mask="auto")
+        jax_c = np.array(jax_Counts(jnp.array(alignment), jax_tree, jax_model,
+                                    branch_mask="auto"))
+
+        np.testing.assert_allclose(ora_c, jax_c, atol=1e-6,
+                                   err_msg=f"Irrev masked counts mismatch for R={R}")
+
+    def test_reversible_model_unchanged(self):
+        """Existing reversible models produce identical results through both old and new code paths."""
+        R = 7
+        C = 6
+        A = 4
+        parentIndex, distances = _make_tree(R, seed=217)
+        alignment = _make_alignment(R, C, A, seed=218)
+
+        jax_model = jax_jukes_cantor_model(4)
+        ora_model = _oracle_model_from_jax(jax_model)
+        jax_tree = _jax_tree(parentIndex, distances)
+        ora_tree = _oracle_tree(parentIndex, distances)
+
+        # These should be identical to the original tests
+        jax_c = np.array(jax_Counts(jnp.array(alignment), jax_tree, jax_model))
+        ora_c = oracle.Counts(alignment, ora_tree, ora_model)
+
+        np.testing.assert_allclose(ora_c, jax_c, atol=1e-6,
+                                   err_msg="Reversible model results changed")
+
+    @pytest.mark.parametrize('R', TREE_SIZES)
+    def test_irrev_root_prob(self, R):
+        """Posterior root distribution sums to 1 per column."""
+        A = 4
+        C = 6
+        R_mat, pi = _make_irrev_rate_matrix(A, seed=219)
+        parentIndex, distances = _make_tree(R, seed=220)
+        alignment = _make_alignment(R, C, A, seed=221)
+
+        ora_model = _oracle_irrev_model(R_mat, pi)
+        jax_model = _jax_irrev_model(R_mat, pi)
+        ora_tree = _oracle_tree(parentIndex, distances)
+        jax_tree = _jax_tree(parentIndex, distances)
+
+        ora_rp = oracle.RootProb(alignment, ora_tree, ora_model)
+        jax_rp = np.array(jax_RootProb(jnp.array(alignment), jax_tree, jax_model))
+
+        # Both should agree
+        np.testing.assert_allclose(ora_rp, jax_rp, atol=1e-8,
+                                   err_msg=f"Irrev RootProb mismatch for R={R}")
+
+        # Sum to 1 per column
+        col_sums = ora_rp.sum(axis=0)
+        np.testing.assert_allclose(col_sums, 1.0, atol=1e-8,
+                                   err_msg=f"Irrev RootProb doesn't sum to 1")

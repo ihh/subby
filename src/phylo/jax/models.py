@@ -1,5 +1,6 @@
 import jax.numpy as jnp
-from .types import DiagModel
+from .types import DiagModel, IrrevDiagModel
+from .diagonalize import diagonalize_irreversible
 
 
 def hky85_diag(kappa, pi):
@@ -191,3 +192,18 @@ def scale_model(model, rate_multiplier):
     )
     pi = jnp.broadcast_to(model.pi[None, ...], (K, *model.pi.shape))
     return DiagModel(eigenvalues=eigenvalues, eigenvectors=eigenvectors, pi=pi)
+
+
+def irrev_model_from_rate_matrix(subRate, pi):
+    """Construct an IrrevDiagModel from a (possibly irreversible) rate matrix.
+
+    Args:
+        subRate: (*H, A, A) rate matrix
+        pi: (*H, A) stationary distribution
+
+    Returns:
+        IrrevDiagModel
+    """
+    subRate = jnp.asarray(subRate, dtype=jnp.float64)
+    pi = jnp.asarray(pi, dtype=jnp.float64)
+    return diagonalize_irreversible(subRate, pi)

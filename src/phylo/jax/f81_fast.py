@@ -1,7 +1,8 @@
 import jax.numpy as jnp
 
 
-def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex):
+def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex,
+               branch_mask=None):
     """O(CRA^2) direct computation of expected counts for F81/JC models.
 
     For F81: M_ij(t) = delta_ij * e^{-mu*t} + pi_j * (1 - e^{-mu*t})
@@ -17,6 +18,8 @@ def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex):
         distances: (R,) branch lengths
         pi: (*H, A) equilibrium frequencies
         parentIndex: (R,) parent indices
+        branch_mask: (*H, R, C) bool or None — if provided, zeros out
+            contributions from inactive branches
 
     Returns:
         (*H, A, A, C) counts tensor (diag=dwell, off-diag=substitutions)
@@ -44,6 +47,8 @@ def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex):
         logNormD[..., 1:, :] + logNormU[..., 1:, :] - logLike[..., None, :]
     )  # (*H, R-1, C)
     scale = jnp.exp(log_scale)  # (*H, R-1, C)
+    if branch_mask is not None:
+        scale = scale * branch_mask[..., 1:, :]
 
     # Per-branch inside/outside vectors (nodes 1..R-1)
     D_b = D[..., 1:, :, :]  # (*H, R-1, C, A)
