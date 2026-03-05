@@ -17,7 +17,7 @@ from .eigensub import (
 )
 from .f81_fast import f81_counts
 from .mixture import mixture_posterior
-from .vjp import _loglike_custom_distances
+from .vjp import make_loglike_custom_grad
 from .models import (
     hky85_diag, jukes_cantor_model, f81_model,
     gamma_rate_categories, scale_model,
@@ -159,9 +159,8 @@ def LogLikeCustomGrad(
         (*H, C) log-likelihoods
     """
     model = _ensure_diag(model)
-    return _loglike_custom_distances(
-        tree.distanceToParent, alignment, tree.parentIndex, model, maxChunkSize
-    )
+    f = make_loglike_custom_grad(model, alignment, tree.parentIndex, maxChunkSize)
+    return f(tree.distanceToParent)
 
 
 def Counts(
