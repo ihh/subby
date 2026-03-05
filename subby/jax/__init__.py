@@ -15,6 +15,7 @@ from .eigensub import (
     compute_J, eigenbasis_project, accumulate_C, back_transform,
     compute_J_complex, eigenbasis_project_irrev, accumulate_C_complex, back_transform_irrev,
 )
+from ._utils import pad_alignment, unpad_columns
 from .f81_fast import f81_counts
 from .mixture import mixture_posterior
 from .vjp import make_loglike_custom_grad

@@ -78,6 +78,47 @@ def token_to_likelihood(alignment: jnp.ndarray, A: int) -> jnp.ndarray:
     return lookup[alignment + 1]
 
 
+def pad_alignment(
+    alignment: jnp.ndarray, bin_size: int = 128,
+) -> tuple[jnp.ndarray, int]:
+    """Pad alignment columns to the next multiple of bin_size with gap tokens.
+
+    Gap-padded columns (-1) produce all-ones likelihood vectors, so they are
+    mathematically neutral: logL=0, zero counts, root prior unchanged.
+    Padding avoids JAX recompilation when C varies across inputs.
+
+    Args:
+        alignment: (R, C) int32 tokens
+        bin_size: round C up to the next multiple of this
+
+    Returns:
+        (padded_alignment, C_original) where padded_alignment has
+        C_padded = ceil(C / bin_size) * bin_size columns.
+    """
+    C_original = alignment.shape[1]
+    remainder = C_original % bin_size
+    if remainder == 0:
+        return alignment, C_original
+    pad_width = bin_size - remainder
+    padding = jnp.full((alignment.shape[0], pad_width), -1, dtype=alignment.dtype)
+    return jnp.concatenate([alignment, padding], axis=1), C_original
+
+
+def unpad_columns(result: jnp.ndarray, C_original: int) -> jnp.ndarray:
+    """Strip padding columns from a result array.
+
+    Works for any array whose last axis is the column dimension C.
+
+    Args:
+        result: (..., C_padded) array
+        C_original: original number of columns before padding
+
+    Returns:
+        (..., C_original) array
+    """
+    return result[..., :C_original]
+
+
 def rescale(
     vec: jnp.ndarray, log_norm: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:

@@ -255,6 +255,46 @@ Scale eigenvalues by a rate multiplier. If `rate_multiplier` is `(K,)`, adds $K$
 
 ---
 
+## Padding utilities
+
+### `pad_alignment(alignment, bin_size=128)`
+
+Pad alignment columns to the next multiple of `bin_size` with gap tokens (`-1`). Gap-padded columns are mathematically neutral (logL = 0, zero counts, root prior unchanged), so padding avoids JAX recompilation when `C` varies across inputs.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `alignment` | `int32 (R, C)` | Token-encoded alignment |
+| `bin_size` | `int` | Round `C` up to the next multiple of this (default 128) |
+
+**Returns:** `(padded_alignment, C_original)` — the padded `(R, C_padded)` alignment and the original column count.
+
+### `unpad_columns(result, C_original)`
+
+Strip padding columns from a result array: `result[..., :C_original]`.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `result` | array `(..., C_padded)` | Output from a padded computation |
+| `C_original` | `int` | Original column count from `pad_alignment` |
+
+**Returns:** `(..., C_original)` array.
+
+**Example — JIT-friendly binning:**
+
+```python
+from subby.jax import LogLike, pad_alignment, unpad_columns
+
+padded, C_orig = pad_alignment(alignment, bin_size=64)
+ll = LogLike(padded, tree, model)       # shape reused across similar C
+ll = unpad_columns(ll, C_orig)          # back to original C
+```
+
+---
+
 ## Low-level functions
 
 ### `diagonalize_rate_matrix(subRate, rootProb)`

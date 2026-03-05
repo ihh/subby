@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 
-from subby.jax import LogLike, Counts, RootProb, MixturePosterior, LogLikeCustomGrad
+from subby.jax import LogLike, Counts, RootProb, MixturePosterior, LogLikeCustomGrad, pad_alignment, unpad_columns
 from subby.jax.types import Tree, RateModel
 from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model, irrev_model_from_rate_matrix
 
@@ -286,3 +286,216 @@ class TestMixturePosterior:
         assert post.shape == (3, C)
         sums = jnp.sum(post, axis=0)
         np.testing.assert_allclose(sums, 1.0, atol=1e-6)
+
+
+class TestPadAlignment:
+
+    def _make_setup(self, C=10, n_leaves=5, seed=42):
+        tree = _make_medium_tree(n_leaves, key=jax.random.PRNGKey(seed))
+        R = tree.parentIndex.shape[0]
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(seed + 1), (R, C), 0, 4
+        ).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+        return alignment, tree, model
+
+    def test_loglike_round_trip(self):
+        alignment, tree, model = self._make_setup(C=10)
+        padded, C_orig = pad_alignment(alignment, bin_size=8)
+        ll_orig = LogLike(alignment, tree, model)
+        ll_padded = unpad_columns(LogLike(padded, tree, model), C_orig)
+        np.testing.assert_allclose(ll_padded, ll_orig, atol=1e-12)
+
+    def test_counts_round_trip(self):
+        alignment, tree, model = self._make_setup(C=10)
+        padded, C_orig = pad_alignment(alignment, bin_size=8)
+        counts_orig = Counts(alignment, tree, model)
+        counts_padded = unpad_columns(Counts(padded, tree, model), C_orig)
+        np.testing.assert_allclose(counts_padded, counts_orig, atol=1e-12)
+
+    def test_rootprob_round_trip(self):
+        alignment, tree, model = self._make_setup(C=10)
+        padded, C_orig = pad_alignment(alignment, bin_size=8)
+        rp_orig = RootProb(alignment, tree, model)
+        rp_padded = unpad_columns(RootProb(padded, tree, model), C_orig)
+        np.testing.assert_allclose(rp_padded, rp_orig, atol=1e-12)
+
+    def test_padded_columns_loglike_zero(self):
+        alignment, tree, model = self._make_setup(C=10)
+        padded, C_orig = pad_alignment(alignment, bin_size=8)
+        ll = LogLike(padded, tree, model)
+        np.testing.assert_allclose(ll[C_orig:], 0.0, atol=1e-12)
+
+    def test_noop_when_aligned(self):
+        alignment, tree, model = self._make_setup(C=16)
+        padded, C_orig = pad_alignment(alignment, bin_size=8)
+        assert C_orig == 16
+        assert padded.shape[1] == 16
+        np.testing.assert_array_equal(padded, alignment)
+
+    @pytest.mark.parametrize("bin_size", [8, 16, 32])
+    def test_various_bin_sizes(self, bin_size):
+        alignment, tree, model = self._make_setup(C=10)
+        padded, C_orig = pad_alignment(alignment, bin_size=bin_size)
+        assert padded.shape[1] % bin_size == 0
+        assert C_orig == 10
+        ll_orig = LogLike(alignment, tree, model)
+        ll_padded = unpad_columns(LogLike(padded, tree, model), C_orig)
+        np.testing.assert_allclose(ll_padded, ll_orig, atol=1e-12)
+
+    def test_irreversible_model_round_trip(self):
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(50))
+        R = tree.parentIndex.shape[0]
+        C = 10
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(51), (R, C), 0, 4
+        ).astype(jnp.int32)
+
+        A = 4
+        rng = np.random.RandomState(99)
+        rate = rng.uniform(0.01, 1.0, (A, A))
+        np.fill_diagonal(rate, 0.0)
+        np.fill_diagonal(rate, -rate.sum(axis=1))
+        pi = np.ones(A) / A
+        norm = -np.sum(pi * np.diag(rate))
+        rate /= norm
+        model = irrev_model_from_rate_matrix(jnp.array(rate), jnp.array(pi))
+
+        padded, C_orig = pad_alignment(alignment, bin_size=8)
+        ll_orig = LogLike(alignment, tree, model)
+        ll_padded = unpad_columns(LogLike(padded, tree, model), C_orig)
+        np.testing.assert_allclose(ll_padded.real, ll_orig.real, atol=1e-10)
+
+    def test_single_column(self):
+        """C=1 with large bin_size: almost all columns are padding."""
+        alignment, tree, model = self._make_setup(C=1)
+        padded, C_orig = pad_alignment(alignment, bin_size=32)
+        assert C_orig == 1
+        assert padded.shape[1] == 32
+        ll_orig = LogLike(alignment, tree, model)
+        ll_padded = LogLike(padded, tree, model)
+        np.testing.assert_allclose(ll_padded[0], ll_orig[0], atol=1e-12)
+        np.testing.assert_allclose(ll_padded[1:], 0.0, atol=1e-12)
+
+    def test_nonuniform_pi_loglike_zero(self):
+        """Padded columns logL=0 even with non-uniform pi (HKY85)."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(60))
+        R = tree.parentIndex.shape[0]
+        C = 7
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(61), (R, C), 0, 4
+        ).astype(jnp.int32)
+        model = hky85_diag(2.5, jnp.array([0.1, 0.2, 0.3, 0.4]))
+        padded, C_orig = pad_alignment(alignment, bin_size=16)
+        ll = LogLike(padded, tree, model)
+        np.testing.assert_allclose(ll[C_orig:], 0.0, atol=1e-12)
+
+    def test_padded_rootprob_returns_prior(self):
+        """All-gap columns should have posterior = prior pi."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(70))
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(71), (R, C), 0, 4
+        ).astype(jnp.int32)
+        pi = jnp.array([0.1, 0.2, 0.3, 0.4])
+        model = hky85_diag(2.0, pi)
+        padded, C_orig = pad_alignment(alignment, bin_size=8)
+        rp = RootProb(padded, tree, model)  # (A, C_padded)
+        # Padded columns: posterior root = prior
+        for c in range(C_orig, padded.shape[1]):
+            np.testing.assert_allclose(rp[:, c], pi, atol=1e-10)
+
+    def test_padded_counts_zero_with_auto_mask(self):
+        """With branch_mask='auto', all-gap columns have empty Steiner tree -> zero counts."""
+        alignment, tree, model = self._make_setup(C=10)
+        padded, C_orig = pad_alignment(alignment, bin_size=16)
+        counts = Counts(padded, tree, model, branch_mask="auto")
+        # Padded columns (all gaps) should have all-zero counts
+        np.testing.assert_allclose(counts[:, :, C_orig:], 0.0, atol=1e-12)
+
+    def test_f81_fast_counts_round_trip(self):
+        """F81 fast path should also be neutral for gap-padded columns."""
+        alignment, tree, model = self._make_setup(C=10)
+        padded, C_orig = pad_alignment(alignment, bin_size=16)
+        counts_orig = Counts(alignment, tree, model, f81_fast_flag=True)
+        counts_padded = unpad_columns(
+            Counts(padded, tree, model, f81_fast_flag=True), C_orig
+        )
+        np.testing.assert_allclose(counts_padded, counts_orig, atol=1e-12)
+
+    def test_custom_grad_round_trip(self):
+        """LogLikeCustomGrad forward values must also be neutral for padded columns."""
+        alignment, tree, model = self._make_setup(C=10)
+        padded, C_orig = pad_alignment(alignment, bin_size=16)
+        ll_orig = LogLikeCustomGrad(alignment, tree, model)
+        ll_padded = LogLikeCustomGrad(padded, tree, model)
+        np.testing.assert_allclose(
+            unpad_columns(ll_padded, C_orig), ll_orig, atol=1e-12
+        )
+        np.testing.assert_allclose(ll_padded[C_orig:], 0.0, atol=1e-12)
+
+    def test_bin_size_one_is_noop(self):
+        """bin_size=1 should never pad, regardless of C."""
+        for C in [1, 7, 13, 128]:
+            alignment, tree, model = self._make_setup(C=C)
+            padded, C_orig = pad_alignment(alignment, bin_size=1)
+            assert C_orig == C
+            assert padded.shape[1] == C
+            np.testing.assert_array_equal(padded, alignment)
+
+    def test_alignment_with_existing_gaps(self):
+        """Padding must not corrupt columns that already contain gap tokens."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(80))
+        R = tree.parentIndex.shape[0]
+        C = 10
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(81), (R, C), -1, 4
+        ).astype(jnp.int32)  # includes -1 tokens
+        model = jukes_cantor_model(4)
+        padded, C_orig = pad_alignment(alignment, bin_size=16)
+        ll_orig = LogLike(alignment, tree, model)
+        ll_padded = unpad_columns(LogLike(padded, tree, model), C_orig)
+        np.testing.assert_allclose(ll_padded, ll_orig, atol=1e-12)
+
+    def test_dtype_preserved(self):
+        """pad_alignment should preserve the input dtype."""
+        alignment, tree, model = self._make_setup(C=10)
+        assert alignment.dtype == jnp.int32
+        padded, _ = pad_alignment(alignment, bin_size=8)
+        assert padded.dtype == jnp.int32
+
+    @pytest.mark.parametrize("C,bin_size,expected_padded", [
+        (1, 8, 8),
+        (8, 8, 8),
+        (9, 8, 16),
+        (15, 8, 16),
+        (1, 128, 128),
+        (127, 128, 128),
+        (129, 128, 256),
+    ])
+    def test_padded_shape(self, C, bin_size, expected_padded):
+        """Padded C = ceil(C / bin_size) * bin_size."""
+        alignment, tree, model = self._make_setup(C=C)
+        padded, C_orig = pad_alignment(alignment, bin_size=bin_size)
+        assert C_orig == C
+        assert padded.shape[1] == expected_padded
+
+    def test_mixture_posterior_round_trip(self):
+        """MixturePosterior should also be unaffected by padding."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(90))
+        R = tree.parentIndex.shape[0]
+        C = 10
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(91), (R, C), 0, 4
+        ).astype(jnp.int32)
+        base = hky85_diag(2.0, jnp.array([0.25, 0.25, 0.25, 0.25]))
+        models = [scale_model(base, r) for r in [0.5, 1.0, 2.0]]
+        log_weights = jnp.log(jnp.array([1.0 / 3, 1.0 / 3, 1.0 / 3]))
+
+        padded, C_orig = pad_alignment(alignment, bin_size=16)
+        post_orig = MixturePosterior(alignment, tree, models, log_weights)
+        post_padded = unpad_columns(
+            MixturePosterior(padded, tree, models, log_weights), C_orig
+        )
+        np.testing.assert_allclose(post_padded, post_orig, atol=1e-10)
