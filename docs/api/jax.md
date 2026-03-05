@@ -83,6 +83,50 @@ Compute per-column log-likelihoods via Felsenstein pruning.
 
 When `model` is a list of C models, each column uses its own substitution model (per-column substitution matrices). This enables position-specific rates, e.g., from a neural network predicting rates per site.
 
+**Example — CNN-predicted per-column rates:**
+
+A 1D convolutional network reads the one-hot-encoded leaf sequences of an MSA and predicts per-column rate multipliers for a Jukes-Cantor model. Gradients flow from `LogLike` through the per-column model list back into the CNN parameters.
+
+```python
+import jax
+import jax.numpy as jnp
+from subby.jax import LogLike
+from subby.jax.types import Tree
+from subby.jax.models import jukes_cantor_model, scale_model
+
+# --- 1D CNN: leaf one-hots -> per-column rates ---
+def conv1d(x, w, b):
+    out = jax.lax.conv_general_dilated(
+        x[None, ...], w, window_strides=(1,), padding="SAME")[0]
+    return out + b[:, None]
+
+def predict_rates(params, leaf_one_hot):
+    """(n_leaves * A, C) -> (C,) positive rates."""
+    h = jax.nn.relu(conv1d(leaf_one_hot, params["w1"], params["b1"]))
+    h = jax.nn.relu(conv1d(h, params["w2"], params["b2"]))
+    h = conv1d(h, params["w3"], params["b3"])  # (1, C)
+    return jax.nn.softplus(h[0])
+
+# --- Loss: negative log-likelihood with per-column rates ---
+def loss_fn(params, alignment, tree, base_model, leaf_idx):
+    A = base_model.pi.shape[0]
+    leaves = alignment[leaf_idx]                         # (n_leaves, C)
+    oh = jax.nn.one_hot(leaves, A)                       # (n_leaves, C, A)
+    oh_input = oh.transpose(0, 2, 1).reshape(-1, alignment.shape[1])
+    rates = predict_rates(params, oh_input)              # (C,)
+    models = [scale_model(base_model, rates[c])
+              for c in range(rates.shape[0])]
+    return -jnp.sum(LogLike(alignment, tree, models))
+
+# --- Training loop (SGD, overfitting one example) ---
+grad_fn = jax.grad(loss_fn)
+for step in range(500):
+    grads = grad_fn(params, alignment, tree, base_model, leaf_idx)
+    params = jax.tree.map(lambda p, g: p - 1e-3 * g, params, grads)
+```
+
+See [`examples/conv_rate_prediction.py`](../../examples/conv_rate_prediction.py) for a complete runnable script that simulates an alignment with slow/fast columns and trains the CNN to recover the rate pattern.
+
 ### `LogLikeCustomGrad(alignment, tree, model, maxChunkSize=128)`
 
 Like `LogLike` but with a custom VJP for faster distance gradients.
