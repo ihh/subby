@@ -35,7 +35,7 @@ Note also that we do not need to consider (k,l) combinations where we know the k
 
 Denote by RootProb(MSA,Tree,Model) the posterior state distribution at the root node of the unambiguously ungapped subtree.
 
-In addition to the substitution counts, dwell times, and (occasionally) the root probabilities, we will sometimes use the posterior distribution over mixture component labels assuming an independent mixture model of substitution processes in each column (which we can easily get via a SoftMax of the LogLike(MSA,Tree,Component) values for each of the components, appropriately biased by the logs of the component prior weights).
+In addition to the substitution counts, dwell times, and (occasionally) the root probabilities, we can also compute the posterior distribution over mixture component labels assuming an independent mixture model of substitution processes in each column. We can easily get this posterior via a SoftMax of the LogLike(MSA,Tree,Component) values for each of the components, appropriately biased by the logs of the component prior weights.
 
 # IMPLEMENTATION
 
