@@ -154,7 +154,7 @@ def train(n_steps=500, lr=1e-3, seed=42):
     print(f"Baseline logL (uniform rate=1):  {ll_uniform:.4f}")
     print(f"Oracle logL (true rates):        {ll_oracle:.4f}")
 
-    grad_fn = jax.grad(loss_fn)
+    grad_fn = jax.jit(jax.grad(loss_fn))
 
     print(f"\nTraining for {n_steps} steps (lr={lr})...")
     for step in range(n_steps):
