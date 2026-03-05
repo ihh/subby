@@ -1,6 +1,7 @@
 from .oracle import (
     LogLike,
     Counts,
+    BranchCounts,
     RootProb,
     MixturePosterior,
     InsideOutside,
@@ -18,8 +19,11 @@ from .oracle import (
     compute_J,
     eigenbasis_project,
     accumulate_C,
+    accumulate_C_per_branch,
     back_transform,
+    back_transform_per_branch,
     f81_counts,
+    f81_counts_per_branch,
     mixture_posterior,
     compute_branch_mask,
     diagonalize_irreversible,
@@ -31,5 +35,7 @@ from .oracle import (
     compute_J_complex,
     eigenbasis_project_irrev,
     accumulate_C_complex,
+    accumulate_C_complex_per_branch,
     back_transform_irrev,
+    back_transform_irrev_per_branch,
 )

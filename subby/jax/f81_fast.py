@@ -139,3 +139,76 @@ def f81_counts(
     result = result + jnp.einsum('...ic,ij->...ijc', dwell, jnp.eye(A))
 
     return result
+
+
+def f81_counts_per_branch(
+    U: jnp.ndarray,
+    D: jnp.ndarray,
+    logNormU: jnp.ndarray,
+    logNormD: jnp.ndarray,
+    logLike: jnp.ndarray,
+    distances: jnp.ndarray,
+    pi: jnp.ndarray,
+    parentIndex: jnp.ndarray,
+) -> jnp.ndarray:
+    """Per-branch O(CRA^2) expected counts for F81/JC models.
+
+    Same as f81_counts but returns per-branch results without summing
+    over branches.
+
+    Returns:
+        (*H, R, A, A, C) per-branch counts (branch 0 = zeros,
+        diag=dwell, off-diag=substitutions)
+    """
+    *H, R, C, A = U.shape
+
+    mu = 1.0 / (1.0 - jnp.sum(pi ** 2, axis=-1))
+
+    t = distances[1:]
+    mu_t = mu[..., None] * t
+    e_t = jnp.exp(-mu_t)
+    p = 1.0 - e_t
+
+    alpha = t * e_t
+    beta = p / mu[..., None] - t * e_t
+    gamma = t * (1.0 + e_t) - 2.0 * p / mu[..., None]
+
+    log_scale = (
+        logNormD[..., 1:, :] + logNormU[..., 1:, :] - logLike[..., None, :]
+    )
+    scale = jnp.exp(log_scale)
+
+    D_b = D[..., 1:, :, :]
+    U_b = U[..., 1:, :, :]
+
+    D_scaled = D_b * scale[..., None]
+    U_scaled = U_b
+
+    piU = jnp.einsum('...a,...nca->...nc', pi, U_scaled)
+    Dsum = jnp.sum(D_scaled, axis=-1)
+
+    # Per-branch terms (keep n dimension)
+    term1 = jnp.einsum('...n,...nci,...ncj->...nijc', alpha, D_scaled, U_scaled)
+
+    term2a = jnp.einsum('...n,...nci,...nc->...nic', beta, D_scaled, piU)
+    term2b = jnp.einsum('...n,...i,...nc,...ncj->...nijc', beta, pi, Dsum, U_scaled)
+    term2 = term2a[..., :, :, None, :] + term2b
+
+    term3_scalar = gamma[..., None] * Dsum * piU  # (*H, R-1, C)
+    term3_per_i = pi[..., None, :, None] * term3_scalar[..., :, None, :]
+
+    # Dwell per branch
+    diag_term1 = jnp.einsum('...niic->...nic', term1)
+    diag_term2 = jnp.einsum('...niic->...nic', term2)
+    dwell = diag_term1 + diag_term2 + term3_per_i
+
+    # Subs per branch
+    I_sum_ij = term1 + term2 + term3_per_i[..., :, :, None, :]
+    subs = mu[..., None, None, None, None] * pi[..., None, None, :, None] * I_sum_ij
+
+    result_nonroot = subs * (1.0 - jnp.eye(A)[..., None])
+    result_nonroot = result_nonroot + jnp.einsum('...nic,ij->...nijc', dwell, jnp.eye(A))
+
+    # Prepend zeros for root
+    zeros = jnp.zeros_like(result_nonroot[..., :1, :, :, :])
+    return jnp.concatenate([zeros, result_nonroot], axis=-4)

@@ -142,6 +142,88 @@ pub fn back_transform(c_eigen: &[f64], model: &DiagModel, c: usize) -> Vec<f64> 
     counts
 }
 
+// ---- Per-branch variants ----
+
+/// Accumulate eigenbasis counts C_{kl} per branch.
+/// Returns (R*A*A*C) flat array with layout result[n*A*A*C + k*A*C + l*C + col].
+/// Branch 0 = zeros.
+pub fn accumulate_c_per_branch(
+    d_tilde: &[f64],
+    u_tilde: &[f64],
+    j: &[f64],
+    log_norm_u: &[f64],
+    log_norm_d: &[f64],
+    log_like: &[f64],
+    _parent_index: &[i32],
+    r: usize,
+    c: usize,
+    a: usize,
+) -> Vec<f64> {
+    let mut c_out = vec![0.0; r * a * a * c];
+
+    for n in 1..r {
+        for col in 0..c {
+            let log_s = log_norm_d[n * c + col] + log_norm_u[n * c + col] - log_like[col];
+            let scale = log_s.exp();
+            let base = (n * c + col) * a;
+
+            for k in 0..a {
+                for l in 0..a {
+                    c_out[n * a * a * c + k * a * c + l * c + col] =
+                        d_tilde[base + k] * j[n * a * a + k * a + l] * u_tilde[base + l] * scale;
+                }
+            }
+        }
+    }
+
+    c_out
+}
+
+/// Transform eigenbasis counts to natural basis, per branch.
+/// Takes (R*A*A*C) flat, returns (R*A*A*C) flat.
+pub fn back_transform_per_branch(c_eigen: &[f64], model: &DiagModel, r: usize, c: usize) -> Vec<f64> {
+    let a = model.pi.len();
+    let v = &model.eigenvectors;
+    let mu = &model.eigenvalues;
+
+    // S = V diag(mu) V^T
+    let mut s_mat = vec![0.0; a * a];
+    for i in 0..a {
+        for j in 0..a {
+            let mut s = 0.0;
+            for k in 0..a {
+                s += v[i * a + k] * mu[k] * v[j * a + k];
+            }
+            s_mat[i * a + j] = s;
+        }
+    }
+
+    // VCV = V C V^T per branch per column
+    let mut counts = vec![0.0; r * a * a * c];
+    for n in 1..r {
+        let br_offset = n * a * a * c;
+        for col in 0..c {
+            for i in 0..a {
+                for j in 0..a {
+                    let mut vcv = 0.0;
+                    for k in 0..a {
+                        for l in 0..a {
+                            vcv += v[i * a + k] * c_eigen[br_offset + k * a * c + l * c + col] * v[j * a + l];
+                        }
+                    }
+                    if i == j {
+                        counts[br_offset + i * a * c + j * c + col] = vcv;
+                    } else {
+                        counts[br_offset + i * a * c + j * c + col] = s_mat[i * a + j] * vcv;
+                    }
+                }
+            }
+        }
+    }
+
+    counts
+}
+
 // ---- Complex / irreversible variants ----
 
 /// Compute J^{kl}(T) for complex eigenvalues.
@@ -295,6 +377,99 @@ pub fn back_transform_irrev(c_eigen: &[f64], model: &IrrevDiagModel, c: usize) -
                 } else {
                     let r_ij = cload(&r_mat, i * a + j);
                     counts[i * a * c + j * c + col] = cmul(r_ij, vcv).0; // Re
+                }
+            }
+        }
+    }
+
+    counts
+}
+
+// ---- Per-branch complex / irreversible variants ----
+
+/// Accumulate eigenbasis counts for irreversible model per branch (complex).
+/// Returns interleaved (2*R*A*A*C). Branch 0 = zeros.
+pub fn accumulate_c_complex_per_branch(
+    d_tilde: &[f64],
+    u_tilde: &[f64],
+    j: &[f64],
+    log_norm_u: &[f64],
+    log_norm_d: &[f64],
+    log_like: &[f64],
+    _parent_index: &[i32],
+    r: usize,
+    c: usize,
+    a: usize,
+) -> Vec<f64> {
+    let mut c_out = vec![0.0; 2 * r * a * a * c];
+
+    for n in 1..r {
+        for col in 0..c {
+            let log_s = log_norm_d[n * c + col] + log_norm_u[n * c + col] - log_like[col];
+            let scale = log_s.exp();
+            let base = (n * c + col) * a;
+
+            for k in 0..a {
+                for l in 0..a {
+                    let dt_k = cload(d_tilde, base + k);
+                    let ut_l = cload(u_tilde, base + l);
+                    let j_kl = cload(j, n * a * a + k * a + l);
+                    let contrib = cscale(cmul(cmul(dt_k, j_kl), ut_l), scale);
+                    let idx = n * a * a * c + k * a * c + l * c + col;
+                    cstore(&mut c_out, idx, contrib);
+                }
+            }
+        }
+    }
+
+    c_out
+}
+
+/// Transform eigenbasis counts to natural basis for irreversible model, per branch.
+/// Takes interleaved (2*R*A*A*C), returns (R*A*A*C) real.
+pub fn back_transform_irrev_per_branch(c_eigen: &[f64], model: &IrrevDiagModel, r: usize, c: usize) -> Vec<f64> {
+    let a = model.pi.len();
+    let v = &model.eigenvectors_complex;
+    let v_inv = &model.eigenvectors_inv_complex;
+    let mu = &model.eigenvalues_complex;
+
+    // R = V diag(mu) V^{-1}
+    let mut r_mat = vec![0.0; 2 * a * a];
+    for i in 0..a {
+        for j in 0..a {
+            let mut s = CZERO;
+            for k in 0..a {
+                let v_ik = cload(v, i * a + k);
+                let mu_k = cload(mu, k);
+                let vinv_kj = cload(v_inv, k * a + j);
+                s = cadd(s, cmul(cmul(v_ik, mu_k), vinv_kj));
+            }
+            cstore(&mut r_mat, i * a + j, s);
+        }
+    }
+
+    // VCV = V C V^{-1} per branch per column
+    let mut counts = vec![0.0; r * a * a * c];
+    for n in 1..r {
+        let br_offset = n * a * a * c;
+        for col in 0..c {
+            for i in 0..a {
+                for j in 0..a {
+                    let mut vcv = CZERO;
+                    for k in 0..a {
+                        let v_ik = cload(v, i * a + k);
+                        for l in 0..a {
+                            let c_kl = cload(c_eigen, br_offset + k * a * c + l * c + col);
+                            let vinv_lj = cload(v_inv, l * a + j);
+                            vcv = cadd(vcv, cmul(cmul(v_ik, c_kl), vinv_lj));
+                        }
+                    }
+                    if i == j {
+                        counts[br_offset + i * a * c + j * c + col] = vcv.0; // Re
+                    } else {
+                        let r_ij = cload(&r_mat, i * a + j);
+                        counts[br_offset + i * a * c + j * c + col] = cmul(r_ij, vcv).0; // Re
+                    }
                 }
             }
         }

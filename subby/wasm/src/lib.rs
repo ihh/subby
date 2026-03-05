@@ -140,6 +140,73 @@ pub fn counts_irrev(
     eigensub::back_transform_irrev(&c_eigen, model, c)
 }
 
+/// Compute per-branch expected substitution counts and dwell times.
+/// Returns (R*A*A*C) flat with layout result[n*A*A*C + i*A*C + j*C + col].
+/// Branch 0 = zeros.
+pub fn branch_counts(
+    alignment: &[i32],
+    parent_index: &[i32],
+    distances: &[f64],
+    model: &DiagModel,
+    f81_fast_flag: bool,
+) -> Vec<f64> {
+    let r = parent_index.len();
+    let a = model.pi.len();
+    let c = alignment.len() / r;
+
+    let sub_mats = sub_matrices::compute_sub_matrices(model, distances);
+    let (u, log_norm_u, ll) = pruning::upward_pass(
+        alignment, parent_index, &sub_mats, &model.pi, r, c, a,
+    );
+    let (d, log_norm_d) = outside::downward_pass(
+        &u, &log_norm_u, parent_index, &sub_mats, &model.pi, alignment, r, c, a,
+    );
+
+    if f81_fast_flag {
+        f81_fast::f81_counts_per_branch(
+            &u, &d, &log_norm_u, &log_norm_d, &ll,
+            distances, &model.pi, parent_index, r, c, a,
+        )
+    } else {
+        let j = eigensub::compute_j(&model.eigenvalues, distances);
+        let (u_tilde, d_tilde) = eigensub::eigenbasis_project(&u, &d, model, r, c, a);
+        let c_eigen = eigensub::accumulate_c_per_branch(
+            &d_tilde, &u_tilde, &j, &log_norm_u, &log_norm_d, &ll,
+            parent_index, r, c, a,
+        );
+        eigensub::back_transform_per_branch(&c_eigen, model, r, c)
+    }
+}
+
+/// Compute per-branch expected substitution counts and dwell times (irreversible model).
+/// Returns (R*A*A*C) flat. Branch 0 = zeros.
+pub fn branch_counts_irrev(
+    alignment: &[i32],
+    parent_index: &[i32],
+    distances: &[f64],
+    model: &IrrevDiagModel,
+) -> Vec<f64> {
+    let r = parent_index.len();
+    let a = model.pi.len();
+    let c = alignment.len() / r;
+
+    let sub_mats = sub_matrices::compute_sub_matrices_irrev(model, distances);
+    let (u, log_norm_u, ll) = pruning::upward_pass(
+        alignment, parent_index, &sub_mats, &model.pi, r, c, a,
+    );
+    let (d, log_norm_d) = outside::downward_pass(
+        &u, &log_norm_u, parent_index, &sub_mats, &model.pi, alignment, r, c, a,
+    );
+
+    let j = eigensub::compute_j_complex(&model.eigenvalues_complex, distances);
+    let (u_tilde, d_tilde) = eigensub::eigenbasis_project_irrev(&u, &d, model, r, c, a);
+    let c_eigen = eigensub::accumulate_c_complex_per_branch(
+        &d_tilde, &u_tilde, &j, &log_norm_u, &log_norm_d, &ll,
+        parent_index, r, c, a,
+    );
+    eigensub::back_transform_irrev_per_branch(&c_eigen, model, r, c)
+}
+
 /// Compute posterior root state distribution.
 pub fn root_prob(
     alignment: &[i32],
@@ -365,6 +432,57 @@ impl InsideOutsideTable {
                     &self.log_like, &self.parent_index, self.r, self.c, self.a,
                 );
                 eigensub::back_transform_irrev(&c_eigen, &model, self.c)
+            }
+        }
+    }
+
+    /// Per-branch expected substitution counts and dwell times.
+    /// Returns (R*A*A*C) flat with layout result[n*A*A*C + i*A*C + j*C + col].
+    /// Branch 0 = zeros.
+    pub fn branch_counts(&self, f81_fast_flag: bool) -> Vec<f64> {
+        match &self.model_data {
+            ModelData::Reversible { eigenvalues, eigenvectors } => {
+                if f81_fast_flag {
+                    f81_fast::f81_counts_per_branch(
+                        &self.u, &self.d, &self.log_norm_u, &self.log_norm_d,
+                        &self.log_like, &self.distances, &self.pi,
+                        &self.parent_index, self.r, self.c, self.a,
+                    )
+                } else {
+                    let model = DiagModel {
+                        eigenvalues: eigenvalues.clone(),
+                        eigenvectors: eigenvectors.clone(),
+                        pi: self.pi.clone(),
+                    };
+                    let j = eigensub::compute_j(eigenvalues, &self.distances);
+                    let (u_tilde, d_tilde) = eigensub::eigenbasis_project(
+                        &self.u, &self.d, &model, self.r, self.c, self.a,
+                    );
+                    let c_eigen = eigensub::accumulate_c_per_branch(
+                        &d_tilde, &u_tilde, &j, &self.log_norm_u, &self.log_norm_d,
+                        &self.log_like, &self.parent_index, self.r, self.c, self.a,
+                    );
+                    eigensub::back_transform_per_branch(&c_eigen, &model, self.r, self.c)
+                }
+            }
+            ModelData::Irreversible {
+                eigenvalues_complex, eigenvectors_complex, eigenvectors_inv_complex,
+            } => {
+                let model = IrrevDiagModel {
+                    eigenvalues_complex: eigenvalues_complex.clone(),
+                    eigenvectors_complex: eigenvectors_complex.clone(),
+                    eigenvectors_inv_complex: eigenvectors_inv_complex.clone(),
+                    pi: self.pi.clone(),
+                };
+                let j = eigensub::compute_j_complex(eigenvalues_complex, &self.distances);
+                let (u_tilde, d_tilde) = eigensub::eigenbasis_project_irrev(
+                    &self.u, &self.d, &model, self.r, self.c, self.a,
+                );
+                let c_eigen = eigensub::accumulate_c_complex_per_branch(
+                    &d_tilde, &u_tilde, &j, &self.log_norm_u, &self.log_norm_d,
+                    &self.log_like, &self.parent_index, self.r, self.c, self.a,
+                );
+                eigensub::back_transform_irrev_per_branch(&c_eigen, &model, self.r, self.c)
             }
         }
     }
@@ -607,6 +725,43 @@ mod wasm_api {
         crate::branch_mask::compute_branch_mask(alignment, parent_index, a, r, c)
     }
 
+    #[wasm_bindgen]
+    pub fn wasm_branch_counts(
+        alignment: &[i32],
+        parent_index: &[i32],
+        distances: &[f64],
+        eigenvalues: &[f64],
+        eigenvectors: &[f64],
+        pi: &[f64],
+        f81_fast: bool,
+    ) -> Vec<f64> {
+        let m = model::DiagModel {
+            eigenvalues: eigenvalues.to_vec(),
+            eigenvectors: eigenvectors.to_vec(),
+            pi: pi.to_vec(),
+        };
+        crate::branch_counts(alignment, parent_index, distances, &m, f81_fast)
+    }
+
+    #[wasm_bindgen]
+    pub fn wasm_branch_counts_irrev(
+        alignment: &[i32],
+        parent_index: &[i32],
+        distances: &[f64],
+        eigenvalues_complex: &[f64],
+        eigenvectors_complex: &[f64],
+        eigenvectors_inv_complex: &[f64],
+        pi: &[f64],
+    ) -> Vec<f64> {
+        let m = crate::model::IrrevDiagModel {
+            eigenvalues_complex: eigenvalues_complex.to_vec(),
+            eigenvectors_complex: eigenvectors_complex.to_vec(),
+            eigenvectors_inv_complex: eigenvectors_inv_complex.to_vec(),
+            pi: pi.to_vec(),
+        };
+        crate::branch_counts_irrev(alignment, parent_index, distances, &m)
+    }
+
     // ---- InsideOutside WASM bindings ----
 
     #[wasm_bindgen]
@@ -666,6 +821,12 @@ mod wasm_api {
 
         pub fn counts(&self, f81_fast: bool) -> Vec<f64> {
             self.table.counts(f81_fast)
+        }
+
+        /// Per-branch expected counts and dwell times.
+        /// Returns (R*A*A*C) flat. Branch 0 = zeros.
+        pub fn branch_counts(&self, f81_fast: bool) -> Vec<f64> {
+            self.table.branch_counts(f81_fast)
         }
 
         /// Posterior state distribution. node = -1 for all nodes.
@@ -1945,6 +2106,238 @@ mod tests {
         for idx in 0..np_rev.len() {
             assert!((np_rev[idx] - np_irrev[idx]).abs() < 1e-8,
                 "irrev node posterior mismatch at idx {}", idx);
+        }
+    }
+
+    // ================================================================
+    // 11. PER-BRANCH COUNTS TESTS
+    // ================================================================
+
+    #[test]
+    fn test_inside_outside_branch_counts_sum_matches_counts() {
+        // Verify that summing branch_counts over branches equals counts.
+        let configs: Vec<(usize, usize, usize, u64)> = vec![
+            (3, 2, 4, 1100),
+            (5, 4, 4, 1101),
+            (7, 8, 4, 1102),
+            (5, 4, 20, 1103),
+        ];
+        for (r, c, a, seed) in configs {
+            let (parent_index, distances) = make_tree(r, seed);
+            let model = model::jukes_cantor_model(a);
+            let alignment = make_alignment(r, c, a, seed + 1000, 0.1);
+
+            let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+            let cts = io.counts(false);
+            let bc = io.branch_counts(false);
+
+            assert_eq!(bc.len(), r * a * a * c,
+                "branch_counts wrong length for R={} C={} A={}", r, c, a);
+
+            // Sum over branches
+            for i in 0..a {
+                for j in 0..a {
+                    for col in 0..c {
+                        let mut sum = 0.0;
+                        for n in 0..r {
+                            sum += bc[n * a * a * c + i * a * c + j * c + col];
+                        }
+                        let expected = cts[i * a * c + j * c + col];
+                        assert!((sum - expected).abs() < 1e-8,
+                            "branch_counts sum mismatch at i={} j={} col={} (R={} C={} A={}): {} vs {}",
+                            i, j, col, r, c, a, sum, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_branch_counts_f81_fast_sum_matches_counts() {
+        // Same test but with f81_fast path.
+        let configs: Vec<(usize, usize, u64)> = vec![
+            (3, 2, 1110),
+            (5, 4, 1111),
+            (7, 8, 1112),
+        ];
+        for (r, c, seed) in configs {
+            let a = 4;
+            let (parent_index, distances) = make_tree(r, seed);
+            let pi_freq = [0.28, 0.22, 0.30, 0.20];
+            let model = model::f81_model(&pi_freq);
+            let alignment = make_alignment(r, c, a, seed + 1000, 0.0);
+
+            let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+            let cts = io.counts(true);
+            let bc = io.branch_counts(true);
+
+            for i in 0..a {
+                for j in 0..a {
+                    for col in 0..c {
+                        let mut sum = 0.0;
+                        for n in 0..r {
+                            sum += bc[n * a * a * c + i * a * c + j * c + col];
+                        }
+                        let expected = cts[i * a * c + j * c + col];
+                        assert!((sum - expected).abs() < 1e-8,
+                            "f81 branch_counts sum mismatch at i={} j={} col={}: {} vs {}",
+                            i, j, col, sum, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_branch_counts_eigensub_vs_f81_fast() {
+        // For F81 model, eigensub and f81_fast per-branch counts should agree.
+        let r = 7;
+        let c = 6;
+        let a = 4;
+        let (parent_index, distances) = make_tree(r, 1120);
+        let pi_freq = [0.28, 0.22, 0.30, 0.20];
+        let model = model::f81_model(&pi_freq);
+        let alignment = make_alignment(r, c, a, 1121, 0.0);
+
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let bc_eigen = io.branch_counts(false);
+        let bc_f81 = io.branch_counts(true);
+
+        for idx in 0..bc_eigen.len() {
+            assert!((bc_eigen[idx] - bc_f81[idx]).abs() < 1e-6,
+                "branch_counts eigensub vs f81 mismatch at {}: {} vs {}",
+                idx, bc_eigen[idx], bc_f81[idx]);
+        }
+    }
+
+    #[test]
+    fn test_branch_counts_branch_zero_is_zeros() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 1130);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 1131, 0.1);
+
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let bc = io.branch_counts(false);
+
+        // Branch 0 should be all zeros
+        for idx in 0..a * a * c {
+            assert!(bc[idx].abs() < 1e-15,
+                "branch_counts branch 0 not zero at idx {}: {}", idx, bc[idx]);
+        }
+    }
+
+    #[test]
+    fn test_branch_counts_free_fn_matches_io() {
+        // Verify free function branch_counts matches InsideOutsideTable::branch_counts.
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 1140);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 1141, 0.1);
+
+        let bc_fn = branch_counts(&alignment, &parent_index, &distances, &model, false);
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let bc_io = io.branch_counts(false);
+
+        for idx in 0..bc_fn.len() {
+            assert!((bc_fn[idx] - bc_io[idx]).abs() < 1e-10,
+                "branch_counts fn vs io mismatch at {}: {} vs {}",
+                idx, bc_fn[idx], bc_io[idx]);
+        }
+    }
+
+    #[test]
+    fn test_branch_counts_irrev_sum_matches_counts_irrev() {
+        // Verify sum of per-branch irrev counts matches total counts_irrev.
+        let configs: Vec<(usize, usize, u64)> = vec![
+            (3, 2, 1150),
+            (5, 4, 1151),
+            (7, 8, 1152),
+        ];
+        for (r, c, seed) in configs {
+            let a = 4;
+            let (parent_index, distances) = make_tree(r, seed);
+            let diag = model::jukes_cantor_model(a);
+            let irrev_model = make_irrev_from_diag(&diag);
+            let alignment = make_alignment(r, c, a, seed + 1000, 0.0);
+
+            let cts = counts_irrev(&alignment, &parent_index, &distances, &irrev_model);
+            let bc = branch_counts_irrev(&alignment, &parent_index, &distances, &irrev_model);
+
+            assert_eq!(bc.len(), r * a * a * c);
+
+            for i in 0..a {
+                for j in 0..a {
+                    for col in 0..c {
+                        let mut sum = 0.0;
+                        for n in 0..r {
+                            sum += bc[n * a * a * c + i * a * c + j * c + col];
+                        }
+                        let expected = cts[i * a * c + j * c + col];
+                        assert!((sum - expected).abs() < 1e-6,
+                            "irrev branch_counts sum mismatch at i={} j={} col={}: {} vs {}",
+                            i, j, col, sum, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_branch_counts_rev_vs_irrev() {
+        // For a symmetric model, reversible and irreversible branch_counts should agree.
+        let r = 7;
+        let c = 4;
+        let a = 4;
+        let (parent_index, distances) = make_tree(r, 1160);
+        let diag = model::jukes_cantor_model(a);
+        let irrev_model = make_irrev_from_diag(&diag);
+        let alignment = make_alignment(r, c, a, 1161, 0.0);
+
+        let bc_rev = branch_counts(&alignment, &parent_index, &distances, &diag, false);
+        let bc_irrev = branch_counts_irrev(&alignment, &parent_index, &distances, &irrev_model);
+
+        for idx in 0..bc_rev.len() {
+            assert!((bc_rev[idx] - bc_irrev[idx]).abs() < 1e-6,
+                "rev/irrev branch_counts mismatch at {}: {} vs {}",
+                idx, bc_rev[idx], bc_irrev[idx]);
+        }
+    }
+
+    #[test]
+    fn test_branch_counts_irrev_io_sum_matches() {
+        // Verify InsideOutsideTable::branch_counts for irrev model sums to counts.
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 1170);
+        let diag = model::jukes_cantor_model(a);
+        let irrev_model = make_irrev_from_diag(&diag);
+        let alignment = make_alignment(r, c, a, 1171, 0.1);
+
+        let io = InsideOutsideTable::new_irrev(
+            &alignment, &parent_index, &distances, &irrev_model,
+        );
+        let cts = io.counts(false);
+        let bc = io.branch_counts(false);
+
+        for i in 0..a {
+            for j in 0..a {
+                for col in 0..c {
+                    let mut sum = 0.0;
+                    for n in 0..r {
+                        sum += bc[n * a * a * c + i * a * c + j * c + col];
+                    }
+                    let expected = cts[i * a * c + j * c + col];
+                    assert!((sum - expected).abs() < 1e-6,
+                        "irrev io branch_counts sum mismatch at i={} j={} col={}: {} vs {}",
+                        i, j, col, sum, expected);
+                }
+            }
         }
     }
 }

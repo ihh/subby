@@ -168,6 +168,22 @@ Compute expected substitution counts and dwell times per column.
 
 **Returns:** `(*H, A, A, C)` float tensor. Diagonal entries are dwell times $E[w_i(c)]$; off-diagonal entries are substitution counts $E[s_{ij}(c)]$.
 
+### `BranchCounts(alignment, tree, model, maxChunkSize=128, f81_fast_flag=False)`
+
+Compute per-branch expected substitution counts and dwell times per column. Returns the same quantities as `Counts` but broken down per branch rather than summed.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `alignment` | `int32 (R, C)` | Token-encoded alignment |
+| `tree` | `Tree` | Phylogenetic tree |
+| `model` | `DiagModel`, `RateModel`, or `list` | Substitution model (or list of C models for per-column rates) |
+| `maxChunkSize` | `int` | Column chunk size |
+| `f81_fast_flag` | `bool` | Use $O(CRA^2)$ fast path (F81/JC only) |
+
+**Returns:** `(*H, R, A, A, C)` float tensor. Branch 0 (root) is zeros. Diagonal entries are dwell times; off-diagonal entries are substitution counts. Summing over the `R` axis recovers `Counts`.
+
 ### `RootProb(alignment, tree, model, maxChunkSize=128)`
 
 Compute posterior root state distribution per column.
@@ -324,6 +340,12 @@ Expected substitution counts and dwell times, reusing stored DP tables.
 
 **Returns:** `(*H, A, A, C)` float tensor.
 
+#### `branch_counts(f81_fast_flag=False)`
+
+Per-branch expected substitution counts and dwell times, reusing stored DP tables.
+
+**Returns:** `(*H, R, A, A, C)` float tensor. Branch 0 (root) is zeros.
+
 #### `node_posterior(node=None)`
 
 Posterior state distribution at node(s).
@@ -362,6 +384,7 @@ root_post = io.node_posterior(0)        # (*H, A, C)
 all_posts = io.node_posterior()         # (*H, R, A, C)
 branch_joint = io.branch_posterior(3)   # (*H, A, A, C)
 counts = io.counts()                    # (*H, A, A, C)
+per_branch = io.branch_counts()         # (*H, R, A, A, C)
 ```
 
 ---
@@ -425,11 +448,23 @@ Transform eigenbasis counts to natural-basis substitution counts and dwell times
 
 **Returns:** `(*H, A, A, C)`.
 
+### `accumulate_C_per_branch(...)` / `back_transform_per_branch(...)`
+
+Per-branch variants of `accumulate_C` and `back_transform`. Instead of summing over branches, each branch's contribution is stored separately.
+
+**Returns:** `(*H, R, A, A, C)`.
+
 ### `f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex)`
 
 $O(CRA^2)$ direct computation for F81/JC models, avoiding the eigenbasis.
 
 **Returns:** `(*H, A, A, C)`.
+
+### `f81_counts_per_branch(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex)`
+
+Per-branch variant of `f81_counts`.
+
+**Returns:** `(*H, R, A, A, C)`.
 
 ### `mixture_posterior(log_likes, log_weights)`
 

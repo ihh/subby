@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 
-from subby.jax import LogLike, Counts, RootProb, MixturePosterior, LogLikeCustomGrad, pad_alignment, unpad_columns, InsideOutside
+from subby.jax import LogLike, Counts, BranchCounts, RootProb, MixturePosterior, LogLikeCustomGrad, pad_alignment, unpad_columns, InsideOutside
 from subby.jax.types import Tree, RateModel
 from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model, irrev_model_from_rate_matrix
 
@@ -726,3 +726,242 @@ class TestInsideOutside:
             io_oracle.counts(),
             atol=1e-8,
         )
+
+    def test_branch_counts_oracle_matches_jax(self):
+        """Oracle InsideOutside.branch_counts matches JAX InsideOutside.branch_counts."""
+        from subby.oracle import InsideOutside as OracleIO
+        from subby.oracle import jukes_cantor_model as oracle_jc
+
+        tree_jax = _make_medium_tree(5, key=jax.random.PRNGKey(120))
+        R = tree_jax.parentIndex.shape[0]
+        C = 8
+        alignment_jax = jax.random.randint(
+            jax.random.PRNGKey(121), (R, C), 0, 4
+        ).astype(jnp.int32)
+
+        model_jax = jukes_cantor_model(4)
+        io_jax = InsideOutside(alignment_jax, tree_jax, model_jax)
+
+        alignment_np = np.array(alignment_jax)
+        tree_np = {
+            'parentIndex': np.array(tree_jax.parentIndex),
+            'distanceToParent': np.array(tree_jax.distanceToParent),
+        }
+        model_np = oracle_jc(4)
+        io_oracle = OracleIO(alignment_np, tree_np, model_np)
+
+        np.testing.assert_allclose(
+            np.array(io_jax.branch_counts()),
+            io_oracle.branch_counts(),
+            atol=1e-8,
+        )
+
+
+class TestBranchCounts:
+
+    def _make_setup(self, C=10, n_leaves=5, A=4, seed=42):
+        tree = _make_medium_tree(n_leaves, key=jax.random.PRNGKey(seed))
+        R = tree.parentIndex.shape[0]
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(seed + 1), (R, C), 0, A
+        ).astype(jnp.int32)
+        model = jukes_cantor_model(A)
+        return alignment, tree, model
+
+    def test_shape(self):
+        """BranchCounts returns (R, A, A, C)."""
+        alignment, tree, model = self._make_setup()
+        bc = BranchCounts(alignment, tree, model)
+        R = tree.parentIndex.shape[0]
+        assert bc.shape == (R, 4, 4, 10)
+
+    def test_sum_matches_counts(self):
+        """Sum of BranchCounts over branches matches Counts."""
+        alignment, tree, model = self._make_setup()
+        bc = BranchCounts(alignment, tree, model)
+        c = Counts(alignment, tree, model)
+        np.testing.assert_allclose(bc.sum(axis=-4), c, atol=1e-10)
+
+    def test_branch_zero_is_zeros(self):
+        """Branch 0 (root) should be all zeros."""
+        alignment, tree, model = self._make_setup()
+        bc = BranchCounts(alignment, tree, model)
+        np.testing.assert_allclose(bc[0], 0.0, atol=1e-15)
+
+    def test_f81_fast_sum_matches(self):
+        """F81 fast path BranchCounts sum matches Counts."""
+        alignment, tree, model = self._make_setup()
+        bc = BranchCounts(alignment, tree, model, f81_fast_flag=True)
+        c = Counts(alignment, tree, model, f81_fast_flag=True)
+        np.testing.assert_allclose(bc.sum(axis=-4), c, atol=1e-10)
+
+    def test_eigensub_vs_f81_fast_sum(self):
+        """Eigensub and F81 fast BranchCounts sum to the same total."""
+        alignment, tree, model = self._make_setup()
+        bc_eig = BranchCounts(alignment, tree, model)
+        bc_f81 = BranchCounts(alignment, tree, model, f81_fast_flag=True)
+        np.testing.assert_allclose(
+            bc_eig.sum(axis=-4), bc_f81.sum(axis=-4), atol=1e-6
+        )
+
+    def test_nonneg_off_diagonal(self):
+        """Off-diagonal entries (substitution counts) should be non-negative."""
+        alignment, tree, model = self._make_setup()
+        bc = BranchCounts(alignment, tree, model)
+        A = 4
+        mask = ~jnp.eye(A, dtype=bool)
+        off_diag = bc[:, mask]
+        assert jnp.all(off_diag >= -1e-10)
+
+    def test_nonneg_diagonal(self):
+        """Diagonal entries (dwell times) should be non-negative."""
+        alignment, tree, model = self._make_setup()
+        bc = BranchCounts(alignment, tree, model)
+        A = 4
+        for i in range(A):
+            assert jnp.all(bc[:, i, i, :] >= -1e-10)
+
+    def test_hky85_model(self):
+        """BranchCounts works with non-uniform pi (HKY85)."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(200))
+        R = tree.parentIndex.shape[0]
+        C = 8
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(201), (R, C), 0, 4
+        ).astype(jnp.int32)
+        pi = jnp.array([0.1, 0.2, 0.3, 0.4])
+        model = hky85_diag(2.5, pi)
+
+        bc = BranchCounts(alignment, tree, model)
+        c = Counts(alignment, tree, model)
+        np.testing.assert_allclose(bc.sum(axis=-4), c, atol=1e-10)
+
+    def test_irreversible_model(self):
+        """BranchCounts works with irreversible model."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(300))
+        R = tree.parentIndex.shape[0]
+        C = 8
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(301), (R, C), 0, 4
+        ).astype(jnp.int32)
+
+        A = 4
+        rng = np.random.RandomState(42)
+        rate = rng.uniform(0.01, 1.0, (A, A))
+        np.fill_diagonal(rate, 0.0)
+        np.fill_diagonal(rate, -rate.sum(axis=1))
+        pi = np.ones(A) / A
+        norm = -np.sum(pi * np.diag(rate))
+        rate /= norm
+        model = irrev_model_from_rate_matrix(jnp.array(rate), jnp.array(pi))
+
+        bc = BranchCounts(alignment, tree, model)
+        c = Counts(alignment, tree, model)
+        np.testing.assert_allclose(
+            bc.sum(axis=-4).real, c.real, atol=1e-8
+        )
+
+    def test_insideoutside_branch_counts_matches_standalone(self):
+        """InsideOutside.branch_counts() matches standalone BranchCounts."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        bc_io = io.branch_counts()
+        bc_standalone = BranchCounts(alignment, tree, model)
+        np.testing.assert_allclose(bc_io, bc_standalone, atol=1e-12)
+
+    def test_insideoutside_branch_counts_f81(self):
+        """InsideOutside.branch_counts(f81_fast_flag=True) matches standalone."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        bc_io = io.branch_counts(f81_fast_flag=True)
+        bc_standalone = BranchCounts(alignment, tree, model, f81_fast_flag=True)
+        np.testing.assert_allclose(bc_io, bc_standalone, atol=1e-12)
+
+    def test_oracle_matches_jax(self):
+        """Oracle BranchCounts matches JAX BranchCounts."""
+        from subby.oracle import BranchCounts as OracleBranchCounts
+        from subby.oracle import jukes_cantor_model as oracle_jc
+
+        tree_jax = _make_medium_tree(5, key=jax.random.PRNGKey(400))
+        R = tree_jax.parentIndex.shape[0]
+        C = 10
+        alignment_jax = jax.random.randint(
+            jax.random.PRNGKey(401), (R, C), 0, 4
+        ).astype(jnp.int32)
+        model_jax = jukes_cantor_model(4)
+
+        bc_jax = np.array(BranchCounts(alignment_jax, tree_jax, model_jax))
+
+        alignment_np = np.array(alignment_jax)
+        tree_np = {
+            'parentIndex': np.array(tree_jax.parentIndex),
+            'distanceToParent': np.array(tree_jax.distanceToParent),
+        }
+        model_np = oracle_jc(4)
+        bc_oracle = OracleBranchCounts(alignment_np, tree_np, model_np)
+
+        np.testing.assert_allclose(bc_jax, bc_oracle, atol=1e-8)
+
+    def test_oracle_irrev_matches_jax(self):
+        """Oracle irreversible BranchCounts matches JAX."""
+        from subby.oracle import BranchCounts as OracleBranchCounts
+        from subby.oracle import irrev_model_from_rate_matrix as oracle_irrev
+
+        tree_jax = _make_medium_tree(5, key=jax.random.PRNGKey(500))
+        R = tree_jax.parentIndex.shape[0]
+        C = 8
+        alignment_jax = jax.random.randint(
+            jax.random.PRNGKey(501), (R, C), 0, 4
+        ).astype(jnp.int32)
+
+        A = 4
+        rng = np.random.RandomState(99)
+        rate = rng.uniform(0.01, 1.0, (A, A))
+        np.fill_diagonal(rate, 0.0)
+        np.fill_diagonal(rate, -rate.sum(axis=1))
+        pi = np.ones(A) / A
+        norm = -np.sum(pi * np.diag(rate))
+        rate /= norm
+
+        model_jax = irrev_model_from_rate_matrix(jnp.array(rate), jnp.array(pi))
+        bc_jax = np.array(BranchCounts(alignment_jax, tree_jax, model_jax))
+
+        alignment_np = np.array(alignment_jax)
+        tree_np = {
+            'parentIndex': np.array(tree_jax.parentIndex),
+            'distanceToParent': np.array(tree_jax.distanceToParent),
+        }
+        model_np = oracle_irrev(rate, pi)
+        bc_oracle = OracleBranchCounts(alignment_np, tree_np, model_np)
+
+        np.testing.assert_allclose(bc_jax.real, bc_oracle.real, atol=1e-6)
+
+    def test_large_alphabet(self):
+        """BranchCounts works with A=20 (protein-sized)."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(600))
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(601), (R, C), 0, 20
+        ).astype(jnp.int32)
+        model = jukes_cantor_model(20)
+
+        bc = BranchCounts(alignment, tree, model)
+        c = Counts(alignment, tree, model)
+        assert bc.shape == (R, 20, 20, C)
+        np.testing.assert_allclose(bc.sum(axis=-4), c, atol=1e-8)
+
+    def test_per_column_model(self):
+        """BranchCounts with per-column models."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(700))
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(701), (R, C), 0, 4
+        ).astype(jnp.int32)
+
+        models = [jukes_cantor_model(4) for _ in range(C)]
+        bc = BranchCounts(alignment, tree, models)
+        c = Counts(alignment, tree, models)
+        assert bc.shape == (R, 4, 4, C)
+        np.testing.assert_allclose(bc.sum(axis=-4), c, atol=1e-10)

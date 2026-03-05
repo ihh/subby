@@ -14,9 +14,11 @@ from .outside import downward_pass
 from .eigensub import (
     compute_J, eigenbasis_project, accumulate_C, back_transform,
     compute_J_complex, eigenbasis_project_irrev, accumulate_C_complex, back_transform_irrev,
+    accumulate_C_per_branch, back_transform_per_branch,
+    accumulate_C_complex_per_branch, back_transform_irrev_per_branch,
 )
 from ._utils import pad_alignment, unpad_columns
-from .f81_fast import f81_counts
+from .f81_fast import f81_counts, f81_counts_per_branch
 from .mixture import mixture_posterior
 from .vjp import make_loglike_custom_grad
 from .models import (
@@ -240,6 +242,76 @@ def Counts(
         C = accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree.parentIndex,
                          branch_mask=branch_mask)
         return back_transform(C, model)
+
+
+def BranchCounts(
+    alignment: jnp.ndarray,
+    tree: Tree,
+    model,
+    maxChunkSize: int = 128,
+    f81_fast_flag: bool = False,
+) -> jnp.ndarray:
+    """Compute per-branch expected substitution counts and dwell times.
+
+    Returns the (A, A) matrix of a posteriori expected transition counts
+    and dwell times for a discrete-state continuous-time Markov chain on
+    each branch of the tree, for each alignment column.
+
+    Args:
+        alignment: (R, C) int32 tokens
+        tree: Tree
+        model: DiagModel, IrrevDiagModel, RateModel, or list of models
+        maxChunkSize: chunk columns for memory
+        f81_fast_flag: if True, use O(CRA^2) F81/JC fast path
+
+    Returns:
+        (*H, R, A, A, C) per-branch counts (diag=dwell, off-diag=substitutions).
+        Branch 0 (root) is zeros.
+    """
+    if _is_model_list(model):
+        models_diag = [_ensure_diag(m) for m in model]
+        C = alignment.shape[1]
+        assert len(models_diag) == C
+        results = []
+        for c in range(C):
+            col_bc = BranchCounts(
+                alignment[:, c:c+1], tree, models_diag[c],
+                maxChunkSize=maxChunkSize, f81_fast_flag=f81_fast_flag,
+            )
+            results.append(col_bc)
+        return jnp.concatenate(results, axis=-1)
+
+    model = _ensure_diag(model)
+    is_irrev = isinstance(model, IrrevDiagModel)
+
+    if is_irrev:
+        assert not f81_fast_flag, "F81 fast path is reversible-only"
+        subMatrices = compute_sub_matrices_irrev(model, tree.distanceToParent)
+    else:
+        subMatrices = compute_sub_matrices(model, tree.distanceToParent)
+
+    U, logNormU, logLike = upward_pass(alignment, tree, subMatrices, model.pi, maxChunkSize)
+    D, logNormD = downward_pass(U, logNormU, tree, subMatrices, model.pi, alignment)
+
+    if f81_fast_flag:
+        return f81_counts_per_branch(
+            U, D, logNormU, logNormD, logLike,
+            tree.distanceToParent, model.pi, tree.parentIndex,
+        )
+    elif is_irrev:
+        J = compute_J_complex(model.eigenvalues, tree.distanceToParent)
+        U_tilde, D_tilde = eigenbasis_project_irrev(U, D, model)
+        C = accumulate_C_complex_per_branch(
+            D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree.parentIndex,
+        )
+        return back_transform_irrev_per_branch(C, model)
+    else:
+        J = compute_J(model.eigenvalues, tree.distanceToParent)
+        U_tilde, D_tilde = eigenbasis_project(U, D, model)
+        C = accumulate_C_per_branch(
+            D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree.parentIndex,
+        )
+        return back_transform_per_branch(C, model)
 
 
 def RootProb(
@@ -480,6 +552,52 @@ class InsideOutside:
                 self._logLike, self._tree.parentIndex, branch_mask=branch_mask,
             )
             return back_transform(C, model)
+
+    def branch_counts(
+        self, f81_fast_flag: bool = False,
+    ) -> jnp.ndarray:
+        """Per-branch expected substitution counts and dwell times.
+
+        Returns the (A, A) matrix of a posteriori expected transition counts
+        and dwell times for the CTMC on each branch, for each column.
+
+        Args:
+            f81_fast_flag: if True, use O(CRA^2) F81/JC fast path
+
+        Returns:
+            (*H, R, A, A, C) per-branch counts (branch 0 = zeros)
+        """
+        if self._is_model_list:
+            return BranchCounts(
+                self._alignment, self._tree, self._models_list,
+                maxChunkSize=self._maxChunkSize,
+                f81_fast_flag=f81_fast_flag,
+            )
+
+        model = self._model
+
+        if f81_fast_flag:
+            return f81_counts_per_branch(
+                self._U, self._D, self._logNormU, self._logNormD,
+                self._logLike, self._tree.distanceToParent, model.pi,
+                self._tree.parentIndex,
+            )
+        elif self._is_irrev:
+            J = compute_J_complex(model.eigenvalues, self._tree.distanceToParent)
+            U_tilde, D_tilde = eigenbasis_project_irrev(self._U, self._D, model)
+            C = accumulate_C_complex_per_branch(
+                D_tilde, U_tilde, J, self._logNormU, self._logNormD,
+                self._logLike, self._tree.parentIndex,
+            )
+            return back_transform_irrev_per_branch(C, model)
+        else:
+            J = compute_J(model.eigenvalues, self._tree.distanceToParent)
+            U_tilde, D_tilde = eigenbasis_project(self._U, self._D, model)
+            C = accumulate_C_per_branch(
+                D_tilde, U_tilde, J, self._logNormU, self._logNormD,
+                self._logLike, self._tree.parentIndex,
+            )
+            return back_transform_per_branch(C, model)
 
     def node_posterior(self, node: Optional[int] = None) -> jnp.ndarray:
         """Posterior state distribution at node(s).

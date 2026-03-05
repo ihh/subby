@@ -1029,6 +1029,23 @@ export class PhyloGPU {
   }
 
   /**
+   * Compute per-branch expected substitution counts and dwell times.
+   *
+   * Delegates to InsideOutside internally: runs upward+downward passes,
+   * then computes per-branch counts via the eigensub pipeline.
+   *
+   * @returns {Float32Array} (R*A*A*C,) per-branch counts
+   */
+  async BranchCounts(alignment, parentIndex, distances, arg4, arg5, arg6, arg7) {
+    const io = await this.InsideOutside(alignment, parentIndex, distances, arg4, arg5, arg6);
+    const parsed = PhyloGPU._parseModelArg(arg4, arg5);
+    const f81Fast = parsed ? false : (arg7 || false);
+    const result = await io.branch_counts(f81Fast);
+    io.destroy();
+    return result;
+  }
+
+  /**
    * Create an InsideOutside table for querying posteriors.
    *
    * Accepts either:
@@ -1210,6 +1227,146 @@ class PhyloGPUInsideOutside {
         this._distances, this._pi, R, C, A,
       );
     }
+  }
+
+  /**
+   * Per-branch expected substitution counts and dwell times.
+   *
+   * Computes the eigensub pipeline per branch on CPU. For each branch n,
+   * the (A,A) matrix gives expected transition counts (off-diag) and
+   * dwell times (diag) for the CTMC on that branch.
+   *
+   * @returns {Float32Array} (R*A*A*C,) per-branch counts. Branch 0 = zeros.
+   */
+  async branch_counts(f81Fast = false) {
+    // Delegate to the GPU eigensub pipeline per-branch.
+    // Since there are no per-branch GPU shaders, compute on CPU
+    // using the summed pipeline: run counts for full, then extract.
+    // Actually, easier: compute from the DP tables directly on CPU.
+    // This matches what the WASM/Rust implementation does.
+    const { R, C, A } = this;
+    const result = new Float32Array(R * A * A * C);
+    const pi = this._pi;
+    const V = this._revModel ? this._revModel.eigenvectors : null;
+    const mu_arr = this._revModel ? this._revModel.eigenvalues : null;
+
+    if (f81Fast && !this._irrevModel) {
+      // F81 fast path on CPU
+      let piSqSum = 0;
+      for (let a = 0; a < A; a++) piSqSum += pi[a] * pi[a];
+      const mu = 1.0 / (1.0 - piSqSum);
+
+      for (let n = 1; n < R; n++) {
+        const t = this._distances[n];
+        const mu_t = mu * t;
+        const e_t = Math.exp(-mu_t);
+        const p = 1.0 - e_t;
+        const alpha = t * e_t;
+        const beta = p / mu - t * e_t;
+        const gamma_v = t * (1.0 + e_t) - 2.0 * p / mu;
+
+        for (let c = 0; c < C; c++) {
+          const logScale = this._logNormD[n * C + c] + this._logNormU[n * C + c] - this._logLike[c];
+          const scale = Math.exp(logScale);
+          const uBase = (n * C + c) * A;
+          const dBase = (n * C + c) * A;
+
+          let piU = 0, dSum = 0;
+          for (let a = 0; a < A; a++) {
+            piU += pi[a] * this._U[uBase + a];
+            dSum += this._D[dBase + a] * scale;
+          }
+
+          for (let i = 0; i < A; i++) {
+            const dI = this._D[dBase + i] * scale;
+            for (let j = 0; j < A; j++) {
+              const iSum = alpha * dI * this._U[uBase + j]
+                + beta * (dI * piU + pi[i] * dSum * this._U[uBase + j])
+                + gamma_v * pi[i] * dSum * piU;
+              if (i === j) {
+                result[n * A * A * C + i * A * C + j * C + c] = iSum;
+              } else {
+                result[n * A * A * C + i * A * C + j * C + c] = mu * pi[j] * iSum;
+              }
+            }
+          }
+        }
+      }
+    } else if (!this._irrevModel) {
+      // Eigensub on CPU per branch
+      // 1. Compute J per branch
+      const J = new Float32Array(R * A * A);
+      for (let n = 0; n < R; n++) {
+        const t = this._distances[n];
+        for (let k = 0; k < A; k++) {
+          for (let l = 0; l < A; l++) {
+            const mk = mu_arr[k], ml = mu_arr[l];
+            const diff = mk - ml;
+            if (Math.abs(diff) < 1e-8) {
+              J[n * A * A + k * A + l] = t * Math.exp(mk * t);
+            } else {
+              J[n * A * A + k * A + l] = (Math.exp(mk * t) - Math.exp(ml * t)) / diff;
+            }
+          }
+        }
+      }
+
+      // 2. Eigenbasis project
+      const sqrtPi = pi.map(p => Math.sqrt(p));
+      const invSqrtPi = sqrtPi.map(s => 1.0 / s);
+
+      // 3. Per-branch: C_eigen[n,k,l,c], back_transform, store
+      // S matrix
+      const S = new Float32Array(A * A);
+      for (let i = 0; i < A; i++) {
+        for (let j = 0; j < A; j++) {
+          let s = 0;
+          for (let k = 0; k < A; k++) s += V[i * A + k] * mu_arr[k] * V[j * A + k];
+          S[i * A + j] = s;
+        }
+      }
+
+      for (let n = 1; n < R; n++) {
+        for (let c = 0; c < C; c++) {
+          const logScale = this._logNormD[n * C + c] + this._logNormU[n * C + c] - this._logLike[c];
+          const scale = Math.exp(logScale);
+          const base = (n * C + c) * A;
+
+          // Project U, D into eigenbasis
+          const Ut = new Float32Array(A);
+          const Dt = new Float32Array(A);
+          for (let k = 0; k < A; k++) {
+            let ut = 0, dt = 0;
+            for (let a = 0; a < A; a++) {
+              ut += this._U[base + a] * sqrtPi[a] * V[a * A + k];
+              dt += this._D[base + a] * invSqrtPi[a] * V[a * A + k];
+            }
+            Ut[k] = ut;
+            Dt[k] = dt * scale;
+          }
+
+          // C_eigen[k,l] = Dt[k] * J[n,k,l] * Ut[l]
+          // VCV[i,j] = sum_{k,l} V[i,k] * C_eigen[k,l] * V[j,l]
+          for (let i = 0; i < A; i++) {
+            for (let j = 0; j < A; j++) {
+              let vcv = 0;
+              for (let k = 0; k < A; k++) {
+                for (let l = 0; l < A; l++) {
+                  vcv += V[i * A + k] * Dt[k] * J[n * A * A + k * A + l] * Ut[l] * V[j * A + l];
+                }
+              }
+              if (i === j) {
+                result[n * A * A * C + i * A * C + j * C + c] = vcv;
+              } else {
+                result[n * A * A * C + i * A * C + j * C + c] = S[i * A + j] * vcv;
+              }
+            }
+          }
+        }
+      }
+    }
+    // irrev: not implemented on GPU CPU fallback yet (would need complex arithmetic)
+    return result;
   }
 
   /**

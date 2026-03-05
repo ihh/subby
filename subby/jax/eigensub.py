@@ -172,6 +172,65 @@ def back_transform(C: jnp.ndarray, model: DiagModel) -> jnp.ndarray:
     return counts
 
 
+def accumulate_C_per_branch(
+    D_tilde: jnp.ndarray, U_tilde: jnp.ndarray,
+    J: jnp.ndarray,
+    logNormU: jnp.ndarray, logNormD: jnp.ndarray,
+    logLike: jnp.ndarray, parentIndex: jnp.ndarray,
+) -> jnp.ndarray:
+    """Per-branch eigenbasis counts (no sum over branches).
+
+    C_{n,kl,c} = D_tilde_k^(n) * J^{kl}(t_n) * U_tilde_l^(n) * scale[n,c]
+
+    Returns:
+        C: (*H, R, A, A, C) eigenbasis counts per branch (branch 0 = zeros)
+    """
+    log_scale = (
+        logNormD[..., 1:, :] + logNormU[..., 1:, :] - logLike[..., None, :]
+    )
+    scale = jnp.exp(log_scale)
+
+    Dt = D_tilde[..., 1:, :, :]
+    Ut = U_tilde[..., 1:, :, :]
+    Jb = J[..., 1:, :, :]
+
+    Dt_scaled = Dt * scale[..., None]
+
+    C_nonroot = jnp.einsum('...nck,...nkl,...ncl->...nklc', Dt_scaled, Jb, Ut)
+
+    # Prepend zeros for root branch
+    zeros = jnp.zeros_like(C_nonroot[..., :1, :, :, :])
+    return jnp.concatenate([zeros, C_nonroot], axis=-4)
+
+
+def back_transform_per_branch(C_per_branch: jnp.ndarray, model: DiagModel) -> jnp.ndarray:
+    """Transform per-branch eigenbasis counts to natural basis.
+
+    Same as back_transform but preserves the R (branch) dimension.
+
+    Args:
+        C_per_branch: (*H, R, A, A, C) per-branch eigenbasis counts
+        model: DiagModel
+
+    Returns:
+        (*H, R, A, A, C) per-branch counts (diag=dwell, off-diag=substitutions)
+    """
+    V = model.eigenvectors[..., None, :, :]  # (*H, 1, A, A) — broadcasts over R
+    mu = model.eigenvalues[..., None, :]     # (*H, 1, A)
+
+    VCV = jnp.einsum('...ik,...klc,...jl->...ijc', V, C_per_branch, V)
+
+    S = jnp.einsum('...ak,...k,...bk->...ab', V, mu, V)  # (*H, 1, A, A)
+
+    diag_mask = jnp.eye(model.eigenvectors.shape[-1], dtype=bool)
+    counts = jnp.where(
+        diag_mask[..., None],
+        VCV,
+        S[..., None] * VCV
+    )
+    return counts
+
+
 def compute_J_complex(eigenvalues: jnp.ndarray, distances: jnp.ndarray) -> jnp.ndarray:
     """Compute J^{kl}(T) interaction matrix for complex eigenvalues.
 
@@ -315,4 +374,61 @@ def back_transform_irrev(C: jnp.ndarray, model: IrrevDiagModel) -> jnp.ndarray:
         R[..., None] * VCV
     )
 
+    return counts.real
+
+
+def accumulate_C_complex_per_branch(
+    D_tilde: jnp.ndarray, U_tilde: jnp.ndarray,
+    J: jnp.ndarray,
+    logNormU: jnp.ndarray, logNormD: jnp.ndarray,
+    logLike: jnp.ndarray, parentIndex: jnp.ndarray,
+) -> jnp.ndarray:
+    """Per-branch eigenbasis counts for complex/irreversible model.
+
+    Returns:
+        C: (*H, R, A, A, C) complex eigenbasis counts per branch (branch 0 = zeros)
+    """
+    log_scale = (
+        logNormD[..., 1:, :] + logNormU[..., 1:, :] - logLike[..., None, :]
+    )
+    scale = jnp.exp(log_scale)
+
+    Dt = D_tilde[..., 1:, :, :]
+    Ut = U_tilde[..., 1:, :, :]
+    Jb = J[..., 1:, :, :]
+
+    Dt_scaled = Dt * scale[..., None]
+
+    C_nonroot = jnp.einsum('...nck,...nkl,...ncl->...nklc', Dt_scaled, Jb, Ut)
+
+    zeros = jnp.zeros_like(C_nonroot[..., :1, :, :, :])
+    return jnp.concatenate([zeros, C_nonroot], axis=-4)
+
+
+def back_transform_irrev_per_branch(
+    C_per_branch: jnp.ndarray, model: IrrevDiagModel,
+) -> jnp.ndarray:
+    """Transform per-branch eigenbasis counts for irreversible model.
+
+    Args:
+        C_per_branch: (*H, R, A, A, C) complex per-branch eigenbasis counts
+        model: IrrevDiagModel
+
+    Returns:
+        (*H, R, A, A, C) real per-branch counts
+    """
+    V = model.eigenvectors[..., None, :, :]       # (*H, 1, A, A)
+    V_inv = model.eigenvectors_inv[..., None, :, :]  # (*H, 1, A, A)
+    mu = model.eigenvalues[..., None, :]           # (*H, 1, A)
+
+    VCV = jnp.einsum('...ik,...klc,...lj->...ijc', V, C_per_branch, V_inv)
+
+    R = jnp.einsum('...ak,...k,...kj->...aj', V, mu, V_inv)  # (*H, 1, A, A)
+
+    diag_mask = jnp.eye(model.eigenvectors.shape[-1], dtype=bool)
+    counts = jnp.where(
+        diag_mask[..., None],
+        VCV,
+        R[..., None] * VCV
+    )
     return counts.real

@@ -123,6 +123,44 @@ export class PhyloWASM {
   }
 
   /**
+   * Compute per-branch expected substitution counts and dwell times.
+   *
+   * Accepts either:
+   *   BranchCounts(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi, f81Fast?)
+   *   BranchCounts(alignment, parentIndex, distances, model)
+   *
+   * @returns {Float64Array} (R*A*A*C,) per-branch counts
+   */
+  async BranchCounts(alignment, parentIndex, distances, arg4, arg5, arg6, arg7) {
+    const parsed = PhyloWASM._parseModelArg(arg4, arg5);
+    if (parsed && parsed.irrev) {
+      const m = parsed.model;
+      return this.wasm.wasm_branch_counts_irrev(
+        new Int32Array(alignment),
+        new Int32Array(parentIndex),
+        new Float64Array(distances),
+        new Float64Array(m.eigenvalues_complex),
+        new Float64Array(m.eigenvectors_complex),
+        new Float64Array(m.eigenvectors_inv_complex),
+        new Float64Array(m.pi),
+      );
+    }
+    const eigenvalues = parsed ? parsed.model.eigenvalues : arg4;
+    const eigenvectors = parsed ? parsed.model.eigenvectors : arg5;
+    const pi = parsed ? parsed.model.pi : arg6;
+    const f81Fast = parsed ? false : (arg7 || false);
+    return this.wasm.wasm_branch_counts(
+      new Int32Array(alignment),
+      new Int32Array(parentIndex),
+      new Float64Array(distances),
+      new Float64Array(eigenvalues),
+      new Float64Array(eigenvectors),
+      new Float64Array(pi),
+      f81Fast,
+    );
+  }
+
+  /**
    * Compute posterior root state distribution.
    *
    * Accepts either:
@@ -277,6 +315,11 @@ class PhyloWASMInsideOutside {
   /** Expected substitution counts. @returns {Float64Array} (A*A*C,) */
   counts(f81Fast = false) {
     return this._io.counts(f81Fast);
+  }
+
+  /** Per-branch expected counts. @returns {Float64Array} (R*A*A*C,) */
+  branch_counts(f81Fast = false) {
+    return this._io.branch_counts(f81Fast);
   }
 
   /**

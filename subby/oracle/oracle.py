@@ -517,6 +517,42 @@ def accumulate_C_complex(D_tilde, U_tilde, J, logNormU, logNormD, logLike,
     return Cout
 
 
+def accumulate_C_complex_per_branch(D_tilde, U_tilde, J, logNormU, logNormD,
+                                    logLike, parentIndex, branch_mask=None):
+    """Accumulate eigenbasis counts C_{kl} per branch (complex, not summed).
+
+    Same as accumulate_C_complex but returns (R, A, A, C) instead of (A, A, C).
+    Branch 0 (root) is all zeros.
+
+    Args:
+        D_tilde: (R, C, A) complex projected outside vectors
+        U_tilde: (R, C, A) complex projected inside vectors
+        J: (R, A, A) complex J matrices per branch
+        logNormU: (R, C) real
+        logNormD: (R, C) real
+        logLike: (C,) real
+        parentIndex: (R,) parent indices
+        branch_mask: (R, C) bool or None
+
+    Returns:
+        Cout: (R, A, A, C) complex eigenbasis counts per branch
+    """
+    R, C, A = U_tilde.shape
+    Cout = np.zeros((R, A, A, C), dtype=np.complex128)
+
+    for n in range(1, R):
+        for c in range(C):
+            if branch_mask is not None and not branch_mask[n, c]:
+                continue
+            log_s = logNormD[n, c] + logNormU[n, c] - logLike[c]
+            scale = np.exp(log_s)
+            for k in range(A):
+                for l in range(A):
+                    Cout[n, k, l, c] = D_tilde[n, c, k] * J[n, k, l] * U_tilde[n, c, l] * scale
+
+    return Cout
+
+
 def back_transform_irrev(C, model):
     """Transform eigenbasis counts to natural basis for irreversible model.
 
@@ -567,6 +603,53 @@ def back_transform_irrev(C, model):
                     counts[i, j, col] = VCV[i, j, col].real
                 else:
                     counts[i, j, col] = (R_mat[i, j] * VCV[i, j, col]).real
+
+    return counts
+
+
+def back_transform_irrev_per_branch(C, model):
+    """Transform eigenbasis counts to natural basis for irreversible model, per branch.
+
+    Same as back_transform_irrev but works on (R, A, A, C) input.
+
+    Args:
+        C: (R, A, A, C) complex eigenbasis counts per branch
+        model: dict with complex 'eigenvalues', 'eigenvectors', 'eigenvectors_inv'
+
+    Returns:
+        (R, A, A, C) real counts tensor per branch
+    """
+    V = model['eigenvectors']         # (A, A) complex
+    V_inv = model['eigenvectors_inv']  # (A, A) complex
+    mu = model['eigenvalues']         # (A,) complex
+    A = len(mu)
+    R = C.shape[0]
+    Ccols = C.shape[3]
+
+    # Reconstruct R = V diag(mu) V^{-1}
+    R_mat = np.zeros((A, A), dtype=np.complex128)
+    for i in range(A):
+        for j in range(A):
+            s = 0.0 + 0.0j
+            for k in range(A):
+                s += V[i, k] * mu[k] * V_inv[k, j]
+            R_mat[i, j] = s
+
+    counts = np.zeros((R, A, A, Ccols), dtype=np.float64)
+    for n in range(R):
+        # VCV = V C[n] V^{-1} per column
+        for col in range(Ccols):
+            for i in range(A):
+                for j in range(A):
+                    s = 0.0 + 0.0j
+                    for k in range(A):
+                        for l in range(A):
+                            s += V[i, k] * C[n, k, l, col] * V_inv[l, j]
+                    vcv = s
+                    if i == j:
+                        counts[n, i, j, col] = vcv.real
+                    else:
+                        counts[n, i, j, col] = (R_mat[i, j] * vcv).real
 
     return counts
 
@@ -875,6 +958,42 @@ def accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, parentIndex,
     return Cout
 
 
+def accumulate_C_per_branch(D_tilde, U_tilde, J, logNormU, logNormD, logLike,
+                            parentIndex, branch_mask=None):
+    """Accumulate eigenbasis counts C_{kl} per branch (not summed).
+
+    Same as accumulate_C but returns (R, A, A, C) instead of (A, A, C).
+    Branch 0 (root) is all zeros.
+
+    Args:
+        D_tilde: (R, C, A) projected outside vectors
+        U_tilde: (R, C, A) projected inside vectors
+        J: (R, A, A) J matrices per branch
+        logNormU: (R, C) per-node inside log-normalizers
+        logNormD: (R, C) per-node outside log-normalizers
+        logLike: (C,) log-likelihoods
+        parentIndex: (R,) parent indices
+        branch_mask: (R, C) bool or None — if provided, skip inactive branches
+
+    Returns:
+        Cout: (R, A, A, C) eigenbasis counts per branch
+    """
+    R, C, A = U_tilde.shape
+    Cout = np.zeros((R, A, A, C), dtype=np.float64)
+
+    for n in range(1, R):
+        for c in range(C):
+            if branch_mask is not None and not branch_mask[n, c]:
+                continue
+            log_s = logNormD[n, c] + logNormU[n, c] - logLike[c]
+            scale = np.exp(log_s)
+            for k in range(A):
+                for l in range(A):
+                    Cout[n, k, l, c] = D_tilde[n, c, k] * J[n, k, l] * U_tilde[n, c, l] * scale
+
+    return Cout
+
+
 # ---------------------------------------------------------------------------
 # 13. Back-transform from eigenbasis to natural basis
 # ---------------------------------------------------------------------------
@@ -928,6 +1047,52 @@ def back_transform(C, model):
                     counts[i, j, c] = VCV[i, j, c]  # dwell
                 else:
                     counts[i, j, c] = S[i, j] * VCV[i, j, c]  # subs
+
+    return counts
+
+
+def back_transform_per_branch(C, model):
+    """Transform eigenbasis counts to natural basis, per branch.
+
+    Same as back_transform but works on (R, A, A, C) input.
+
+    Args:
+        C: (R, A, A, C) eigenbasis counts per branch
+        model: dict
+
+    Returns:
+        (R, A, A, C) counts tensor per branch (diag=dwell, off-diag=substitution counts)
+    """
+    V = model['eigenvectors']  # (A, A)
+    mu = model['eigenvalues']  # (A,)
+    A = len(mu)
+    R = C.shape[0]
+    Ccols = C.shape[3]
+
+    # Reconstruct S = V diag(mu) V^T
+    S = np.zeros((A, A), dtype=np.float64)
+    for i in range(A):
+        for j in range(A):
+            s = 0.0
+            for k in range(A):
+                s += V[i, k] * mu[k] * V[j, k]
+            S[i, j] = s
+
+    counts = np.zeros((R, A, A, Ccols), dtype=np.float64)
+    for n in range(R):
+        # VCV = V C[n] V^T per column
+        for c in range(Ccols):
+            for i in range(A):
+                for j in range(A):
+                    s = 0.0
+                    for k in range(A):
+                        for l in range(A):
+                            s += V[i, k] * C[n, k, l, c] * V[j, l]
+                    vcv = s
+                    if i == j:
+                        counts[n, i, j, c] = vcv  # dwell
+                    else:
+                        counts[n, i, j, c] = S[i, j] * vcv  # subs
 
     return counts
 
@@ -1001,6 +1166,77 @@ def f81_counts(U, D, logNormU, logNormD, logLike, distances, pi, parentIndex,
                         result[i, j, c] += I_sum  # dwell
                     else:
                         result[i, j, c] += mu * pi[j] * I_sum  # substitutions
+
+    return result
+
+
+def f81_counts_per_branch(U, D, logNormU, logNormD, logLike, distances, pi,
+                          parentIndex, branch_mask=None):
+    """O(CRA^2) direct computation of expected counts for F81/JC models, per branch.
+
+    Same as f81_counts but returns (R, A, A, C) instead of (A, A, C).
+    Branch 0 (root) is all zeros.
+
+    Args:
+        U: (R, C, A) inside vectors (rescaled)
+        D: (R, C, A) outside vectors (rescaled)
+        logNormU: (R, C) per-node inside log-normalizers
+        logNormD: (R, C) per-node outside log-normalizers
+        logLike: (C,) log-likelihoods
+        distances: (R,) branch lengths
+        pi: (A,) equilibrium frequencies
+        parentIndex: (R,) parent indices
+        branch_mask: (R, C) bool or None — if provided, skip inactive branches
+
+    Returns:
+        (R, A, A, C) counts tensor per branch (diag=dwell, off-diag=substitutions)
+    """
+    R, C, A = U.shape
+
+    # mu = 1 / (1 - sum(pi^2))
+    mu = 1.0 / (1.0 - np.sum(pi ** 2))
+
+    result = np.zeros((R, A, A, C), dtype=np.float64)
+
+    for n in range(1, R):
+        t = distances[n]
+        mu_t = mu * t
+        e_t = np.exp(-mu_t)
+        p = 1.0 - e_t
+
+        alpha_n = t * e_t
+        beta_n = p / mu - t * e_t
+        gamma_n = t * (1.0 + e_t) - 2.0 * p / mu
+
+        for c in range(C):
+            if branch_mask is not None and not branch_mask[n, c]:
+                continue
+            log_s = logNormD[n, c] + logNormU[n, c] - logLike[c]
+            scale = np.exp(log_s)
+
+            # Compute piU = sum_b pi_b * U[n,c,b]
+            piU = 0.0
+            for b in range(A):
+                piU += pi[b] * U[n, c, b]
+
+            # Compute Dsum = sum_a D[n,c,a] * scale
+            Dsum = 0.0
+            for a in range(A):
+                Dsum += D[n, c, a] * scale
+
+            for i in range(A):
+                D_i_scaled = D[n, c, i] * scale
+                for j in range(A):
+                    # I_sum = alpha*D_i*U_j + beta*(D_i*piU + pi_i*Dsum*U_j) + gamma*pi_i*Dsum*piU
+                    I_sum = (
+                        alpha_n * D_i_scaled * U[n, c, j]
+                        + beta_n * (D_i_scaled * piU + pi[i] * Dsum * U[n, c, j])
+                        + gamma_n * pi[i] * Dsum * piU
+                    )
+                    if i == j:
+                        result[n, i, j, c] = I_sum  # dwell
+                    else:
+                        result[n, i, j, c] = mu * pi[j] * I_sum  # substitutions
 
     return result
 
@@ -1192,6 +1428,60 @@ def Counts(alignment, tree, model, f81_fast=False, branch_mask="auto"):
         return back_transform(C, model)
 
 
+def BranchCounts(alignment, tree, model, f81_fast=False, branch_mask="auto"):
+    """Compute per-branch expected substitution counts and dwell times per column.
+
+    Same as Counts but returns (R, A, A, C) with per-branch breakdowns.
+    Branch 0 (root) is all zeros.
+
+    Args:
+        alignment: (R, C) int32 tokens
+        tree: dict with 'parentIndex', 'distanceToParent'
+        model: dict with 'eigenvalues', 'eigenvectors', 'pi'
+        f81_fast: if True, use O(CRA^2) F81/JC fast path
+        branch_mask: "auto" (compute from alignment), None (no masking),
+            or (R, C) bool array
+
+    Returns:
+        (R, A, A, C) counts tensor per branch (diag=dwell, off-diag=substitution counts)
+    """
+    is_irrev = _is_irrev(model)
+
+    if isinstance(branch_mask, str) and branch_mask == "auto":
+        A = len(model['pi'])
+        branch_mask = compute_branch_mask(alignment, tree['parentIndex'], A)
+
+    if is_irrev:
+        assert not f81_fast, "F81 fast path is reversible-only"
+
+    subMats = _get_sub_matrices(model, tree['distanceToParent'])
+    U, logNormU, logLike = upward_pass(alignment, tree, subMats, model['pi'])
+    D, logNormD = downward_pass(U, logNormU, tree, subMats, model['pi'], alignment)
+
+    if f81_fast:
+        return f81_counts_per_branch(
+            U, D, logNormU, logNormD, logLike,
+            tree['distanceToParent'], model['pi'], tree['parentIndex'],
+            branch_mask=branch_mask,
+        )
+    elif is_irrev:
+        J = compute_J_complex(model['eigenvalues'], tree['distanceToParent'])
+        U_tilde, D_tilde = eigenbasis_project_irrev(U, D, model)
+        C = accumulate_C_complex_per_branch(
+            D_tilde, U_tilde, J, logNormU, logNormD, logLike,
+            tree['parentIndex'], branch_mask=branch_mask,
+        )
+        return back_transform_irrev_per_branch(C, model)
+    else:
+        J = compute_J(model['eigenvalues'], tree['distanceToParent'])
+        U_tilde, D_tilde = eigenbasis_project(U, D, model)
+        C = accumulate_C_per_branch(
+            D_tilde, U_tilde, J, logNormU, logNormD, logLike,
+            tree['parentIndex'], branch_mask=branch_mask,
+        )
+        return back_transform_per_branch(C, model)
+
+
 def RootProb(alignment, tree, model):
     """Compute posterior root state distribution per column.
 
@@ -1331,6 +1621,50 @@ class InsideOutside:
                 self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
             )
             return back_transform(C, model)
+
+    def branch_counts(self, f81_fast=False, branch_mask="auto"):
+        """Per-branch expected substitution counts and dwell times per column.
+
+        Same as counts() but returns (R, A, A, C) with per-branch breakdowns.
+        Branch 0 (root) is all zeros.
+
+        Args:
+            f81_fast: if True, use O(CRA^2) F81/JC fast path
+            branch_mask: "auto", None, or (R, C) bool array
+
+        Returns:
+            (R, A, A, C) counts tensor per branch
+        """
+        model = self._model
+
+        if isinstance(branch_mask, str) and branch_mask == "auto":
+            A = len(model['pi'])
+            branch_mask = compute_branch_mask(
+                self._alignment, self._tree['parentIndex'], A
+            )
+
+        if f81_fast:
+            return f81_counts_per_branch(
+                self._U, self._D, self._logNormU, self._logNormD,
+                self._logLike, self._tree['distanceToParent'], model['pi'],
+                self._tree['parentIndex'], branch_mask=branch_mask,
+            )
+        elif self._is_irrev:
+            J = compute_J_complex(model['eigenvalues'], self._tree['distanceToParent'])
+            U_tilde, D_tilde = eigenbasis_project_irrev(self._U, self._D, model)
+            C = accumulate_C_complex_per_branch(
+                D_tilde, U_tilde, J, self._logNormU, self._logNormD,
+                self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
+            )
+            return back_transform_irrev_per_branch(C, model)
+        else:
+            J = compute_J(model['eigenvalues'], self._tree['distanceToParent'])
+            U_tilde, D_tilde = eigenbasis_project(self._U, self._D, model)
+            C = accumulate_C_per_branch(
+                D_tilde, U_tilde, J, self._logNormU, self._logNormD,
+                self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
+            )
+            return back_transform_per_branch(C, model)
 
     def node_posterior(self, node=None):
         """Posterior state distribution at node(s).

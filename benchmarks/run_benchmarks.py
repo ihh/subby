@@ -158,7 +158,7 @@ def _get_jax_backend():
     """Return (fn_map, make_tree_fn, make_model_fns) for JAX."""
     import jax
     import jax.numpy as jnp
-    from subby.jax import LogLike, Counts, LogLikeCustomGrad
+    from subby.jax import LogLike, Counts, BranchCounts, LogLikeCustomGrad
     from subby.jax.types import Tree
     from subby.jax.models import jukes_cantor_model, irrev_model_from_rate_matrix
 
@@ -177,12 +177,12 @@ def _get_jax_backend():
     def make_alignment_jax(alignment):
         return jnp.array(alignment)
 
-    return LogLike, Counts, make_tree_jax, make_model_jax, make_alignment_jax
+    return LogLike, Counts, BranchCounts, make_tree_jax, make_model_jax, make_alignment_jax
 
 
 def _get_oracle_backend():
     """Return (LogLike, Counts, make_tree_fn, make_model_fns) for oracle."""
-    from subby.oracle import LogLike, Counts
+    from subby.oracle import LogLike, Counts, BranchCounts
     from subby.oracle import jukes_cantor_model as oracle_jc
     from subby.oracle import irrev_model_from_rate_matrix as oracle_irrev
 
@@ -201,7 +201,7 @@ def _get_oracle_backend():
     def make_alignment_oracle(alignment):
         return alignment
 
-    return LogLike, Counts, make_tree_oracle, make_model_oracle, make_alignment_oracle
+    return LogLike, Counts, BranchCounts, make_tree_oracle, make_model_oracle, make_alignment_oracle
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +236,7 @@ PARAM_GRID = {
     "R": [7, 15, 31],
 }
 
-FUNCTIONS = ["LogLike", "Counts", "LogLikeGrad", "LogLikeCustomGrad"]
+FUNCTIONS = ["LogLike", "Counts", "BranchCounts", "LogLikeGrad", "LogLikeCustomGrad"]
 MODEL_TYPES = ["reversible", "irreversible"]
 
 
@@ -268,7 +268,7 @@ def run_benchmarks(backends, n_reps, dry_run=False, timeout=60.0, model_types=No
         if backend_name == "jax_cpu":
             os.environ["JAX_PLATFORMS"] = "cpu"
             try:
-                ll_fn, counts_fn, mk_tree, mk_model, mk_align = _get_jax_backend()
+                ll_fn, counts_fn, bc_fn, mk_tree, mk_model, mk_align = _get_jax_backend()
             except ImportError as e:
                 print(f"Skipping {backend_name}: {e}")
                 done += len(PARAM_GRID["A"]) * len(PARAM_GRID["C"]) * len(PARAM_GRID["R"]) * len(FUNCTIONS) * len(model_types)
@@ -279,14 +279,14 @@ def run_benchmarks(backends, n_reps, dry_run=False, timeout=60.0, model_types=No
                 import jax
                 if not jax.devices("gpu"):
                     raise RuntimeError("No GPU devices")
-                ll_fn, counts_fn, mk_tree, mk_model, mk_align = _get_jax_backend()
+                ll_fn, counts_fn, bc_fn, mk_tree, mk_model, mk_align = _get_jax_backend()
             except Exception as e:
                 print(f"Skipping {backend_name}: {e}")
                 done += len(PARAM_GRID["A"]) * len(PARAM_GRID["C"]) * len(PARAM_GRID["R"]) * len(FUNCTIONS) * len(model_types)
                 continue
         elif backend_name == "oracle":
             try:
-                ll_fn, counts_fn, mk_tree, mk_model, mk_align = _get_oracle_backend()
+                ll_fn, counts_fn, bc_fn, mk_tree, mk_model, mk_align = _get_oracle_backend()
             except ImportError as e:
                 print(f"Skipping {backend_name}: {e}")
                 done += len(PARAM_GRID["A"]) * len(PARAM_GRID["C"]) * len(PARAM_GRID["R"]) * len(FUNCTIONS) * len(model_types)
@@ -335,7 +335,7 @@ def run_benchmarks(backends, n_reps, dry_run=False, timeout=60.0, model_types=No
                                 print(f"  {label} ... SKIPPED (smaller config exceeded {timeout}s)")
                                 continue
 
-                            fn_map = {"LogLike": ll_fn, "Counts": counts_fn}
+                            fn_map = {"LogLike": ll_fn, "Counts": counts_fn, "BranchCounts": bc_fn}
 
                             # For gradient functions, only available with JAX
                             if func_name in ("LogLikeGrad", "LogLikeCustomGrad") and backend_name not in ("jax_cpu", "jax_gpu"):
