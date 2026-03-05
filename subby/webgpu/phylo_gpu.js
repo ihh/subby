@@ -1028,7 +1028,288 @@ export class PhyloGPU {
     return result;
   }
 
+  /**
+   * Create an InsideOutside table for querying posteriors.
+   *
+   * Accepts either:
+   *   InsideOutside(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi)
+   *   InsideOutside(alignment, parentIndex, distances, model)
+   *
+   * @returns {PhyloGPUInsideOutside}
+   */
+  async InsideOutside(alignment, parentIndex, distances, arg4, arg5, arg6) {
+    const parsed = PhyloGPU._parseModelArg(arg4, arg5);
+    const pi = parsed ? parsed.model.pi : arg6;
+    const isIrrev = parsed && parsed.irrev;
+    const R = parentIndex.length;
+    const A = pi.length;
+    const C = alignment.length / R;
+
+    const alignBuf = this._createBuffer(new Int32Array(alignment));
+    const distBuf = this._createBuffer(new Float32Array(distances));
+
+    const encoder = this.device.createCommandEncoder();
+    const likeBuf = this._tokenToLikelihood(encoder, alignBuf, R, C, A);
+
+    // Compute sub-matrices
+    let subMatBuf, smExtraBufs;
+    if (isIrrev) {
+      const m = parsed.model;
+      const evBuf = this._createBuffer(new Float32Array(m.eigenvalues_complex));
+      const vecBuf = this._createBuffer(new Float32Array(m.eigenvectors_complex));
+      const invBuf = this._createBuffer(new Float32Array(m.eigenvectors_inv_complex));
+      subMatBuf = this._computeSubMatricesComplex(encoder, evBuf, vecBuf, invBuf, distBuf, R, A);
+      smExtraBufs = [evBuf, vecBuf, invBuf];
+    } else {
+      const eigenvalues = parsed ? parsed.model.eigenvalues : arg4;
+      const eigenvectors = parsed ? parsed.model.eigenvectors : arg5;
+      const eigenvalsBuf = this._createBuffer(new Float32Array(eigenvalues));
+      const eigenvecsBuf = this._createBuffer(new Float32Array(eigenvectors));
+      const piBuf = this._createBuffer(new Float32Array(pi));
+      subMatBuf = this._computeSubMatrices(encoder, eigenvalsBuf, eigenvecsBuf, piBuf, distBuf, R, A);
+      smExtraBufs = [eigenvalsBuf, eigenvecsBuf, piBuf];
+    }
+
+    const logNormUBuf = this._createStorageBuffer(R * C * 4);
+    this.device.queue.writeBuffer(logNormUBuf, 0, new Float32Array(R * C));
+    this._upwardPass(encoder, likeBuf, logNormUBuf, subMatBuf, parentIndex, R, C, A);
+
+    this.device.queue.submit([encoder.finish()]);
+    await this.device.queue.onSubmittedWorkDone();
+
+    const UData = await this._readBuffer(likeBuf, R * C * A * 4);
+    const logNormUData = await this._readBuffer(logNormUBuf, R * C * 4);
+
+    // Compute logLike on CPU
+    const logLike = new Float32Array(C);
+    for (let c = 0; c < C; c++) {
+      let s = 0;
+      for (let a = 0; a < A; a++) s += pi[a] * UData[c * A + a];
+      logLike[c] = logNormUData[c] + Math.log(s);
+    }
+
+    // Observation likelihoods for downward pass
+    const obsLikeBuf = this._createStorageBuffer(R * C * A * 4);
+    {
+      const obsLike = new Float32Array(R * C * A);
+      for (let r = 0; r < R; r++) {
+        for (let c = 0; c < C; c++) {
+          const tok = alignment[r * C + c];
+          for (let a = 0; a < A; a++) {
+            if (tok >= 0 && tok < A) {
+              obsLike[(r * C + c) * A + a] = (a === tok) ? 1.0 : 0.0;
+            } else {
+              obsLike[(r * C + c) * A + a] = 1.0;
+            }
+          }
+        }
+      }
+      this.device.queue.writeBuffer(obsLikeBuf, 0, obsLike);
+    }
+
+    const UBuf2 = this._createBuffer(new Float32Array(UData));
+    const logNormUBuf2 = this._createBuffer(new Float32Array(logNormUData));
+    const rootProbBuf = this._createBuffer(new Float32Array(pi));
+
+    const DBuf = this._createStorageBuffer(R * C * A * 4);
+    this.device.queue.writeBuffer(DBuf, 0, new Float32Array(R * C * A));
+    const logNormDBuf = this._createStorageBuffer(R * C * 4);
+    this.device.queue.writeBuffer(logNormDBuf, 0, new Float32Array(R * C));
+
+    const subMatData = await this._readBuffer(subMatBuf, R * A * A * 4);
+    const subMatBuf2 = this._createBuffer(new Float32Array(subMatData));
+
+    const encoder2 = this.device.createCommandEncoder();
+    this._downwardPass(encoder2, UBuf2, logNormUBuf2, DBuf, logNormDBuf,
+                       subMatBuf2, rootProbBuf, obsLikeBuf, parentIndex, R, C, A);
+    this.device.queue.submit([encoder2.finish()]);
+    await this.device.queue.onSubmittedWorkDone();
+
+    const DData = await this._readBuffer(DBuf, R * C * A * 4);
+    const logNormDData = await this._readBuffer(logNormDBuf, R * C * 4);
+
+    // Fix root D: set D[0] = pi (rescaled)
+    let maxPi = 0;
+    for (let a = 0; a < A; a++) { if (pi[a] > maxPi) maxPi = pi[a]; }
+    if (maxPi < 1e-30) maxPi = 1e-30;
+    for (let c = 0; c < C; c++) {
+      for (let a = 0; a < A; a++) {
+        DData[c * A + a] = pi[a] / maxPi;
+      }
+      logNormDData[c] = Math.log(maxPi);
+    }
+
+    // Cleanup GPU buffers
+    for (const b of [alignBuf, distBuf, likeBuf, subMatBuf, logNormUBuf,
+                      UBuf2, logNormUBuf2, obsLikeBuf, rootProbBuf,
+                      DBuf, logNormDBuf, subMatBuf2, ...smExtraBufs]) {
+      b.destroy();
+    }
+
+    return new PhyloGPUInsideOutside(
+      UData, DData, logNormUData, logNormDData, logLike,
+      subMatData, pi, parentIndex, R, C, A,
+      isIrrev ? parsed.model : null,
+      isIrrev ? null : { eigenvalues: parsed ? parsed.model.eigenvalues : arg4,
+                          eigenvectors: parsed ? parsed.model.eigenvectors : arg5 },
+      distances, this,
+    );
+  }
+
   destroy() {
     this.device.destroy();
+  }
+}
+
+/**
+ * InsideOutside table for PhyloGPU.
+ * Stores CPU-side copies of U, D, logNorm arrays and computes posteriors on CPU.
+ */
+class PhyloGPUInsideOutside {
+  constructor(U, D, logNormU, logNormD, logLike, subMats, pi,
+              parentIndex, R, C, A, irrevModel, revModel, distances, gpu) {
+    this._U = U;               // Float32Array (R*C*A)
+    this._D = D;               // Float32Array (R*C*A)
+    this._logNormU = logNormU;  // Float32Array (R*C)
+    this._logNormD = logNormD;  // Float32Array (R*C)
+    this._logLike = logLike;    // Float32Array (C)
+    this._subMats = subMats;    // Float32Array (R*A*A)
+    this._pi = pi;
+    this._parentIndex = parentIndex;
+    this.R = R;
+    this.C = C;
+    this.A = A;
+    this._irrevModel = irrevModel;
+    this._revModel = revModel;
+    this._distances = distances;
+    this._gpu = gpu;
+  }
+
+  /** Per-column log-likelihoods. @returns {Float32Array} (C,) */
+  get log_likelihood() {
+    return this._logLike;
+  }
+
+  /** Expected substitution counts via eigensub pipeline on GPU. */
+  async counts(f81Fast = false) {
+    const { R, C, A } = this;
+    if (this._irrevModel) {
+      return this._gpu._eigensubCountsComplex(
+        this._U, this._D, this._logNormU, this._logNormD,
+        this._logLike, this._irrevModel, this._distances, R, C, A,
+      );
+    } else if (f81Fast) {
+      return this._gpu._f81Fast(
+        this._U, this._D, this._logNormU, this._logNormD,
+        this._logLike, this._distances, this._pi, R, C, A,
+      );
+    } else {
+      return this._gpu._eigensubCounts(
+        this._U, this._D, this._logNormU, this._logNormD,
+        this._logLike, this._revModel.eigenvalues, this._revModel.eigenvectors,
+        this._distances, this._pi, R, C, A,
+      );
+    }
+  }
+
+  /**
+   * Posterior state distribution at node(s).
+   * @param {number|null} node - Node index, or null for all nodes.
+   * @returns {Float32Array} (A*C,) for single or (R*A*C,) for all.
+   */
+  node_posterior(node = null) {
+    const { R, C, A } = this;
+    if (node !== null) {
+      const q = new Float32Array(A * C);
+      for (let c = 0; c < C; c++) {
+        const logScale = this._logNormU[node * C + c]
+          + this._logNormD[node * C + c]
+          - this._logLike[c];
+        const scale = Math.exp(logScale);
+        let sum = 0;
+        if (node === 0) {
+          for (let a = 0; a < A; a++) {
+            const val = this._D[c * A + a] * this._U[c * A + a] * scale;
+            q[a * C + c] = val;
+            sum += val;
+          }
+        } else {
+          const mBase = node * A * A;
+          const uBase = (node * C + c) * A;
+          const dBase = (node * C + c) * A;
+          for (let j = 0; j < A; j++) {
+            let dT = 0;
+            for (let a = 0; a < A; a++) {
+              dT += this._D[dBase + a] * this._subMats[mBase + a * A + j];
+            }
+            const val = dT * this._U[uBase + j] * scale;
+            q[j * C + c] = val;
+            sum += val;
+          }
+        }
+        if (sum > 0) {
+          for (let a = 0; a < A; a++) q[a * C + c] /= sum;
+        }
+      }
+      return q;
+    } else {
+      const result = new Float32Array(R * A * C);
+      for (let n = 0; n < R; n++) {
+        const single = this.node_posterior(n);
+        result.set(single, n * A * C);
+      }
+      return result;
+    }
+  }
+
+  /**
+   * Joint branch posterior of parent-child states.
+   * @param {number|null} node - Child node (> 0), or null for all.
+   * @returns {Float32Array} (A*A*C,) for single or (R*A*A*C,) for all.
+   */
+  branch_posterior(node = null) {
+    const { R, C, A } = this;
+    if (node !== null) {
+      const joint = new Float32Array(A * A * C);
+      for (let c = 0; c < C; c++) {
+        const logScale = this._logNormD[node * C + c]
+          + this._logNormU[node * C + c]
+          - this._logLike[c];
+        const scale = Math.exp(logScale);
+        const dBase = (node * C + c) * A;
+        const uBase = (node * C + c) * A;
+        const mBase = node * A * A;
+        let sum = 0;
+        for (let i = 0; i < A; i++) {
+          for (let j = 0; j < A; j++) {
+            const val = this._D[dBase + i]
+              * this._subMats[mBase + i * A + j]
+              * this._U[uBase + j]
+              * scale;
+            joint[i * A * C + j * C + c] = val;
+            sum += val;
+          }
+        }
+        if (sum > 0) {
+          for (let i = 0; i < A; i++) {
+            for (let j = 0; j < A; j++) {
+              joint[i * A * C + j * C + c] /= sum;
+            }
+          }
+        }
+      }
+      return joint;
+    } else {
+      const result = new Float32Array(R * A * A * C);
+      for (let n = 1; n < R; n++) {
+        const single = this.branch_posterior(n);
+        result.set(single, n * A * A * C);
+      }
+      return result;
+    }
+  }
+
+  destroy() {
+    // No GPU resources to free (all read back to CPU)
   }
 }

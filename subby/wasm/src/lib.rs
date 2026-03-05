@@ -190,6 +190,297 @@ pub fn mixture_posterior_full(
     mixture::mixture_posterior(&log_likes, log_weights, k, c)
 }
 
+// ---- InsideOutside table ----
+
+enum ModelData {
+    Reversible {
+        eigenvalues: Vec<f64>,
+        eigenvectors: Vec<f64>,
+    },
+    Irreversible {
+        eigenvalues_complex: Vec<f64>,
+        eigenvectors_complex: Vec<f64>,
+        eigenvectors_inv_complex: Vec<f64>,
+    },
+}
+
+/// Inside-outside DP tables for querying posteriors.
+///
+/// Runs the upward (inside) and downward (outside) passes once and stores the
+/// resulting vectors, enabling efficient queries for log-likelihoods, expected
+/// substitution counts, node state posteriors, and branch endpoint joint
+/// posteriors without recomputation.
+pub struct InsideOutsideTable {
+    u: Vec<f64>,
+    d: Vec<f64>,
+    log_norm_u: Vec<f64>,
+    log_norm_d: Vec<f64>,
+    log_like: Vec<f64>,
+    sub_mats: Vec<f64>,
+    pi: Vec<f64>,
+    parent_index: Vec<i32>,
+    distances: Vec<f64>,
+    model_data: ModelData,
+    r: usize,
+    c: usize,
+    a: usize,
+}
+
+impl InsideOutsideTable {
+    /// Create from a reversible DiagModel.
+    pub fn new(
+        alignment: &[i32],
+        parent_index: &[i32],
+        distances: &[f64],
+        model: &DiagModel,
+    ) -> Self {
+        let r = parent_index.len();
+        let a = model.pi.len();
+        let c = alignment.len() / r;
+
+        let sm = sub_matrices::compute_sub_matrices(model, distances);
+        let (u, log_norm_u, log_like) = pruning::upward_pass(
+            alignment, parent_index, &sm, &model.pi, r, c, a,
+        );
+        let (mut d, mut log_norm_d) = outside::downward_pass(
+            &u, &log_norm_u, parent_index, &sm, &model.pi, alignment, r, c, a,
+        );
+
+        // Fix root D: set D[0] = pi (rescaled)
+        Self::fix_root_d(&mut d, &mut log_norm_d, &model.pi, c, a);
+
+        InsideOutsideTable {
+            u, d, log_norm_u, log_norm_d, log_like,
+            sub_mats: sm,
+            pi: model.pi.clone(),
+            parent_index: parent_index.to_vec(),
+            distances: distances.to_vec(),
+            model_data: ModelData::Reversible {
+                eigenvalues: model.eigenvalues.clone(),
+                eigenvectors: model.eigenvectors.clone(),
+            },
+            r, c, a,
+        }
+    }
+
+    /// Create from an irreversible IrrevDiagModel.
+    pub fn new_irrev(
+        alignment: &[i32],
+        parent_index: &[i32],
+        distances: &[f64],
+        model: &IrrevDiagModel,
+    ) -> Self {
+        let r = parent_index.len();
+        let a = model.pi.len();
+        let c = alignment.len() / r;
+
+        let sm = sub_matrices::compute_sub_matrices_irrev(model, distances);
+        let (u, log_norm_u, log_like) = pruning::upward_pass(
+            alignment, parent_index, &sm, &model.pi, r, c, a,
+        );
+        let (mut d, mut log_norm_d) = outside::downward_pass(
+            &u, &log_norm_u, parent_index, &sm, &model.pi, alignment, r, c, a,
+        );
+
+        Self::fix_root_d(&mut d, &mut log_norm_d, &model.pi, c, a);
+
+        InsideOutsideTable {
+            u, d, log_norm_u, log_norm_d, log_like,
+            sub_mats: sm,
+            pi: model.pi.clone(),
+            parent_index: parent_index.to_vec(),
+            distances: distances.to_vec(),
+            model_data: ModelData::Irreversible {
+                eigenvalues_complex: model.eigenvalues_complex.clone(),
+                eigenvectors_complex: model.eigenvectors_complex.clone(),
+                eigenvectors_inv_complex: model.eigenvectors_inv_complex.clone(),
+            },
+            r, c, a,
+        }
+    }
+
+    fn fix_root_d(d: &mut [f64], log_norm_d: &mut [f64], pi: &[f64], c: usize, a: usize) {
+        let mut max_val = 0.0f64;
+        for aa in 0..a {
+            if pi[aa] > max_val { max_val = pi[aa]; }
+        }
+        if max_val < 1e-300 { max_val = 1e-300; }
+        for col in 0..c {
+            let base = col * a; // node 0: (0 * c + col) * a = col * a
+            for aa in 0..a {
+                d[base + aa] = pi[aa] / max_val;
+            }
+            log_norm_d[col] = max_val.ln(); // node 0: 0 * c + col = col
+        }
+    }
+
+    /// Per-column log-likelihoods.
+    pub fn log_likelihood(&self) -> &[f64] {
+        &self.log_like
+    }
+
+    /// Expected substitution counts and dwell times.
+    /// Returns (A*A*C) flat with layout result[i*A*C + j*C + col].
+    pub fn counts(&self, f81_fast_flag: bool) -> Vec<f64> {
+        match &self.model_data {
+            ModelData::Reversible { eigenvalues, eigenvectors } => {
+                if f81_fast_flag {
+                    f81_fast::f81_counts(
+                        &self.u, &self.d, &self.log_norm_u, &self.log_norm_d,
+                        &self.log_like, &self.distances, &self.pi,
+                        &self.parent_index, self.r, self.c, self.a,
+                    )
+                } else {
+                    let model = DiagModel {
+                        eigenvalues: eigenvalues.clone(),
+                        eigenvectors: eigenvectors.clone(),
+                        pi: self.pi.clone(),
+                    };
+                    let j = eigensub::compute_j(eigenvalues, &self.distances);
+                    let (u_tilde, d_tilde) = eigensub::eigenbasis_project(
+                        &self.u, &self.d, &model, self.r, self.c, self.a,
+                    );
+                    let c_eigen = eigensub::accumulate_c(
+                        &d_tilde, &u_tilde, &j, &self.log_norm_u, &self.log_norm_d,
+                        &self.log_like, &self.parent_index, self.r, self.c, self.a,
+                    );
+                    eigensub::back_transform(&c_eigen, &model, self.c)
+                }
+            }
+            ModelData::Irreversible {
+                eigenvalues_complex, eigenvectors_complex, eigenvectors_inv_complex,
+            } => {
+                let model = IrrevDiagModel {
+                    eigenvalues_complex: eigenvalues_complex.clone(),
+                    eigenvectors_complex: eigenvectors_complex.clone(),
+                    eigenvectors_inv_complex: eigenvectors_inv_complex.clone(),
+                    pi: self.pi.clone(),
+                };
+                let j = eigensub::compute_j_complex(eigenvalues_complex, &self.distances);
+                let (u_tilde, d_tilde) = eigensub::eigenbasis_project_irrev(
+                    &self.u, &self.d, &model, self.r, self.c, self.a,
+                );
+                let c_eigen = eigensub::accumulate_c_complex(
+                    &d_tilde, &u_tilde, &j, &self.log_norm_u, &self.log_norm_d,
+                    &self.log_like, &self.parent_index, self.r, self.c, self.a,
+                );
+                eigensub::back_transform_irrev(&c_eigen, &model, self.c)
+            }
+        }
+    }
+
+    /// Posterior state distribution at a single node.
+    /// Returns (A*C) flat with layout q[a*C + col].
+    pub fn node_posterior_single(&self, node: usize) -> Vec<f64> {
+        let (c, a) = (self.c, self.a);
+        let mut q = vec![0.0; a * c];
+
+        for col in 0..c {
+            let u_base = (node * c + col) * a;
+            let d_base = (node * c + col) * a;
+
+            let log_scale = self.log_norm_u[node * c + col]
+                + self.log_norm_d[node * c + col]
+                - self.log_like[col];
+            let scale = log_scale.exp();
+
+            let mut sum = 0.0;
+            if node == 0 {
+                // Root: D[0] = pi (set in constructor), product is pi * U / Z
+                for aa in 0..a {
+                    let val = self.d[d_base + aa] * self.u[u_base + aa] * scale;
+                    q[aa * c + col] = val;
+                    sum += val;
+                }
+            } else {
+                // Non-root: transform D through M
+                let m_base = node * a * a;
+                for j in 0..a {
+                    let mut d_transformed = 0.0;
+                    for aa in 0..a {
+                        d_transformed += self.d[d_base + aa]
+                            * self.sub_mats[m_base + aa * a + j];
+                    }
+                    let val = d_transformed * self.u[u_base + j] * scale;
+                    q[j * c + col] = val;
+                    sum += val;
+                }
+            }
+            if sum > 0.0 {
+                for aa in 0..a {
+                    q[aa * c + col] /= sum;
+                }
+            }
+        }
+        q
+    }
+
+    /// Posterior state distribution at all nodes.
+    /// Returns (R*A*C) flat with layout q[n*A*C + a*C + col].
+    pub fn node_posterior_all(&self) -> Vec<f64> {
+        let (r, c, a) = (self.r, self.c, self.a);
+        let mut result = vec![0.0; r * a * c];
+        for n in 0..r {
+            let single = self.node_posterior_single(n);
+            let offset = n * a * c;
+            result[offset..offset + a * c].copy_from_slice(&single);
+        }
+        result
+    }
+
+    /// Joint posterior of parent-child states on a single branch.
+    /// Returns (A*A*C) flat with layout joint[i*A*C + j*C + col].
+    pub fn branch_posterior_single(&self, node: usize) -> Vec<f64> {
+        let (c, a) = (self.c, self.a);
+        assert!(node > 0, "Branch 0 (root) has no parent");
+        let mut joint = vec![0.0; a * a * c];
+
+        for col in 0..c {
+            let d_base = (node * c + col) * a;
+            let u_base = (node * c + col) * a;
+            let m_base = node * a * a;
+
+            let log_scale = self.log_norm_d[node * c + col]
+                + self.log_norm_u[node * c + col]
+                - self.log_like[col];
+            let scale = log_scale.exp();
+
+            let mut sum = 0.0;
+            for i in 0..a {
+                for j in 0..a {
+                    let val = self.d[d_base + i]
+                        * self.sub_mats[m_base + i * a + j]
+                        * self.u[u_base + j]
+                        * scale;
+                    joint[i * a * c + j * c + col] = val;
+                    sum += val;
+                }
+            }
+            if sum > 0.0 {
+                for i in 0..a {
+                    for j in 0..a {
+                        joint[i * a * c + j * c + col] /= sum;
+                    }
+                }
+            }
+        }
+        joint
+    }
+
+    /// Joint posterior for all branches.
+    /// Returns (R*A*A*C) flat. Branch 0 is zeros.
+    pub fn branch_posterior_all(&self) -> Vec<f64> {
+        let (r, c, a) = (self.r, self.c, self.a);
+        let mut result = vec![0.0; r * a * a * c];
+        for n in 1..r {
+            let single = self.branch_posterior_single(n);
+            let offset = n * a * a * c;
+            result[offset..offset + a * a * c].copy_from_slice(&single);
+        }
+        result
+    }
+}
+
 // ---- WASM bindings ----
 #[cfg(feature = "wasm")]
 mod wasm_api {
@@ -314,6 +605,88 @@ mod wasm_api {
         let r = parent_index.len();
         let c = alignment.len() / r;
         crate::branch_mask::compute_branch_mask(alignment, parent_index, a, r, c)
+    }
+
+    // ---- InsideOutside WASM bindings ----
+
+    #[wasm_bindgen]
+    pub struct WasmInsideOutside {
+        table: crate::InsideOutsideTable,
+    }
+
+    #[wasm_bindgen]
+    impl WasmInsideOutside {
+        /// Create InsideOutside table for a reversible model.
+        pub fn create(
+            alignment: &[i32],
+            parent_index: &[i32],
+            distances: &[f64],
+            eigenvalues: &[f64],
+            eigenvectors: &[f64],
+            pi: &[f64],
+        ) -> WasmInsideOutside {
+            let m = model::DiagModel {
+                eigenvalues: eigenvalues.to_vec(),
+                eigenvectors: eigenvectors.to_vec(),
+                pi: pi.to_vec(),
+            };
+            WasmInsideOutside {
+                table: crate::InsideOutsideTable::new(
+                    alignment, parent_index, distances, &m,
+                ),
+            }
+        }
+
+        /// Create InsideOutside table for an irreversible model.
+        pub fn create_irrev(
+            alignment: &[i32],
+            parent_index: &[i32],
+            distances: &[f64],
+            eigenvalues_complex: &[f64],
+            eigenvectors_complex: &[f64],
+            eigenvectors_inv_complex: &[f64],
+            pi: &[f64],
+        ) -> WasmInsideOutside {
+            let m = model::IrrevDiagModel {
+                eigenvalues_complex: eigenvalues_complex.to_vec(),
+                eigenvectors_complex: eigenvectors_complex.to_vec(),
+                eigenvectors_inv_complex: eigenvectors_inv_complex.to_vec(),
+                pi: pi.to_vec(),
+            };
+            WasmInsideOutside {
+                table: crate::InsideOutsideTable::new_irrev(
+                    alignment, parent_index, distances, &m,
+                ),
+            }
+        }
+
+        pub fn log_likelihood(&self) -> Vec<f64> {
+            self.table.log_likelihood().to_vec()
+        }
+
+        pub fn counts(&self, f81_fast: bool) -> Vec<f64> {
+            self.table.counts(f81_fast)
+        }
+
+        /// Posterior state distribution. node = -1 for all nodes.
+        /// Returns (A*C) for single node or (R*A*C) for all.
+        pub fn node_posterior(&self, node: i32) -> Vec<f64> {
+            if node < 0 {
+                self.table.node_posterior_all()
+            } else {
+                self.table.node_posterior_single(node as usize)
+            }
+        }
+
+        /// Joint branch posterior. node = -1 for all branches.
+        /// Returns (A*A*C) for single branch or (R*A*A*C) for all.
+        pub fn branch_posterior(&self, node: i32) -> Vec<f64> {
+            if node < 0 {
+                self.table.branch_posterior_all()
+            } else {
+                self.table.branch_posterior_single(node as usize)
+            }
+        }
     }
 }
 
@@ -1382,6 +1755,196 @@ mod tests {
             assert_root_prob_properties(&rp, a, 4, &format!("irrev_seed_{}", seed));
             let cts = counts_irrev(&alignment, &pi, &dist, &irrev_model);
             assert_counts_properties(&cts, a, 4, &format!("irrev_seed_{}", seed));
+        }
+    }
+
+    // ---- InsideOutside tests ----
+
+    #[test]
+    fn test_inside_outside_loglike_matches() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 42);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 99, 0.1);
+
+        let ll_direct = log_like(&alignment, &parent_index, &distances, &model);
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let ll_io = io.log_likelihood();
+
+        for col in 0..c {
+            assert!((ll_direct[col] - ll_io[col]).abs() < 1e-12,
+                "loglike mismatch at col {}: {} vs {}", col, ll_direct[col], ll_io[col]);
+        }
+    }
+
+    #[test]
+    fn test_inside_outside_counts_matches() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 42);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 99, 0.1);
+
+        let cts_direct = counts(&alignment, &parent_index, &distances, &model, false);
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let cts_io = io.counts(false);
+
+        for idx in 0..cts_direct.len() {
+            assert!((cts_direct[idx] - cts_io[idx]).abs() < 1e-10,
+                "counts mismatch at {}: {} vs {}", idx, cts_direct[idx], cts_io[idx]);
+        }
+    }
+
+    #[test]
+    fn test_inside_outside_node_posterior_root_matches_root_prob() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 42);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 99, 0.1);
+
+        let rp = root_prob(&alignment, &parent_index, &distances, &model);
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let np = io.node_posterior_single(0);
+
+        for idx in 0..rp.len() {
+            assert!((rp[idx] - np[idx]).abs() < 1e-10,
+                "root posterior mismatch at {}: {} vs {}", idx, rp[idx], np[idx]);
+        }
+    }
+
+    #[test]
+    fn test_inside_outside_node_posterior_sums_to_one() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 42);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 99, 0.1);
+
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let np_all = io.node_posterior_all();
+
+        for n in 0..r {
+            for col in 0..c {
+                let mut sum = 0.0;
+                for aa in 0..a {
+                    let val = np_all[n * a * c + aa * c + col];
+                    assert!(val >= -1e-15,
+                        "negative posterior at node {} col {} state {}", n, col, aa);
+                    sum += val;
+                }
+                assert!((sum - 1.0).abs() < 1e-10,
+                    "posterior doesn't sum to 1 at node {} col {}: {}", n, col, sum);
+            }
+        }
+    }
+
+    #[test]
+    fn test_inside_outside_branch_posterior_sums_to_one() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 42);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 99, 0.1);
+
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        for n in 1..r {
+            let bp = io.branch_posterior_single(n);
+            for col in 0..c {
+                let mut sum = 0.0;
+                for i in 0..a {
+                    for j in 0..a {
+                        let val = bp[i * a * c + j * c + col];
+                        assert!(val >= -1e-15, "negative branch posterior");
+                        sum += val;
+                    }
+                }
+                assert!((sum - 1.0).abs() < 1e-10,
+                    "branch posterior doesn't sum to 1 at node {} col {}: {}", n, col, sum);
+            }
+        }
+    }
+
+    #[test]
+    fn test_inside_outside_branch_marginal_matches_child_node() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 42);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 99, 0.1);
+
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        // sum_i P(parent=i, child=j) should equal child's node_posterior(j)
+        for n in 1..r {
+            let bp = io.branch_posterior_single(n);
+            let np = io.node_posterior_single(n);
+            for col in 0..c {
+                for j in 0..a {
+                    let mut marginal = 0.0;
+                    for i in 0..a {
+                        marginal += bp[i * a * c + j * c + col];
+                    }
+                    assert!((marginal - np[j * c + col]).abs() < 1e-10,
+                        "child marginal mismatch at node {} col {} state {}: {} vs {}",
+                        n, col, j, marginal, np[j * c + col]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_inside_outside_branch_all_zeros_at_root() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 42);
+        let model = model::jukes_cantor_model(a);
+        let alignment = make_alignment(r, c, a, 99, 0.1);
+
+        let io = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let bp_all = io.branch_posterior_all();
+        // Branch 0 should be all zeros
+        for idx in 0..a * a * c {
+            assert!(bp_all[idx].abs() < 1e-15, "branch 0 not zero");
+        }
+    }
+
+    #[test]
+    fn test_inside_outside_irrev() {
+        let r = 5;
+        let a = 4;
+        let c = 6;
+        let (parent_index, distances) = make_tree(r, 42);
+        let model = model::jukes_cantor_model(a);
+        let irrev_model = make_irrev_from_diag(&model);
+        let alignment = make_alignment(r, c, a, 99, 0.1);
+
+        let io_rev = InsideOutsideTable::new(&alignment, &parent_index, &distances, &model);
+        let io_irrev = InsideOutsideTable::new_irrev(
+            &alignment, &parent_index, &distances, &irrev_model,
+        );
+
+        // Log-likelihoods should match
+        let ll_rev = io_rev.log_likelihood();
+        let ll_irrev = io_irrev.log_likelihood();
+        for col in 0..c {
+            assert!((ll_rev[col] - ll_irrev[col]).abs() < 1e-10,
+                "irrev loglike mismatch at col {}", col);
+        }
+
+        // Node posteriors should match
+        let np_rev = io_rev.node_posterior_all();
+        let np_irrev = io_irrev.node_posterior_all();
+        for idx in 0..np_rev.len() {
+            assert!((np_rev[idx] - np_irrev[idx]).abs() < 1e-8,
+                "irrev node posterior mismatch at idx {}", idx);
         }
     }
 }

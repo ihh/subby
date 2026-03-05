@@ -295,6 +295,77 @@ ll = unpad_columns(ll, C_orig)          # back to original C
 
 ---
 
+## InsideOutside
+
+### `InsideOutside(alignment, tree, model, maxChunkSize=128)`
+
+Runs the inside (upward) and outside (downward) passes once and stores the resulting DP tables, enabling efficient queries for log-likelihoods, expected substitution counts, node state posteriors, and branch endpoint joint posteriors without recomputation.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `alignment` | `int32 (R, C)` | Token-encoded alignment |
+| `tree` | `Tree` | Phylogenetic tree |
+| `model` | `DiagModel`, `IrrevDiagModel`, `RateModel`, or `list` | Substitution model |
+| `maxChunkSize` | `int` | Column chunk size |
+
+**Properties:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `log_likelihood` | `(*H, C)` float | Per-column log-likelihoods |
+
+**Methods:**
+
+#### `counts(f81_fast_flag=False, branch_mask="auto")`
+
+Expected substitution counts and dwell times, reusing stored DP tables.
+
+**Returns:** `(*H, A, A, C)` float tensor.
+
+#### `node_posterior(node=None)`
+
+Posterior state distribution at node(s).
+
+For root: $P(X_0 = a \mid \text{data}) \propto \pi_a \cdot U^{(0)}_a(c)$
+
+For non-root: $P(X_n = j \mid \text{data}) \propto \left[\sum_a D^{(n)}_a(c) \cdot M^{(n)}_{aj}\right] \cdot U^{(n)}_j(c)$
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `node` | `int` or `None` | Node index, or `None` for all nodes |
+
+**Returns:** `(*H, A, C)` if `node` is int; `(*H, R, A, C)` if `None`.
+
+#### `branch_posterior(node=None)`
+
+Joint posterior of parent-child states on a branch.
+
+$$P(X_{\text{parent}(n)}=i,\, X_n=j \mid \text{data}, c) \propto D^{(n)}_i(c) \cdot M^{(n)}_{ij} \cdot U^{(n)}_j(c)$$
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `node` | `int` or `None` | Child node index (must be > 0), or `None` for all |
+
+**Returns:** `(*H, A, A, C)` if `node` is int; `(*H, R, A, A, C)` if `None`. Branch 0 is zeros.
+
+**Example:**
+
+```python
+from subby.jax import InsideOutside
+
+io = InsideOutside(alignment, tree, model)
+
+ll = io.log_likelihood                  # (*H, C)
+root_post = io.node_posterior(0)        # (*H, A, C)
+all_posts = io.node_posterior()         # (*H, R, A, C)
+branch_joint = io.branch_posterior(3)   # (*H, A, A, C)
+counts = io.counts()                    # (*H, A, A, C)
+```
+
+---
+
 ## Low-level functions
 
 ### `diagonalize_rate_matrix(subRate, rootProb)`

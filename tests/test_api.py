@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 
-from subby.jax import LogLike, Counts, RootProb, MixturePosterior, LogLikeCustomGrad, pad_alignment, unpad_columns
+from subby.jax import LogLike, Counts, RootProb, MixturePosterior, LogLikeCustomGrad, pad_alignment, unpad_columns, InsideOutside
 from subby.jax.types import Tree, RateModel
 from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model, irrev_model_from_rate_matrix
 
@@ -499,3 +499,230 @@ class TestPadAlignment:
             MixturePosterior(padded, tree, models, log_weights), C_orig
         )
         np.testing.assert_allclose(post_padded, post_orig, atol=1e-10)
+
+
+class TestInsideOutside:
+
+    def _make_setup(self, C=10, n_leaves=5, seed=42):
+        tree = _make_medium_tree(n_leaves, key=jax.random.PRNGKey(seed))
+        R = tree.parentIndex.shape[0]
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(seed + 1), (R, C), 0, 4
+        ).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+        return alignment, tree, model
+
+    def test_loglike_matches(self):
+        """InsideOutside.log_likelihood matches standalone LogLike."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        np.testing.assert_allclose(io.log_likelihood, LogLike(alignment, tree, model), atol=1e-12)
+
+    def test_counts_matches(self):
+        """InsideOutside.counts() matches standalone Counts."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        np.testing.assert_allclose(io.counts(), Counts(alignment, tree, model), atol=1e-12)
+
+    def test_counts_f81_fast(self):
+        """InsideOutside.counts(f81_fast_flag=True) matches standalone."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        np.testing.assert_allclose(
+            io.counts(f81_fast_flag=True),
+            Counts(alignment, tree, model, f81_fast_flag=True),
+            atol=1e-12,
+        )
+
+    def test_node_posterior_root_matches_rootprob(self):
+        """node_posterior(0) should match RootProb."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        np.testing.assert_allclose(
+            io.node_posterior(0),
+            RootProb(alignment, tree, model),
+            atol=1e-10,
+        )
+
+    def test_node_posterior_sums_to_one(self):
+        """Node posterior sums to 1 over states for every node and column."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        all_post = io.node_posterior()  # (R, A, C)
+        sums = jnp.sum(all_post, axis=-2)  # (R, C)
+        np.testing.assert_allclose(sums, 1.0, atol=1e-8)
+
+    def test_node_posterior_nonnegative(self):
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        all_post = io.node_posterior()
+        assert jnp.all(all_post >= -1e-10)
+
+    def test_node_posterior_single_matches_all(self):
+        """node_posterior(n) matches the n-th slice of node_posterior(None)."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        all_post = io.node_posterior()  # (R, A, C)
+        for n in [0, 1, 3, 5]:
+            single = io.node_posterior(n)  # (A, C)
+            np.testing.assert_allclose(single, all_post[n], atol=1e-12)
+
+    def test_branch_posterior_sums_to_one(self):
+        """Branch posterior sums to 1 over (i,j) for every branch and column."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        R = tree.parentIndex.shape[0]
+        for n in [1, 3, 5]:
+            bp = io.branch_posterior(n)  # (A, A, C)
+            sums = jnp.sum(bp, axis=(0, 1))  # (C,)
+            np.testing.assert_allclose(sums, 1.0, atol=1e-8)
+
+    def test_branch_posterior_nonnegative(self):
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        bp = io.branch_posterior(1)
+        assert jnp.all(bp >= -1e-10)
+
+    def test_branch_marginal_matches_node_posterior(self):
+        """Summing branch_posterior over child states gives parent's node_posterior."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        R = tree.parentIndex.shape[0]
+        parentIndex = tree.parentIndex
+
+        for n in [1, 3, 5]:
+            bp = io.branch_posterior(n)     # (A, A, C)
+            parent = int(parentIndex[n])
+            # Sum over child states (axis 1) to get parent marginal
+            parent_marginal = jnp.sum(bp, axis=1)  # (A, C)
+            parent_post = io.node_posterior(parent)  # (A, C)
+            np.testing.assert_allclose(parent_marginal, parent_post, atol=1e-8)
+
+    def test_branch_marginal_child_matches_node_posterior(self):
+        """Summing branch_posterior over parent states gives child's node_posterior."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+
+        for n in [1, 3, 5]:
+            bp = io.branch_posterior(n)     # (A, A, C)
+            # Sum over parent states (axis 0) to get child marginal
+            child_marginal = jnp.sum(bp, axis=0)  # (A, C)
+            child_post = io.node_posterior(n)       # (A, C)
+            np.testing.assert_allclose(child_marginal, child_post, atol=1e-8)
+
+    def test_branch_posterior_all(self):
+        """branch_posterior(None) returns all branches; branch 0 is zeros."""
+        alignment, tree, model = self._make_setup()
+        io = InsideOutside(alignment, tree, model)
+        all_bp = io.branch_posterior()  # (R, A, A, C)
+        R = tree.parentIndex.shape[0]
+        assert all_bp.shape == (R, 4, 4, 10)
+        # Branch 0 is all zeros
+        np.testing.assert_allclose(all_bp[0], 0.0, atol=1e-15)
+        # Other branches match individual queries
+        for n in [1, 3, 5]:
+            np.testing.assert_allclose(all_bp[n], io.branch_posterior(n), atol=1e-12)
+
+    def test_irreversible_model(self):
+        """InsideOutside works with irreversible model."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(100))
+        R = tree.parentIndex.shape[0]
+        C = 8
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(101), (R, C), 0, 4
+        ).astype(jnp.int32)
+
+        A = 4
+        rng = np.random.RandomState(42)
+        rate = rng.uniform(0.01, 1.0, (A, A))
+        np.fill_diagonal(rate, 0.0)
+        np.fill_diagonal(rate, -rate.sum(axis=1))
+        pi = np.ones(A) / A
+        norm = -np.sum(pi * np.diag(rate))
+        rate /= norm
+        model = irrev_model_from_rate_matrix(jnp.array(rate), jnp.array(pi))
+
+        io = InsideOutside(alignment, tree, model)
+        np.testing.assert_allclose(
+            io.log_likelihood.real,
+            LogLike(alignment, tree, model).real,
+            atol=1e-10,
+        )
+        # Node posterior should still sum to 1
+        post = io.node_posterior(0)  # (A, C)
+        sums = jnp.sum(post.real, axis=0)
+        np.testing.assert_allclose(sums, 1.0, atol=1e-6)
+
+    def test_hky_model(self):
+        """InsideOutside works with HKY85 model (non-uniform pi)."""
+        tree = _make_medium_tree(5, key=jax.random.PRNGKey(110))
+        R = tree.parentIndex.shape[0]
+        C = 8
+        alignment = jax.random.randint(
+            jax.random.PRNGKey(111), (R, C), 0, 4
+        ).astype(jnp.int32)
+        pi = jnp.array([0.1, 0.2, 0.3, 0.4])
+        model = hky85_diag(2.5, pi)
+        io = InsideOutside(alignment, tree, model)
+
+        # Log-likelihood matches
+        np.testing.assert_allclose(
+            io.log_likelihood, LogLike(alignment, tree, model), atol=1e-12
+        )
+        # Root posterior matches
+        np.testing.assert_allclose(
+            io.node_posterior(0), RootProb(alignment, tree, model), atol=1e-10
+        )
+        # Branch posterior marginals consistent
+        bp = io.branch_posterior(1)
+        child_marginal = jnp.sum(bp, axis=0)
+        np.testing.assert_allclose(child_marginal, io.node_posterior(1), atol=1e-8)
+
+    def test_oracle_matches_jax(self):
+        """Oracle InsideOutside matches JAX InsideOutside."""
+        from subby.oracle import InsideOutside as OracleIO
+        from subby.oracle import jukes_cantor_model as oracle_jc
+
+        tree_jax = _make_medium_tree(5, key=jax.random.PRNGKey(120))
+        R = tree_jax.parentIndex.shape[0]
+        C = 8
+        alignment_jax = jax.random.randint(
+            jax.random.PRNGKey(121), (R, C), 0, 4
+        ).astype(jnp.int32)
+
+        model_jax = jukes_cantor_model(4)
+        io_jax = InsideOutside(alignment_jax, tree_jax, model_jax)
+
+        # Convert to oracle format
+        alignment_np = np.array(alignment_jax)
+        tree_np = {
+            'parentIndex': np.array(tree_jax.parentIndex),
+            'distanceToParent': np.array(tree_jax.distanceToParent),
+        }
+        model_np = oracle_jc(4)
+        io_oracle = OracleIO(alignment_np, tree_np, model_np)
+
+        # Log-likelihood
+        np.testing.assert_allclose(
+            np.array(io_jax.log_likelihood), io_oracle.log_likelihood, atol=1e-10
+        )
+        # Node posteriors
+        for n in [0, 1, 3]:
+            np.testing.assert_allclose(
+                np.array(io_jax.node_posterior(n)),
+                io_oracle.node_posterior(n),
+                atol=1e-8,
+            )
+        # Branch posteriors
+        for n in [1, 3, 5]:
+            np.testing.assert_allclose(
+                np.array(io_jax.branch_posterior(n)),
+                io_oracle.branch_posterior(n),
+                atol=1e-8,
+            )
+        # Counts
+        np.testing.assert_allclose(
+            np.array(io_jax.counts()),
+            io_oracle.counts(),
+            atol=1e-8,
+        )

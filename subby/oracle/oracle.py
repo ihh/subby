@@ -1237,3 +1237,246 @@ def MixturePosterior(alignment, tree, models, log_weights):
     for k in range(K):
         log_likes[k, :] = LogLike(alignment, tree, models[k])
     return mixture_posterior(log_likes, log_weights)
+
+
+class InsideOutside:
+    """Inside-outside DP tables for querying posteriors (pure-Python oracle).
+
+    Runs the upward (inside) and downward (outside) passes once and stores the
+    resulting vectors, enabling efficient queries for log-likelihoods, expected
+    substitution counts, node state posteriors, and branch endpoint joint
+    posteriors without recomputation.
+
+    Args:
+        alignment: (R, C) int32 tokens
+        tree: dict with 'parentIndex' (R,), 'distanceToParent' (R,)
+        model: dict with 'eigenvalues', 'eigenvectors', 'pi'
+    """
+
+    def __init__(self, alignment, tree, model):
+        self._alignment = alignment
+        self._tree = tree
+        self._model = model
+        self._is_irrev = _is_irrev(model)
+
+        subMats = _get_sub_matrices(model, tree['distanceToParent'])
+        self._subMatrices = subMats
+
+        U, logNormU, logLike = upward_pass(alignment, tree, subMats, model['pi'])
+        self._U = U
+        self._logNormU = logNormU
+        self._logLike = logLike
+
+        D, logNormD = downward_pass(U, logNormU, tree, subMats, model['pi'], alignment)
+
+        # Set root's outside vector to the prior pi (downward pass leaves it zero)
+        pi = model['pi']
+        A = len(pi)
+        C = alignment.shape[1]
+        for c in range(C):
+            max_val = max(pi)
+            if max_val < 1e-300:
+                max_val = 1e-300
+            for a in range(A):
+                D[0, c, a] = pi[a] / max_val
+            logNormD[0, c] = np.log(max_val)
+
+        self._D = D
+        self._logNormD = logNormD
+
+    @property
+    def log_likelihood(self):
+        """Per-column log-likelihoods. Shape: (C,)."""
+        return self._logLike
+
+    def counts(self, f81_fast=False, branch_mask="auto"):
+        """Expected substitution counts and dwell times per column.
+
+        Reuses stored inside-outside vectors.
+
+        Args:
+            f81_fast: if True, use O(CRA^2) F81/JC fast path
+            branch_mask: "auto", None, or (R, C) bool array
+
+        Returns:
+            (A, A, C) counts tensor
+        """
+        model = self._model
+
+        if isinstance(branch_mask, str) and branch_mask == "auto":
+            A = len(model['pi'])
+            branch_mask = compute_branch_mask(
+                self._alignment, self._tree['parentIndex'], A
+            )
+
+        if f81_fast:
+            return f81_counts(
+                self._U, self._D, self._logNormU, self._logNormD,
+                self._logLike, self._tree['distanceToParent'], model['pi'],
+                self._tree['parentIndex'], branch_mask=branch_mask,
+            )
+        elif self._is_irrev:
+            J = compute_J_complex(model['eigenvalues'], self._tree['distanceToParent'])
+            U_tilde, D_tilde = eigenbasis_project_irrev(self._U, self._D, model)
+            C = accumulate_C_complex(
+                D_tilde, U_tilde, J, self._logNormU, self._logNormD,
+                self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
+            )
+            return back_transform_irrev(C, model)
+        else:
+            J = compute_J(model['eigenvalues'], self._tree['distanceToParent'])
+            U_tilde, D_tilde = eigenbasis_project(self._U, self._D, model)
+            C = accumulate_C(
+                D_tilde, U_tilde, J, self._logNormU, self._logNormD,
+                self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
+            )
+            return back_transform(C, model)
+
+    def node_posterior(self, node=None):
+        """Posterior state distribution at node(s).
+
+        For root: P(X_0 = a | data) ∝ pi_a * U(0,c,a)
+        For non-root: P(X_n = j | data) ∝ [sum_a D(n,c,a) * M(n,a,j)] * U(n,c,j)
+
+        D(n,a) is indexed by the parent's state a, so we transform through
+        the branch matrix M(n) to get the child state j.
+
+        Args:
+            node: int node index, or None for all nodes.
+
+        Returns:
+            If node is int: (A, C) posterior distribution
+            If node is None: (R, A, C) posteriors for all nodes
+        """
+        R, C, A = self._U.shape
+
+        if node is not None:
+            posterior = np.zeros((A, C), dtype=np.float64)
+            for c in range(C):
+                log_scale = (
+                    self._logNormU[node, c]
+                    + self._logNormD[node, c]
+                    - self._logLike[c]
+                )
+                scale = np.exp(log_scale)
+                total = 0.0
+                if node == 0:
+                    # Root: D[0] = pi, direct product
+                    for a in range(A):
+                        val = self._U[node, c, a] * self._D[node, c, a] * scale
+                        posterior[a, c] = val
+                        total += val
+                else:
+                    # Non-root: transform D through M
+                    M = self._subMatrices[node]  # (A, A)
+                    for j in range(A):
+                        d_transformed = 0.0
+                        for a in range(A):
+                            d_transformed += self._D[node, c, a] * M[a, j]
+                        val = d_transformed * self._U[node, c, j] * scale
+                        posterior[j, c] = val
+                        total += val
+                if total > 0:
+                    for a in range(A):
+                        posterior[a, c] /= total
+            return posterior
+        else:
+            result = np.zeros((R, A, C), dtype=np.float64)
+            for n in range(R):
+                for c in range(C):
+                    log_scale = (
+                        self._logNormU[n, c]
+                        + self._logNormD[n, c]
+                        - self._logLike[c]
+                    )
+                    scale = np.exp(log_scale)
+                    total = 0.0
+                    if n == 0:
+                        for a in range(A):
+                            val = self._U[n, c, a] * self._D[n, c, a] * scale
+                            result[n, a, c] = val
+                            total += val
+                    else:
+                        M = self._subMatrices[n]
+                        for j in range(A):
+                            d_transformed = 0.0
+                            for a in range(A):
+                                d_transformed += self._D[n, c, a] * M[a, j]
+                            val = d_transformed * self._U[n, c, j] * scale
+                            result[n, j, c] = val
+                            total += val
+                    if total > 0:
+                        for a in range(A):
+                            result[n, a, c] /= total
+            return result
+
+    def branch_posterior(self, node=None):
+        """Joint posterior of parent-child states on branch(es).
+
+        P(X_{parent(n)}=i, X_n=j | data, c) ∝ D(n,c,i) * M(n,i,j) * U(n,c,j)
+
+        D(n,a) is indexed by the parent's state a (the outside context at
+        branch n), so D(n) is used directly (not D at the parent node).
+
+        Args:
+            node: int child node index (must be > 0), or None for all branches.
+
+        Returns:
+            If node is int: (A, A, C) where [i,j,c] = P(parent=i, child=j)
+            If node is None: (R, A, A, C) for all branches (branch 0 is zeros)
+        """
+        R, C, A = self._U.shape
+
+        if node is not None:
+            M = self._subMatrices[node]  # (A, A)
+            joint = np.zeros((A, A, C), dtype=np.float64)
+            for c in range(C):
+                log_scale = (
+                    self._logNormD[node, c]
+                    + self._logNormU[node, c]
+                    - self._logLike[c]
+                )
+                scale = np.exp(log_scale)
+                total = 0.0
+                for i in range(A):
+                    for j in range(A):
+                        val = (
+                            self._D[node, c, i]
+                            * M[i, j]
+                            * self._U[node, c, j]
+                            * scale
+                        )
+                        joint[i, j, c] = val
+                        total += val
+                if total > 0:
+                    for i in range(A):
+                        for j in range(A):
+                            joint[i, j, c] /= total
+            return joint
+        else:
+            result = np.zeros((R, A, A, C), dtype=np.float64)
+            for n in range(1, R):
+                M = self._subMatrices[n]
+                for c in range(C):
+                    log_scale = (
+                        self._logNormD[n, c]
+                        + self._logNormU[n, c]
+                        - self._logLike[c]
+                    )
+                    scale = np.exp(log_scale)
+                    total = 0.0
+                    for i in range(A):
+                        for j in range(A):
+                            val = (
+                                self._D[n, c, i]
+                                * M[i, j]
+                                * self._U[n, c, j]
+                                * scale
+                            )
+                            result[n, i, j, c] = val
+                            total += val
+                    if total > 0:
+                        for i in range(A):
+                            for j in range(A):
+                                result[n, i, j, c] /= total
+            return result

@@ -210,7 +210,97 @@ export class PhyloWASM {
     );
   }
 
+  /**
+   * Create an InsideOutside table for querying posteriors.
+   *
+   * Accepts either:
+   *   InsideOutside(alignment, parentIndex, distances, eigenvalues, eigenvectors, pi)
+   *   InsideOutside(alignment, parentIndex, distances, model)
+   *
+   * @returns {PhyloWASMInsideOutside}
+   */
+  async InsideOutside(alignment, parentIndex, distances, arg4, arg5, arg6) {
+    const parsed = PhyloWASM._parseModelArg(arg4, arg5);
+    let wasmIO;
+    if (parsed && parsed.irrev) {
+      const m = parsed.model;
+      wasmIO = this.wasm.WasmInsideOutside.create_irrev(
+        new Int32Array(alignment),
+        new Int32Array(parentIndex),
+        new Float64Array(distances),
+        new Float64Array(m.eigenvalues_complex),
+        new Float64Array(m.eigenvectors_complex),
+        new Float64Array(m.eigenvectors_inv_complex),
+        new Float64Array(m.pi),
+      );
+    } else {
+      const eigenvalues = parsed ? parsed.model.eigenvalues : arg4;
+      const eigenvectors = parsed ? parsed.model.eigenvectors : arg5;
+      const pi = parsed ? parsed.model.pi : arg6;
+      wasmIO = this.wasm.WasmInsideOutside.create(
+        new Int32Array(alignment),
+        new Int32Array(parentIndex),
+        new Float64Array(distances),
+        new Float64Array(eigenvalues),
+        new Float64Array(eigenvectors),
+        new Float64Array(pi),
+      );
+    }
+    const R = parentIndex.length;
+    const A = (parsed ? parsed.model.pi : arg6).length;
+    const C = alignment.length / R;
+    return new PhyloWASMInsideOutside(wasmIO, R, C, A);
+  }
+
   destroy() {
     // No-op for WASM
+  }
+}
+
+/**
+ * InsideOutside table wrapper for WASM backend.
+ * Provides log_likelihood, counts, node_posterior, branch_posterior methods.
+ */
+class PhyloWASMInsideOutside {
+  constructor(wasmIO, R, C, A) {
+    this._io = wasmIO;
+    this.R = R;
+    this.C = C;
+    this.A = A;
+  }
+
+  /** Per-column log-likelihoods. @returns {Float64Array} (C,) */
+  get log_likelihood() {
+    return this._io.log_likelihood();
+  }
+
+  /** Expected substitution counts. @returns {Float64Array} (A*A*C,) */
+  counts(f81Fast = false) {
+    return this._io.counts(f81Fast);
+  }
+
+  /**
+   * Posterior state distribution at node(s).
+   * @param {number|null} node - Node index, or null for all nodes.
+   * @returns {Float64Array} (A*C,) for single node or (R*A*C,) for all.
+   */
+  node_posterior(node = null) {
+    return this._io.node_posterior(node === null ? -1 : node);
+  }
+
+  /**
+   * Joint branch posterior of parent-child states.
+   * @param {number|null} node - Child node index (> 0), or null for all.
+   * @returns {Float64Array} (A*A*C,) for single or (R*A*A*C,) for all.
+   */
+  branch_posterior(node = null) {
+    return this._io.branch_posterior(node === null ? -1 : node);
+  }
+
+  destroy() {
+    if (this._io && this._io.free) {
+      this._io.free();
+    }
+    this._io = null;
   }
 }

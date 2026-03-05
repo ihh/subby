@@ -3,6 +3,7 @@ from .oracle import (
     Counts,
     RootProb,
     MixturePosterior,
+    InsideOutside,
     children_of,
     validate_binary_tree,
     token_to_likelihood,

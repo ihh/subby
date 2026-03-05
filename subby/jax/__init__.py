@@ -324,3 +324,313 @@ def MixturePosterior(
     while log_likes.ndim > 2:
         log_likes = jnp.sum(log_likes, axis=1)
     return mixture_posterior(log_likes, log_weights)
+
+
+class InsideOutside:
+    """Inside-outside DP tables for querying posteriors.
+
+    Runs the upward (inside) and downward (outside) passes once and stores the
+    resulting vectors, enabling efficient queries for log-likelihoods, expected
+    substitution counts, node state posteriors, and branch endpoint joint
+    posteriors without recomputation.
+
+    Args:
+        alignment: (R, C) int32 tokens
+        tree: Tree
+        model: DiagModel, IrrevDiagModel, RateModel, or list of models
+        maxChunkSize: chunk columns for memory
+
+    Example::
+
+        io = InsideOutside(alignment, tree, model)
+        ll = io.log_likelihood               # (*H, C)
+        root_post = io.node_posterior(0)      # (*H, A, C)
+        branch_post = io.branch_posterior(5)  # (*H, A, A, C)
+        counts = io.counts()                  # (*H, A, A, C)
+    """
+
+    def __init__(
+        self,
+        alignment: jnp.ndarray,
+        tree: Tree,
+        model,
+        maxChunkSize: int = 128,
+    ):
+        self._alignment = alignment
+        self._tree = tree
+        self._maxChunkSize = maxChunkSize
+
+        if _is_model_list(model):
+            stacked, is_irrev = _stack_models(model)
+            subMatrices = _compute_sub_matrices_per_column(
+                stacked, tree.distanceToParent, is_irrev
+            )
+            rootProb = stacked.pi[0]
+            per_column = True
+            self._model = stacked
+            self._is_irrev = is_irrev
+            self._is_model_list = True
+            self._models_list = [_ensure_diag(m) for m in model]
+        else:
+            model = _ensure_diag(model)
+            is_irrev = isinstance(model, IrrevDiagModel)
+            if is_irrev:
+                subMatrices = compute_sub_matrices_irrev(model, tree.distanceToParent)
+            else:
+                subMatrices = compute_sub_matrices(model, tree.distanceToParent)
+            rootProb = model.pi
+            per_column = False
+            self._model = model
+            self._is_irrev = is_irrev
+            self._is_model_list = False
+            self._models_list = None
+
+        self._subMatrices = subMatrices
+        self._per_column = per_column
+        self._rootProb = rootProb
+
+        U, logNormU, logLike = upward_pass(
+            alignment, tree, subMatrices, rootProb, maxChunkSize,
+            per_column=per_column,
+        )
+        self._U = U
+        self._logNormU = logNormU
+        self._logLike = logLike
+
+        D, logNormD = downward_pass(
+            U, logNormU, tree, subMatrices, rootProb, alignment,
+            per_column=per_column,
+        )
+
+        # Set root's outside vector to the prior pi (downward pass leaves it zero)
+        if self._is_model_list:
+            root_pi = self._model.pi  # (C, A)
+        else:
+            root_pi = self._model.pi  # (*H, A)
+        D_root = jnp.broadcast_to(
+            root_pi[..., None, :] if root_pi.ndim == 1 or not self._is_model_list
+            else root_pi,
+            D[..., 0, :, :].shape,
+        )
+        max_val = jnp.maximum(jnp.max(D_root, axis=-1), 1e-300)
+        D = D.at[..., 0, :, :].set(D_root / max_val[..., None])
+        logNormD = logNormD.at[..., 0, :].set(jnp.log(max_val))
+
+        self._D = D
+        self._logNormD = logNormD
+
+    @property
+    def log_likelihood(self) -> jnp.ndarray:
+        """Per-column log-likelihoods. Shape: (*H, C)."""
+        return self._logLike
+
+    def counts(
+        self,
+        f81_fast_flag: bool = False,
+        branch_mask: Optional[Union[str, jnp.ndarray]] = "auto",
+    ) -> jnp.ndarray:
+        """Expected substitution counts and dwell times per column.
+
+        Reuses stored inside-outside vectors (avoids re-running the DP passes).
+
+        Args:
+            f81_fast_flag: if True, use O(CRA^2) F81/JC fast path
+            branch_mask: "auto", None, or (*H, R, C) bool array
+
+        Returns:
+            (*H, A, A, C) counts tensor
+        """
+        if self._is_model_list:
+            return Counts(
+                self._alignment, self._tree, self._models_list,
+                maxChunkSize=self._maxChunkSize,
+                f81_fast_flag=f81_fast_flag,
+                branch_mask=branch_mask,
+            )
+
+        model = self._model
+
+        if isinstance(branch_mask, str) and branch_mask == "auto":
+            from .components import compute_branch_mask
+            A = model.pi.shape[-1]
+            branch_mask = compute_branch_mask(
+                self._alignment, self._tree.parentIndex, A
+            )
+
+        if f81_fast_flag:
+            return f81_counts(
+                self._U, self._D, self._logNormU, self._logNormD,
+                self._logLike, self._tree.distanceToParent, model.pi,
+                self._tree.parentIndex, branch_mask=branch_mask,
+            )
+        elif self._is_irrev:
+            assert not f81_fast_flag, "F81 fast path is reversible-only"
+            J = compute_J_complex(model.eigenvalues, self._tree.distanceToParent)
+            U_tilde, D_tilde = eigenbasis_project_irrev(self._U, self._D, model)
+            C = accumulate_C_complex(
+                D_tilde, U_tilde, J, self._logNormU, self._logNormD,
+                self._logLike, self._tree.parentIndex, branch_mask=branch_mask,
+            )
+            return back_transform_irrev(C, model)
+        else:
+            J = compute_J(model.eigenvalues, self._tree.distanceToParent)
+            U_tilde, D_tilde = eigenbasis_project(self._U, self._D, model)
+            C = accumulate_C(
+                D_tilde, U_tilde, J, self._logNormU, self._logNormD,
+                self._logLike, self._tree.parentIndex, branch_mask=branch_mask,
+            )
+            return back_transform(C, model)
+
+    def node_posterior(self, node: Optional[int] = None) -> jnp.ndarray:
+        """Posterior state distribution at node(s).
+
+        For root: P(X_0 = a | data) ∝ pi_a * U(0,c,a)
+        For non-root: P(X_n = j | data) ∝ [sum_a D(n,c,a) * M(n,a,j)] * U(n,c,j)
+
+        D(n,a) is indexed by the parent's state a, so we transform through
+        the branch matrix M(n) to get the child state j.
+
+        Args:
+            node: int node index, or None for all nodes.
+
+        Returns:
+            If node is int: (*H, A, C) posterior distribution
+            If node is None: (*H, R, A, C) posteriors for all nodes
+        """
+        if node is not None:
+            if node == 0:
+                # Root: D[0] = pi (set in __init__), product is pi * U / Z
+                U_0 = self._U[..., 0, :, :]
+                D_0 = self._D[..., 0, :, :]
+                log_scale = (
+                    self._logNormU[..., 0, :]
+                    + self._logNormD[..., 0, :]
+                    - self._logLike
+                )
+                posterior = U_0 * D_0 * jnp.exp(log_scale)[..., None]
+            else:
+                # Non-root: transform D through M
+                D_n = self._D[..., node, :, :]   # (*H, C, A_parent)
+                U_n = self._U[..., node, :, :]   # (*H, C, A_child)
+                if self._per_column:
+                    M = self._subMatrices[..., node, :, :, :]  # (*H, C, A, A)
+                    D_transformed = jnp.einsum('...ca,...caj->...cj', D_n, M)
+                else:
+                    M = self._subMatrices[..., node, :, :]     # (*H, A, A)
+                    D_transformed = jnp.einsum('...ca,...aj->...cj', D_n, M)
+                log_scale = (
+                    self._logNormU[..., node, :]
+                    + self._logNormD[..., node, :]
+                    - self._logLike
+                )
+                posterior = D_transformed * U_n * jnp.exp(log_scale)[..., None]
+            posterior = posterior / jnp.sum(posterior, axis=-1, keepdims=True)
+            return jnp.moveaxis(posterior, -1, -2)  # (*H, A, C)
+        else:
+            # All nodes: compute via branch_posterior marginals for non-root,
+            # direct formula for root
+            *H, R, C, A = self._U.shape
+            # Root
+            D_0 = self._D[..., 0, :, :]
+            U_0 = self._U[..., 0, :, :]
+            log_scale_0 = (
+                self._logNormU[..., 0, :]
+                + self._logNormD[..., 0, :]
+                - self._logLike
+            )
+            root_post = D_0 * U_0 * jnp.exp(log_scale_0)[..., None]
+            root_post = root_post / jnp.sum(root_post, axis=-1, keepdims=True)
+
+            # Non-root: D_transformed = D @ M, then * U * scale
+            log_scale = (
+                self._logNormU + self._logNormD
+                - self._logLike[..., None, :]
+            )  # (*H, R, C)
+            if self._per_column:
+                D_transformed = jnp.einsum(
+                    '...rca,...rcaj->...rcj', self._D, self._subMatrices
+                )
+            else:
+                D_transformed = jnp.einsum(
+                    '...rca,...raj->...rcj', self._D, self._subMatrices
+                )
+            posterior = D_transformed * self._U * jnp.exp(log_scale)[..., None]
+            posterior = posterior / jnp.sum(posterior, axis=-1, keepdims=True)
+            # Replace root row with correct root posterior
+            posterior = posterior.at[..., 0, :, :].set(root_post)
+            return jnp.moveaxis(posterior, -1, -2)  # (*H, R, A, C)
+
+    def branch_posterior(self, node: Optional[int] = None) -> jnp.ndarray:
+        """Joint posterior of parent-child states on branch(es).
+
+        P(X_{parent(n)}=i, X_n=j | data, c) ∝ D(n,c,i) * M(n,i,j) * U(n,c,j)
+
+        D(n,a) is indexed by the parent's state a (the outside context at
+        branch n), so D(n) is used directly (not D at the parent node).
+
+        Args:
+            node: int child node index (must be > 0), or None for all branches.
+
+        Returns:
+            If node is int: (*H, A, A, C) where [i,j,c] = P(parent=i, child=j)
+            If node is None: (*H, R, A, A, C) for all branches (branch 0 is zeros)
+        """
+        if node is not None:
+            D_n = self._D[..., node, :, :]     # (*H, C, A_parent)
+            U_n = self._U[..., node, :, :]     # (*H, C, A_child)
+
+            if self._per_column:
+                M = self._subMatrices[..., node, :, :, :]  # (*H, C, A, A)
+            else:
+                M = self._subMatrices[..., node, :, :]     # (*H, A, A)
+
+            log_scale = (
+                self._logNormD[..., node, :]
+                + self._logNormU[..., node, :]
+                - self._logLike
+            )  # (*H, C)
+            scale = jnp.exp(log_scale)
+
+            if self._per_column:
+                joint = (
+                    D_n[..., :, :, None]
+                    * M
+                    * U_n[..., :, None, :]
+                    * scale[..., :, None, None]
+                )
+            else:
+                joint = (
+                    D_n[..., :, :, None]
+                    * M[..., None, :, :]
+                    * U_n[..., :, None, :]
+                    * scale[..., :, None, None]
+                )
+
+            joint = joint / jnp.sum(joint, axis=(-2, -1), keepdims=True)
+            return jnp.moveaxis(joint, -3, -1)  # (*H, A, A, C)
+        else:
+            # All branches: use D[n] directly (not D[parent])
+            log_scale = (
+                self._logNormD + self._logNormU
+                - self._logLike[..., None, :]
+            )  # (*H, R, C)
+            scale = jnp.exp(log_scale)
+
+            if self._per_column:
+                joint = (
+                    self._D[..., :, :, None]
+                    * self._subMatrices
+                    * self._U[..., :, None, :]
+                    * scale[..., :, None, None]
+                )
+            else:
+                joint = (
+                    self._D[..., :, :, None]
+                    * self._subMatrices[..., None, :, :]
+                    * self._U[..., :, None, :]
+                    * scale[..., :, None, None]
+                )
+
+            joint = joint / jnp.sum(joint, axis=(-2, -1), keepdims=True)
+            joint = joint.at[..., 0, :, :, :].set(0.0)
+            return jnp.moveaxis(joint, -3, -1)  # (*H, R, A, A, C)
