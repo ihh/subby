@@ -1,5 +1,7 @@
 # subby
 
+**This is a reference algorithm project** (see ~/.claude/CLAUDE.md for the standard).
+
 Phylogenetic sufficient statistics via eigensubstitution accumulation.
 
 ## Project overview
