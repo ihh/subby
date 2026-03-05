@@ -125,7 +125,7 @@ for step in range(500):
     params = jax.tree.map(lambda p, g: p - 1e-3 * g, params, grads)
 ```
 
-See [`examples/conv_rate_prediction.py`](../../examples/conv_rate_prediction.py) for a complete runnable script that simulates an alignment with slow/fast columns and trains the CNN to recover the rate pattern.
+See [`examples/conv_rate_prediction.py`](https://github.com/ihh/subby/blob/main/examples/conv_rate_prediction.py) for a complete runnable script that simulates an alignment with slow/fast columns and trains the CNN to recover the rate pattern.
 
 ### `LogLikeCustomGrad(alignment, tree, model, maxChunkSize=128)`
 
