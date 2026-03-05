@@ -40,7 +40,10 @@ docs/               # Documentation source
 
 The main entry points are:
 - `subby.jax.LogLike(alignment, tree, model)` — per-column log-likelihoods
+- `subby.jax.LogLikeCustomGrad(alignment, tree, model)` — same as LogLike but with custom VJP for faster distance gradients
 - `subby.jax.Counts(alignment, tree, model)` — expected substitution counts and dwell times
 - `subby.jax.RootProb(alignment, tree, model)` — posterior root state distribution
 - `subby.jax.MixturePosterior(alignment, tree, models, log_weights)` — mixture component posteriors
 - `subby.oracle.*` — identical API using pure NumPy (test reference)
+
+All high-level functions (`LogLike`, `Counts`, `RootProb`) accept a list of models for per-column substitution rates (one model per alignment column).

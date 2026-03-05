@@ -13,6 +13,7 @@ def downward_pass(
     subMatrices: jnp.ndarray,
     rootProb: jnp.ndarray,
     alignment: jnp.ndarray,
+    per_column: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Compute outside (D) vectors for all nodes.
 
@@ -26,9 +27,10 @@ def downward_pass(
         U: (*H, R, C, A) inside vectors from upward_pass (rescaled)
         logNormU: (*H, R, C) per-node subtree log-normalizers
         tree: Tree(parentIndex, distanceToParent)
-        subMatrices: (*H, R, A, A) substitution probability matrices
+        subMatrices: (*H, R, A, A) or (*H, R, C, A, A) if per_column=True
         rootProb: (*H, A) equilibrium frequencies
         alignment: (R, C) int32 token alignment
+        per_column: if True, subMatrices has per-column substitution matrices
 
     Returns:
         D: (*H, R, C, A) outside vectors per node (rescaled)
@@ -52,8 +54,10 @@ def downward_pass(
 
     init = (D, logNormD)
 
+    step_fn = _downward_step_per_column if per_column else _downward_step
+
     (D, logNormD), _ = jax.lax.scan(
-        lambda carry, xs: _downward_step(
+        lambda carry, xs: step_fn(
             carry, xs, U, logNormU, subMatrices, rootProb, parentIndex, obs_like
         ),
         init,
@@ -100,6 +104,50 @@ def _downward_step(carry, xs, U, logNormU, subMatrices, rootProb, parentIndex, o
     accumulated = log_norm_from_sib + log_norm_prior
 
     # Rescale
+    maxD = jnp.max(D_raw, axis=-1)
+    maxD = jnp.maximum(maxD, 1e-300)
+    D_rescaled = D_raw / maxD[..., None]
+    log_rescale = jnp.log(maxD)
+
+    logNormD_node = accumulated + log_rescale
+
+    D = D.at[..., node, :, :].set(D_rescaled)
+    logNormD = logNormD.at[..., node, :].set(logNormD_node)
+
+    return (D, logNormD), None
+
+
+def _downward_step_per_column(carry, xs, U, logNormU, subMatrices, rootProb, parentIndex, obs_like):
+    """Single step of the downward (outside) scan with per-column subMatrices."""
+    D, logNormD = carry
+    node, parent, sib = xs
+
+    # subMatrices: (*H, R, C, A, A)
+    # Sibling contribution: sum_j M_{aj}(c, t_{p,sib}) * U^(sib)_j(c)
+    sib_M = subMatrices[..., sib, :, :, :]   # (*H, C, A, A)
+    sib_U = U[..., sib, :, :]                # (*H, C, A)
+    sib_contrib = jnp.einsum('...cij,...cj->...ci', sib_M, sib_U)  # (*H, C, A)
+
+    # Parent contribution: pi_a if parent is root, else sum_i D^(p)_i M_{ia}(c, t_{g,p})
+    parent_is_root = (parent == 0)
+
+    parent_M = subMatrices[..., parent, :, :, :]  # (*H, C, A, A)
+    parent_D = D[..., parent, :, :]               # (*H, C, A)
+    prop_down = jnp.einsum('...ci,...cia->...ca', parent_D, parent_M)  # (*H, C, A)
+
+    root_contrib = jnp.broadcast_to(rootProb[..., None, :], prop_down.shape)
+    parent_contrib = jnp.where(parent_is_root, root_contrib, prop_down)
+
+    parent_obs = obs_like[parent]  # (C, A)
+    parent_contrib = parent_contrib * parent_obs
+
+    D_raw = sib_contrib * parent_contrib
+
+    log_norm_from_sib = logNormU[..., sib, :]
+    log_norm_from_parent = logNormD[..., parent, :]
+    log_norm_prior = jnp.where(parent_is_root, 0.0, log_norm_from_parent)
+    accumulated = log_norm_from_sib + log_norm_prior
+
     maxD = jnp.max(D_raw, axis=-1)
     maxD = jnp.maximum(maxD, 1e-300)
     D_rescaled = D_raw / maxD[..., None]

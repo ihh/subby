@@ -5,13 +5,14 @@
 ```
 subby/
 ├── jax/                    # JAX training implementation (f64, GPU-accelerated)
-│   ├── __init__.py         # Public API: LogLike, Counts, RootProb, MixturePosterior
-│   ├── types.py            # Tree, DiagModel, RateModel named tuples
+│   ├── __init__.py         # Public API: LogLike, LogLikeCustomGrad, Counts, RootProb, MixturePosterior
+│   ├── types.py            # Tree, DiagModel, IrrevDiagModel, RateModel named tuples
 │   ├── models.py           # hky85_diag, jukes_cantor_model, f81_model, gamma, scale
 │   ├── diagonalize.py      # diagonalize_rate_matrix, compute_sub_matrices
 │   ├── pruning.py          # upward_pass (Felsenstein pruning via jax.lax.scan)
 │   ├── outside.py          # downward_pass (outside algorithm via jax.lax.scan)
 │   ├── eigensub.py         # compute_J, eigenbasis_project, accumulate_C, back_transform
+│   ├── vjp.py              # Custom VJP for LogLike (fast distance gradients via Fisher identity)
 │   ├── f81_fast.py         # f81_counts (O(CRA²) direct computation)
 │   ├── mixture.py          # mixture_posterior (softmax over components)
 │   ├── components.py       # compute_branch_mask (Steiner tree identification)
@@ -102,7 +103,8 @@ U, D, logNormU, logNormD, logLike ──→ f81_counts ──→ counts
 - Tree traversals implemented as `jax.lax.scan` over branches in post/preorder
 - Column chunking (`maxChunkSize`) for memory control
 - All operations support batched models via `*H` leading dimensions
-- Differentiable — `jax.grad` works through `LogLike`
+- Differentiable — `jax.grad` works through `LogLike`; `LogLikeCustomGrad` provides a faster custom VJP for distance gradients via the Fisher identity
+- Per-column models — `LogLike`, `Counts`, `RootProb` accept a list of models (one per column) for position-specific substitution rates
 
 ### Oracle
 

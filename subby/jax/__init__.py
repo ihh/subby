@@ -17,6 +17,7 @@ from .eigensub import (
 )
 from .f81_fast import f81_counts
 from .mixture import mixture_posterior
+from .vjp import _loglike_custom_distances
 from .models import (
     hky85_diag, jukes_cantor_model, f81_model,
     gamma_rate_categories, scale_model,
@@ -33,13 +34,120 @@ def _ensure_diag(model: AnyModel) -> AnyDiagModel:
     return model
 
 
+def _is_model_list(model) -> bool:
+    """Check if model is a list/tuple of models (per-column)."""
+    return isinstance(model, (list, tuple)) and len(model) > 0 and not isinstance(model, (Tree, DiagModel, IrrevDiagModel, RateModel))
+
+
+def _stack_models(models: list[AnyModel]) -> tuple[AnyDiagModel, bool]:
+    """Stack a list of models into a single model with leading C dimension.
+
+    Returns:
+        (stacked_model, is_irrev)
+    """
+    models = [_ensure_diag(m) for m in models]
+    is_irrev = isinstance(models[0], IrrevDiagModel)
+    if is_irrev:
+        return IrrevDiagModel(
+            eigenvalues=jnp.stack([m.eigenvalues for m in models]),
+            eigenvectors=jnp.stack([m.eigenvectors for m in models]),
+            eigenvectors_inv=jnp.stack([m.eigenvectors_inv for m in models]),
+            pi=jnp.stack([m.pi for m in models]),
+        ), True
+    else:
+        return DiagModel(
+            eigenvalues=jnp.stack([m.eigenvalues for m in models]),
+            eigenvectors=jnp.stack([m.eigenvectors for m in models]),
+            pi=jnp.stack([m.pi for m in models]),
+        ), False
+
+
+def _compute_sub_matrices_per_column(
+    stacked_model: AnyDiagModel, distances: jnp.ndarray, is_irrev: bool
+) -> jnp.ndarray:
+    """Compute per-column substitution matrices from a stacked model.
+
+    stacked_model fields have leading C dimension.
+    Returns: (R, C, A, A) substitution matrices.
+    """
+    if is_irrev:
+        V = stacked_model.eigenvectors       # (C, A, A)
+        V_inv = stacked_model.eigenvectors_inv  # (C, A, A)
+        mu = stacked_model.eigenvalues        # (C, A)
+        # exp(mu_k * t_r): (C, R, A)
+        exp_mu_t = jnp.exp(mu[:, None, :] * distances[None, :, None])
+        # M_ij(c,t) = sum_k V_ik(c) * exp(mu_k(c)*t) * V_inv_kj(c)
+        M = jnp.einsum('cak,crk,ckj->craj', V, exp_mu_t, V_inv)
+        # Transpose to (R, C, A, A)
+        M = jnp.moveaxis(M, 0, 1)
+        return M.real
+    else:
+        V = stacked_model.eigenvectors   # (C, A, A)
+        mu = stacked_model.eigenvalues   # (C, A)
+        pi = stacked_model.pi            # (C, A)
+        exp_mu_t = jnp.exp(mu[:, None, :] * distances[None, :, None])
+        S_t = jnp.einsum('cak,crk,cbk->crab', V, exp_mu_t, V)
+        sqrt_pi = jnp.sqrt(pi)
+        inv_sqrt_pi = 1.0 / sqrt_pi
+        # M_ij = sqrt(pi_j/pi_i) * S_ij
+        M = S_t * inv_sqrt_pi[:, None, :, None] * sqrt_pi[:, None, None, :]
+        # Transpose to (R, C, A, A)
+        M = jnp.moveaxis(M, 0, 1)
+        return M
+
+
 def LogLike(
+    alignment: jnp.ndarray,
+    tree: Tree,
+    model,
+    maxChunkSize: int = 128,
+) -> jnp.ndarray:
+    """Compute per-column log-likelihoods.
+
+    Args:
+        alignment: (R, C) int32 tokens
+        tree: Tree
+        model: DiagModel, IrrevDiagModel, RateModel, or list of models
+            (one per column, len must equal C)
+        maxChunkSize: chunk columns for memory
+
+    Returns:
+        (*H, C) log-likelihoods
+    """
+    if _is_model_list(model):
+        stacked, is_irrev = _stack_models(model)
+        subMatrices = _compute_sub_matrices_per_column(
+            stacked, tree.distanceToParent, is_irrev
+        )
+        # Use first model's pi for root (all should be same or broadcastable)
+        rootProb = stacked.pi[0]
+        _, _, logLike = upward_pass(
+            alignment, tree, subMatrices, rootProb, maxChunkSize, per_column=True
+        )
+        return logLike
+    model = _ensure_diag(model)
+    if isinstance(model, IrrevDiagModel):
+        subMatrices = compute_sub_matrices_irrev(model, tree.distanceToParent)
+    else:
+        subMatrices = compute_sub_matrices(model, tree.distanceToParent)
+    _, _, logLike = upward_pass(alignment, tree, subMatrices, model.pi, maxChunkSize)
+    return logLike
+
+
+def LogLikeCustomGrad(
     alignment: jnp.ndarray,
     tree: Tree,
     model: AnyModel,
     maxChunkSize: int = 128,
 ) -> jnp.ndarray:
-    """Compute per-column log-likelihoods.
+    """Like LogLike but with custom VJP for faster distance gradients.
+
+    Uses the Fisher identity: the gradient of log-likelihood w.r.t. branch
+    lengths equals a contraction of expected substitution counts, which can
+    be computed via the downward pass + eigenbasis projection without tracing
+    through the full computation graph.
+
+    Same signature and output as LogLike. Only the backward pass differs.
 
     Args:
         alignment: (R, C) int32 tokens
@@ -51,18 +159,15 @@ def LogLike(
         (*H, C) log-likelihoods
     """
     model = _ensure_diag(model)
-    if isinstance(model, IrrevDiagModel):
-        subMatrices = compute_sub_matrices_irrev(model, tree.distanceToParent)
-    else:
-        subMatrices = compute_sub_matrices(model, tree.distanceToParent)
-    _, _, logLike = upward_pass(alignment, tree, subMatrices, model.pi, maxChunkSize)
-    return logLike
+    return _loglike_custom_distances(
+        tree.distanceToParent, alignment, tree.parentIndex, model, maxChunkSize
+    )
 
 
 def Counts(
     alignment: jnp.ndarray,
     tree: Tree,
-    model: AnyModel,
+    model,
     maxChunkSize: int = 128,
     f81_fast_flag: bool = False,
     branch_mask: Optional[Union[str, jnp.ndarray]] = "auto",
@@ -72,7 +177,8 @@ def Counts(
     Args:
         alignment: (R, C) int32 tokens
         tree: Tree
-        model: DiagModel, IrrevDiagModel, or RateModel
+        model: DiagModel, IrrevDiagModel, RateModel, or list of models
+            (one per column, len must equal C)
         maxChunkSize: chunk columns for memory
         f81_fast_flag: if True, use O(CRA^2) F81/JC fast path
         branch_mask: "auto" (compute from alignment), None (no masking),
@@ -81,6 +187,24 @@ def Counts(
     Returns:
         (*H, A, A, C) counts tensor (diag=dwell, off-diag=substitution counts)
     """
+    if _is_model_list(model):
+        # Per-column models: compute column-by-column since the eigensub
+        # pipeline requires model fields to align with *H batch dims,
+        # which conflicts with the C (column) dimension.
+        models_diag = [_ensure_diag(m) for m in model]
+        C = alignment.shape[1]
+        assert len(models_diag) == C, f"Expected {C} models, got {len(models_diag)}"
+        results = []
+        for c in range(C):
+            col_counts = Counts(
+                alignment[:, c:c+1], tree, models_diag[c],
+                maxChunkSize=maxChunkSize,
+                f81_fast_flag=f81_fast_flag,
+                branch_mask=branch_mask[..., c:c+1] if branch_mask is not None and not isinstance(branch_mask, str) else branch_mask,
+            )
+            results.append(col_counts)
+        return jnp.concatenate(results, axis=-1)
+
     model = _ensure_diag(model)
     is_irrev = isinstance(model, IrrevDiagModel)
 
@@ -121,7 +245,7 @@ def Counts(
 def RootProb(
     alignment: jnp.ndarray,
     tree: Tree,
-    model: AnyModel,
+    model,
     maxChunkSize: int = 128,
 ) -> jnp.ndarray:
     """Compute posterior root state distribution per column.
@@ -131,12 +255,31 @@ def RootProb(
     Args:
         alignment: (R, C) int32 tokens
         tree: Tree
-        model: DiagModel, IrrevDiagModel, or RateModel
+        model: DiagModel, IrrevDiagModel, RateModel, or list of models
+            (one per column, len must equal C)
         maxChunkSize: chunk columns for memory
 
     Returns:
         (*H, A, C) posterior root distribution
     """
+    if _is_model_list(model):
+        stacked, is_irrev = _stack_models(model)
+        subMatrices = _compute_sub_matrices_per_column(
+            stacked, tree.distanceToParent, is_irrev
+        )
+        rootProb = stacked.pi[0]
+        U, logNormU, logLike = upward_pass(
+            alignment, tree, subMatrices, rootProb, maxChunkSize, per_column=True
+        )
+        # Per-column pi: stacked.pi is (C, A)
+        pi_per_col = stacked.pi  # (C, A)
+        root_U = U[..., 0, :, :]  # (*H, C, A)
+        log_scale = logNormU[..., 0, :] - logLike
+        scale = jnp.exp(log_scale)
+        q = pi_per_col * root_U * scale[..., None]
+        q = jnp.moveaxis(q, -1, -2)
+        return q
+
     model = _ensure_diag(model)
     if isinstance(model, IrrevDiagModel):
         subMatrices = compute_sub_matrices_irrev(model, tree.distanceToParent)

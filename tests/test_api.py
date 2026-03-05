@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 
 
-from subby.jax import LogLike, Counts, RootProb, MixturePosterior
+from subby.jax import LogLike, Counts, RootProb, MixturePosterior, LogLikeCustomGrad
 from subby.jax.types import Tree, RateModel
-from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model
+from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model, irrev_model_from_rate_matrix
 
 
 def _make_medium_tree(n_leaves=10, key=None):
@@ -127,6 +127,147 @@ class TestRootProb:
         model = jukes_cantor_model(4)
         rp = RootProb(alignment, tree, model)
         assert jnp.all(rp >= -1e-6)
+
+
+class TestCustomVJP:
+
+    def test_grad_matches_autograd_reversible(self):
+        """Custom VJP distance gradient should match autograd."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(10), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        def loss_auto(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLike(alignment, t, model))
+
+        def loss_custom(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model))
+
+        grad_auto = jax.grad(loss_auto)(tree.distanceToParent)
+        grad_custom = jax.grad(loss_custom)(tree.distanceToParent)
+
+        np.testing.assert_allclose(grad_custom[1:], grad_auto[1:], atol=1e-6)
+
+    def test_grad_matches_autograd_hky(self):
+        """Custom VJP with HKY85 model."""
+        tree = _make_medium_tree(8)
+        R = tree.parentIndex.shape[0]
+        C = 10
+        alignment = jax.random.randint(jax.random.PRNGKey(11), (R, C), 0, 4).astype(jnp.int32)
+        model = hky85_diag(2.0, jnp.array([0.3, 0.2, 0.25, 0.25]))
+
+        def loss_auto(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLike(alignment, t, model))
+
+        def loss_custom(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model))
+
+        grad_auto = jax.grad(loss_auto)(tree.distanceToParent)
+        grad_custom = jax.grad(loss_custom)(tree.distanceToParent)
+
+        np.testing.assert_allclose(grad_custom[1:], grad_auto[1:], atol=1e-6)
+
+    def test_grad_matches_autograd_irreversible(self):
+        """Custom VJP with irreversible model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(12), (R, C), 0, 4).astype(jnp.int32)
+
+        A = 4
+        rng = np.random.RandomState(42)
+        rate = rng.uniform(0.01, 1.0, (A, A))
+        np.fill_diagonal(rate, 0.0)
+        np.fill_diagonal(rate, -rate.sum(axis=1))
+        pi = np.ones(A) / A
+        norm = -np.sum(pi * np.diag(rate))
+        rate /= norm
+        model = irrev_model_from_rate_matrix(jnp.array(rate), jnp.array(pi))
+
+        def loss_auto(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLike(alignment, t, model))
+
+        def loss_custom(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model))
+
+        grad_auto = jax.grad(loss_auto)(tree.distanceToParent)
+        grad_custom = jax.grad(loss_custom)(tree.distanceToParent)
+
+        np.testing.assert_allclose(grad_custom[1:].real, grad_auto[1:].real, atol=1e-5)
+
+    def test_forward_values_match(self):
+        """Custom VJP forward pass should give same logLike values."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 8
+        alignment = jax.random.randint(jax.random.PRNGKey(13), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        ll_auto = LogLike(alignment, tree, model)
+        ll_custom = LogLikeCustomGrad(alignment, tree, model)
+
+        np.testing.assert_allclose(ll_custom, ll_auto, atol=1e-10)
+
+
+class TestPerColumnModel:
+
+    def test_single_model_list_matches(self):
+        """[model] * C should give same result as single model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(14), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        ll_single = LogLike(alignment, tree, model)
+        ll_list = LogLike(alignment, tree, [model] * C)
+
+        np.testing.assert_allclose(ll_list, ll_single, atol=1e-8)
+
+    def test_different_rates_per_column(self):
+        """Different rates per column vs column-by-column computation."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(jax.random.PRNGKey(15), (R, C), 0, 4).astype(jnp.int32)
+
+        base = hky85_diag(2.0, jnp.array([0.25, 0.25, 0.25, 0.25]))
+        rates = [0.5, 1.0, 1.5, 2.0]
+        models = [scale_model(base, r) for r in rates]
+
+        # Per-column result
+        ll_per_col = LogLike(alignment, tree, models)
+
+        # Column-by-column reference
+        ll_ref = jnp.array([
+            LogLike(alignment[:, c:c+1], tree, models[c])[0]
+            for c in range(C)
+        ])
+
+        np.testing.assert_allclose(ll_per_col, ll_ref, atol=1e-8)
+
+    def test_rootprob_per_column(self):
+        """RootProb with per-column models should sum to 1."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 3
+        alignment = jax.random.randint(jax.random.PRNGKey(16), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        models = [scale_model(base, r) for r in [0.5, 1.0, 2.0]]
+
+        rp = RootProb(alignment, tree, models)
+        assert rp.shape == (4, C)
+        sums = jnp.sum(rp, axis=0)
+        np.testing.assert_allclose(sums, 1.0, atol=1e-4)
 
 
 class TestMixturePosterior:

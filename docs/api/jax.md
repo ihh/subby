@@ -7,7 +7,7 @@ The JAX implementation provides GPU-accelerated, differentiable phylogenetic com
 ### `Tree`
 
 ```python
-from src.phylo.jax.types import Tree
+from subby.jax.types import Tree
 
 tree = Tree(
     parentIndex=jnp.array([-1, 0, 0, 1, 1], dtype=jnp.int32),
@@ -23,7 +23,7 @@ tree = Tree(
 ### `DiagModel`
 
 ```python
-from src.phylo.jax.types import DiagModel
+from subby.jax.types import DiagModel
 
 model = DiagModel(
     eigenvalues=jnp.array([0.0, -1.333, -1.333, -1.333]),
@@ -38,10 +38,21 @@ model = DiagModel(
 | `eigenvectors` | float | `(*H, A, A)` | `v[a,k]` = component $a$ of eigenvector $k$ |
 | `pi` | float | `(*H, A)` | Equilibrium distribution |
 
+### `IrrevDiagModel`
+
+For irreversible rate matrices (non-symmetric, complex eigendecomposition).
+
+| Field | Type | Shape | Description |
+|-------|------|-------|-------------|
+| `eigenvalues` | complex128 | `(*H, A)` | Complex eigenvalues of rate matrix |
+| `eigenvectors` | complex128 | `(*H, A, A)` | Right eigenvectors $V$ |
+| `eigenvectors_inv` | complex128 | `(*H, A, A)` | $V^{-1}$ |
+| `pi` | float | `(*H, A)` | Stationary distribution |
+
 ### `RateModel`
 
 ```python
-from src.phylo.jax.types import RateModel
+from subby.jax.types import RateModel
 ```
 
 | Field | Type | Shape | Description |
@@ -49,7 +60,7 @@ from src.phylo.jax.types import RateModel
 | `subRate` | float | `(*H, A, A)` | Rate matrix $Q$ |
 | `rootProb` | float | `(*H, A)` | Equilibrium distribution |
 
-Automatically diagonalized when passed to high-level functions.
+Automatically diagonalized when passed to high-level functions. Reversibility is auto-detected.
 
 ---
 
@@ -65,10 +76,37 @@ Compute per-column log-likelihoods via Felsenstein pruning.
 |------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
 | `tree` | `Tree` | Phylogenetic tree |
-| `model` | `DiagModel` or `RateModel` | Substitution model |
+| `model` | `DiagModel`, `RateModel`, or `list` | Substitution model (or list of C models for per-column rates) |
 | `maxChunkSize` | `int` | Column chunk size for memory control |
 
 **Returns:** `(*H, C)` float array of log-likelihoods.
+
+When `model` is a list of C models, each column uses its own substitution model (per-column substitution matrices). This enables position-specific rates, e.g., from a neural network predicting rates per site.
+
+### `LogLikeCustomGrad(alignment, tree, model, maxChunkSize=128)`
+
+Like `LogLike` but with a custom VJP for faster distance gradients.
+
+Uses the Fisher identity: the gradient of log-likelihood w.r.t. branch lengths equals a contraction of expected substitution counts, computed via the downward pass and eigenbasis projection without tracing through the full computation graph. The forward pass is identical to `LogLike`; only the backward pass differs.
+
+**Parameters:** Same as `LogLike` (single model only, not per-column).
+
+**Returns:** `(*H, C)` float array of log-likelihoods.
+
+**Example:**
+
+```python
+import jax
+from subby.jax import LogLikeCustomGrad
+from subby.jax.types import Tree
+
+def loss(distances):
+    tree = Tree(parentIndex=parent_idx, distanceToParent=distances)
+    return jnp.sum(LogLikeCustomGrad(alignment, tree, model))
+
+# Gradient via Fisher identity (faster than autograd)
+grad = jax.grad(loss)(distances)
+```
 
 ### `Counts(alignment, tree, model, maxChunkSize=128, f81_fast_flag=False)`
 
@@ -80,7 +118,7 @@ Compute expected substitution counts and dwell times per column.
 |------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
 | `tree` | `Tree` | Phylogenetic tree |
-| `model` | `DiagModel` or `RateModel` | Substitution model |
+| `model` | `DiagModel`, `RateModel`, or `list` | Substitution model (or list of C models for per-column rates) |
 | `maxChunkSize` | `int` | Column chunk size |
 | `f81_fast_flag` | `bool` | Use $O(CRA^2)$ fast path (F81/JC only) |
 
@@ -98,7 +136,7 @@ $$q_a(c) = \frac{\pi_a \cdot U^{(0)}_a(c)}{P(x_c)}$$
 |------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
 | `tree` | `Tree` | Phylogenetic tree |
-| `model` | `DiagModel` or `RateModel` | Substitution model |
+| `model` | `DiagModel`, `RateModel`, or `list` | Substitution model (or list of C models for per-column rates) |
 | `maxChunkSize` | `int` | Column chunk size |
 
 **Returns:** `(*H, A, C)` float array. Sums to 1 over the $A$ dimension for each column.
@@ -185,18 +223,22 @@ Compute transition probability matrices $M_{ij}(t_n)$ for each branch.
 
 **Returns:** `(*H, R, A, A)` — rows sum to 1, $M(0) = I$.
 
-### `upward_pass(alignment, tree, subMatrices, rootProb, maxChunkSize)`
+### `upward_pass(alignment, tree, subMatrices, rootProb, maxChunkSize, per_column=False)`
 
 Felsenstein pruning (postorder, leaves to root) via `jax.lax.scan`.
+
+When `per_column=True`, `subMatrices` has shape `(*H, R, C, A, A)` — a different substitution matrix per column. Default: `(*H, R, A, A)`.
 
 **Returns:** `(U, logNormU, logLike)` where:
 - `U`: `(*H, R, C, A)` rescaled inside vectors
 - `logNormU`: `(*H, R, C)` log-normalizers
 - `logLike`: `(*H, C)` per-column log-likelihoods
 
-### `downward_pass(U, logNormU, tree, subMatrices, rootProb, alignment)`
+### `downward_pass(U, logNormU, tree, subMatrices, rootProb, alignment, per_column=False)`
 
 Outside algorithm (preorder, root to leaves) via `jax.lax.scan`.
+
+When `per_column=True`, `subMatrices` has shape `(*H, R, C, A, A)`. Default: `(*H, R, A, A)`.
 
 **Returns:** `(D, logNormD)` where:
 - `D`: `(*H, R, C, A)` rescaled outside vectors

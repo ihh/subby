@@ -155,9 +155,10 @@ def _make_irrev_rate_matrix(A, seed=42):
 
 
 def _get_jax_backend():
-    """Return (LogLike, Counts, make_tree_fn, make_model_fns) for JAX."""
+    """Return (fn_map, make_tree_fn, make_model_fns) for JAX."""
+    import jax
     import jax.numpy as jnp
-    from subby.jax import LogLike, Counts
+    from subby.jax import LogLike, Counts, LogLikeCustomGrad
     from subby.jax.types import Tree
     from subby.jax.models import jukes_cantor_model, irrev_model_from_rate_matrix
 
@@ -235,7 +236,7 @@ PARAM_GRID = {
     "R": [7, 15, 31],
 }
 
-FUNCTIONS = ["LogLike", "Counts"]
+FUNCTIONS = ["LogLike", "Counts", "LogLikeGrad", "LogLikeCustomGrad"]
 MODEL_TYPES = ["reversible", "irreversible"]
 
 
@@ -335,13 +336,48 @@ def run_benchmarks(backends, n_reps, dry_run=False, timeout=60.0, model_types=No
                                 continue
 
                             fn_map = {"LogLike": ll_fn, "Counts": counts_fn}
-                            fn = fn_map[func_name]
+
+                            # For gradient functions, only available with JAX
+                            if func_name in ("LogLikeGrad", "LogLikeCustomGrad") and backend_name not in ("jax_cpu", "jax_gpu"):
+                                print(f"  {label} ... SKIPPED (gradient fn requires JAX)")
+                                continue
+
+                            if func_name == "LogLikeGrad":
+                                import jax
+                                import jax.numpy as jnp
+                                from subby.jax.types import Tree as JTree
+                                _parent_idx = tree.parentIndex if hasattr(tree, 'parentIndex') else tree['parentIndex']
+                                def _grad_fn(alignment=alignment, tree=tree, model=model):
+                                    def loss(d):
+                                        t = JTree(parentIndex=_parent_idx, distanceToParent=d)
+                                        return jnp.sum(ll_fn(alignment, t, model))
+                                    _d = tree.distanceToParent if hasattr(tree, 'distanceToParent') else tree['distanceToParent']
+                                    return jax.grad(loss)(_d)
+                                fn = None  # use _grad_fn below
+                            elif func_name == "LogLikeCustomGrad":
+                                import jax
+                                import jax.numpy as jnp
+                                from subby.jax import LogLikeCustomGrad as LLCG
+                                from subby.jax.types import Tree as JTree
+                                _parent_idx = tree.parentIndex if hasattr(tree, 'parentIndex') else tree['parentIndex']
+                                def _grad_fn(alignment=alignment, tree=tree, model=model):
+                                    def loss(d):
+                                        t = JTree(parentIndex=_parent_idx, distanceToParent=d)
+                                        return jnp.sum(LLCG(alignment, t, model))
+                                    _d = tree.distanceToParent if hasattr(tree, 'distanceToParent') else tree['distanceToParent']
+                                    return jax.grad(loss)(_d)
+                                fn = None  # use _grad_fn below
+                            else:
+                                fn = fn_map[func_name]
+                                _grad_fn = None
+
+                            call_fn = _grad_fn if _grad_fn is not None else lambda: fn(alignment, tree, model)
 
                             # Warmup / probe: single call to get rough timing
                             print(f"  {label} ...", end="", flush=True)
                             try:
                                 t0 = time.perf_counter()
-                                fn(alignment, tree, model)
+                                call_fn()
                                 probe_time = time.perf_counter() - t0
                             except Exception as e:
                                 print(f" ERROR: {e}")
@@ -367,7 +403,7 @@ def run_benchmarks(backends, n_reps, dry_run=False, timeout=60.0, model_types=No
                             # Full timing (probe counts as warmup for JAX)
                             try:
                                 mean_s, std_s = time_fn(
-                                    lambda: fn(alignment, tree, model),
+                                    call_fn,
                                     n_reps,
                                     timeout=timeout,
                                 )
