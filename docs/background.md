@@ -5,11 +5,13 @@ This page describes the eigensubstitution accumulation algorithm implemented by 
 ## Problem statement
 
 Given:
+
 - A multiple sequence alignment $x$ of $R$ sequences over $C$ columns
 - A binary phylogenetic tree $T$ with branch lengths $t_n$
 - A continuous-time Markov substitution model with rate matrix $Q$ and equilibrium distribution $\pi$
 
 Compute, for each column $c$:
+
 - **Log-likelihood** $\log P(x_c \mid T, Q)$
 - **Expected substitution counts** $E[s_{ij,c}]$ for each state pair $(i,j)$, $i \ne j$
 - **Expected dwell times** $E[w_{i,c}]$ for each state $i$
@@ -67,6 +69,7 @@ Steps 1 and 2 operate on the transition matrices $M(t)$ directly and are identic
 For each node $n$ in postorder (leaves to root), the inside vector $U^{(n)}_a(c)$ gives the likelihood of the data below node $n$ given that $n$ is in state $a$ at column $c$.
 
 **Leaf initialization:**
+
 - $U^{(n)}_a(c) = \delta_{a, x_{n,c}}$ if observed
 - $U^{(n)}_a(c) = 1$ for all $a$ if gapped or unobserved
 
@@ -177,6 +180,7 @@ where $S_t[a,b] = \sum_k V_{ak} e^{\mu_k t} V_{bk}$ is the **symmetrized** trans
 ### Key properties
 
 For all reachable $(a,b)$ with $M_{ab}(t) > 0$:
+
 - **Dwell times sum to $t$**: $\sum_i \text{result}[a,b,i,i] = t$
 - **Non-negative**: all entries $\ge 0$
 - **$t=0$ limit**: all entries are zero
@@ -195,6 +199,7 @@ For F81 (and its special case Jukes-Cantor), all non-zero eigenvalues are equal 
 $$M_{ij}(t) = \delta_{ij} \cdot e^{-\mu t} + \pi_j \cdot (1 - e^{-\mu t})$$
 
 The integral $I^{ab}_{ij}(t)$ decomposes into three closed-form terms parameterized by:
+
 - $\alpha(t) = t \cdot e^{-\mu t}$
 - $\beta(t) = (1 - e^{-\mu t})/\mu - t \cdot e^{-\mu t}$
 - $\gamma(t) = t(1 + e^{-\mu t}) - 2(1 - e^{-\mu t})/\mu$

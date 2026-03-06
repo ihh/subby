@@ -5,10 +5,10 @@ The WebGPU implementation runs phylogenetic computations in the browser using WG
 ## Entry point
 
 ```javascript
-import { createPhyloEngine } from './src/phylo/webgpu/index.js';
+import { createPhyloEngine, parseNewick, parseFasta, combineTreeAlignment } from './subby/webgpu/index.js';
 
 const { engine, backend } = await createPhyloEngine({
-  shaderBasePath: './src/phylo/webgpu/shaders/',
+  shaderBasePath: './subby/webgpu/shaders/',
   wasmUrl: './phylo_wasm_bg.wasm',
 });
 console.log(`Using ${backend} backend`);  // 'webgpu' or 'wasm'
@@ -101,6 +101,40 @@ Compute Steiner tree branch mask (runs on CPU).
 ### `engine.destroy()`
 
 Release GPU resources.
+
+---
+
+## Format parsers
+
+Standard file format parsers are exported from the same module:
+
+```javascript
+import {
+  detectAlphabet, parseNewick, parseFasta, parseStockholm,
+  parseMaf, parseStrings, combineTreeAlignment,
+} from './subby/webgpu/index.js';
+```
+
+### `parseNewick(newickStr) -> object`
+
+Parse a Newick tree string. Returns `{ parentIndex: Int32Array, distanceToParent: Float64Array, leafNames, nodeNames, R }`.
+
+### `parseFasta(text, alphabet?) -> object`
+
+Parse FASTA alignment. Returns `{ alignment: Int32Array, leafNames, alphabet, N, C }`.
+
+### `combineTreeAlignment(treeResult, alignmentResult) -> object`
+
+Match leaf names between tree and alignment. Returns `{ alignment: Int32Array, parentIndex, distanceToParent, alphabet, leafNames, R, C }`.
+
+```javascript
+const tree = parseNewick('((A:0.1,B:0.2):0.05,C:0.3);');
+const aln = parseFasta('>A\nACGT\n>B\nTGCA\n>C\nGGGG\n');
+const combined = combineTreeAlignment(tree, aln);
+// combined.alignment is a flat (R*C) Int32Array ready for engine.LogLike()
+```
+
+Also available: `parseStockholm(text)`, `parseMaf(text)`, `parseStrings(sequences)`, `detectAlphabet(chars)`.
 
 ---
 

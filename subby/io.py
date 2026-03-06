@@ -4,6 +4,15 @@ import json
 import numpy as np
 
 from .oracle import oracle
+from .formats import (
+    detect_alphabet,
+    parse_newick,
+    parse_fasta,
+    parse_stockholm,
+    parse_maf,
+    parse_strings,
+    combine_tree_alignment,
+)
 
 
 def _parse_model(spec):

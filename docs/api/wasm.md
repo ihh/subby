@@ -4,7 +4,7 @@ The Rust implementation provides f64 precision phylogenetic computations, compil
 
 ## Crate: `phylo_wasm`
 
-**Location:** `src/phylo/wasm/`
+**Location:** `subby/wasm/`
 
 **Targets:**
 - `cdylib` — WebAssembly module via wasm-bindgen
@@ -108,6 +108,7 @@ Scale eigenvalues by a rate multiplier.
 | `f81_fast` | `f81_counts` |
 | `mixture` | `mixture_posterior` |
 | `branch_mask` | `compute_branch_mask` |
+| `formats` | `parse_newick`, `parse_fasta`, `parse_strings`, `combine_tree_alignment`, `detect_alphabet` |
 
 ---
 
@@ -125,6 +126,20 @@ When compiled with `--features wasm`, the crate exports flat-array wasm-bindgen 
 
 All parameters are flat typed arrays. Model parameters are passed individually rather than as a struct.
 
+### Format parser bindings
+
+### `wasm_parse_newick(newick_str) -> JsValue`
+
+Parse a Newick string. Returns object with `parentIndex` (Int32Array), `distanceToParent` (Float64Array), `leafNames`, `nodeNames`, `R`.
+
+### `wasm_parse_fasta(text) -> JsValue`
+
+Parse FASTA text. Returns object with `alignment` (Int32Array, flat N*C), `leafNames`, `alphabet`, `N`, `C`.
+
+### `wasm_parse_strings(sequences) -> JsValue`
+
+Parse an array of equal-length strings. Returns object with `alignment` (Int32Array, flat N*C), `alphabet`, `N`, `C`.
+
 ---
 
 ## Building
@@ -132,7 +147,7 @@ All parameters are flat typed arrays. Model parameters are passed individually r
 ### Native
 
 ```bash
-cd src/phylo/wasm
+cd subby/wasm
 cargo build --release
 cargo test
 ```
@@ -140,7 +155,7 @@ cargo test
 ### WASM
 
 ```bash
-cd src/phylo/wasm
+cd subby/wasm
 wasm-pack build --target web --features wasm
 ```
 
@@ -150,7 +165,7 @@ Produces `pkg/phylo_wasm_bg.wasm` and `pkg/phylo_wasm.js`.
 
 ## JS wrapper: PhyloWASM
 
-`src/phylo/webgpu/phylo_wasm.js` wraps the WASM module with the same async API as `PhyloGPU`:
+`subby/webgpu/phylo_wasm.js` wraps the WASM module with the same async API as `PhyloGPU`:
 
 ```javascript
 import { PhyloWASM } from './phylo_wasm.js';

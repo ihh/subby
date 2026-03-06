@@ -77,3 +77,4 @@ export async function createPhyloEngine(options = {}) {
 export { PhyloGPU } from './phylo_gpu.js';
 export { PhyloWASM } from './phylo_wasm.js';
 export { jukesCantor, f81, hky85, diagonalize, diagonalizeIrreversible, diagonalizeAuto } from './models.js';
+export { detectAlphabet, parseNewick, parseFasta, parseStockholm, parseMaf, parseStrings, combineTreeAlignment } from './formats.js';

@@ -15,6 +15,7 @@ pub mod mixture;
 pub mod branch_mask;
 pub mod complex;
 pub mod ctmc;
+pub mod formats;
 
 use model::{DiagModel, IrrevDiagModel};
 
@@ -898,6 +899,81 @@ mod wasm_api {
                 self.table.branch_posterior_single(node as usize)
             }
         }
+    }
+
+    // ---- Format parser WASM bindings ----
+
+    /// Parse a Newick string. Returns JSON with parentIndex, distanceToParent,
+    /// leafNames, nodeNames.
+    #[wasm_bindgen]
+    pub fn wasm_parse_newick(newick_str: &str) -> JsValue {
+        let result = crate::formats::parse_newick(newick_str);
+        // Return as flat arrays + metadata via JsValue
+        let obj = js_sys::Object::new();
+        let pi = js_sys::Int32Array::from(&result.parent_index[..]);
+        let dist = js_sys::Float64Array::from(&result.distance_to_parent[..]);
+        let leaf_names = js_sys::Array::new();
+        for name in &result.leaf_names {
+            leaf_names.push(&JsValue::from_str(name));
+        }
+        let node_names = js_sys::Array::new();
+        for name in &result.node_names {
+            match name {
+                Some(n) => node_names.push(&JsValue::from_str(n)),
+                None => node_names.push(&JsValue::NULL),
+            }
+        }
+        js_sys::Reflect::set(&obj, &"parentIndex".into(), &pi).unwrap();
+        js_sys::Reflect::set(&obj, &"distanceToParent".into(), &dist).unwrap();
+        js_sys::Reflect::set(&obj, &"leafNames".into(), &leaf_names).unwrap();
+        js_sys::Reflect::set(&obj, &"nodeNames".into(), &node_names).unwrap();
+        js_sys::Reflect::set(&obj, &"R".into(), &JsValue::from(result.parent_index.len() as u32)).unwrap();
+        obj.into()
+    }
+
+    /// Parse FASTA text. Returns JSON with alignment (flat Int32Array), leafNames,
+    /// alphabet, N, C.
+    #[wasm_bindgen]
+    pub fn wasm_parse_fasta(text: &str) -> JsValue {
+        let result = crate::formats::parse_fasta(text, None);
+        let obj = js_sys::Object::new();
+        let aln = js_sys::Int32Array::from(&result.alignment[..]);
+        let leaf_names = js_sys::Array::new();
+        for name in &result.leaf_names {
+            leaf_names.push(&JsValue::from_str(name));
+        }
+        let alpha = js_sys::Array::new();
+        for &ch in &result.alphabet {
+            alpha.push(&JsValue::from_str(&ch.to_string()));
+        }
+        js_sys::Reflect::set(&obj, &"alignment".into(), &aln).unwrap();
+        js_sys::Reflect::set(&obj, &"leafNames".into(), &leaf_names).unwrap();
+        js_sys::Reflect::set(&obj, &"alphabet".into(), &alpha).unwrap();
+        js_sys::Reflect::set(&obj, &"N".into(), &JsValue::from(result.n as u32)).unwrap();
+        js_sys::Reflect::set(&obj, &"C".into(), &JsValue::from(result.c as u32)).unwrap();
+        obj.into()
+    }
+
+    /// Parse plain strings. Returns JSON with alignment (flat Int32Array),
+    /// alphabet, N, C.
+    #[wasm_bindgen]
+    pub fn wasm_parse_strings(sequences: &js_sys::Array) -> JsValue {
+        let seqs: Vec<String> = sequences.iter()
+            .map(|v| v.as_string().expect("Expected string"))
+            .collect();
+        let refs: Vec<&str> = seqs.iter().map(|s| s.as_str()).collect();
+        let result = crate::formats::parse_strings(&refs, None);
+        let obj = js_sys::Object::new();
+        let aln = js_sys::Int32Array::from(&result.alignment[..]);
+        let alpha = js_sys::Array::new();
+        for &ch in &result.alphabet {
+            alpha.push(&JsValue::from_str(&ch.to_string()));
+        }
+        js_sys::Reflect::set(&obj, &"alignment".into(), &aln).unwrap();
+        js_sys::Reflect::set(&obj, &"alphabet".into(), &alpha).unwrap();
+        js_sys::Reflect::set(&obj, &"N".into(), &JsValue::from(result.n as u32)).unwrap();
+        js_sys::Reflect::set(&obj, &"C".into(), &JsValue::from(result.c as u32)).unwrap();
+        obj.into()
     }
 }
 

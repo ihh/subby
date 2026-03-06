@@ -44,7 +44,7 @@ model = {
 ## High-level API
 
 ```python
-from src.phylo.oracle import LogLike, Counts, RootProb, MixturePosterior
+from subby.oracle import LogLike, Counts, RootProb, MixturePosterior
 ```
 
 ### `LogLike(alignment, tree, model)`
@@ -155,6 +155,60 @@ Compute Steiner tree branch mask per column.
 ```python
 mask = compute_branch_mask(alignment, parentIndex, A=4)
 # Shape: (R, C) — boolean, True where branch is informative
+```
+
+---
+
+## Format parsers
+
+Standard phylogenetic file format parsers are re-exported from `subby.oracle` for convenience:
+
+```python
+from subby.oracle import parse_newick, parse_fasta, parse_stockholm, parse_maf, parse_strings, combine_tree_alignment, detect_alphabet
+```
+
+### `parse_newick(newick_str) -> dict`
+
+Parse a Newick tree string into subby's internal tree representation.
+
+**Returns:** dict with `parentIndex` (int32), `distanceToParent` (float64), `leaf_names`, `node_names`.
+
+```python
+tree = parse_newick("((A:0.1,B:0.2):0.05,C:0.3);")
+```
+
+### `parse_fasta(text, alphabet=None) -> dict`
+
+Parse FASTA-formatted alignment. Auto-detects DNA/RNA/protein alphabet.
+
+**Returns:** dict with `alignment` (int32 `(N, C)`), `leaf_names`, `alphabet`.
+
+### `parse_stockholm(text, alphabet=None) -> dict`
+
+Parse Stockholm format. Extracts `#=GF NH` tree if present. When a tree is found, automatically calls `combine_tree_alignment`.
+
+### `parse_maf(text, alphabet=None) -> dict`
+
+Parse MAF (Multiple Alignment Format). Concatenates alignment blocks; fills gaps for missing species.
+
+### `parse_strings(sequences, alphabet=None) -> dict`
+
+Parse a list of equal-length strings into an alignment tensor.
+
+### `combine_tree_alignment(tree_result, alignment_result) -> dict`
+
+Map leaf sequences to tree positions by name. Creates full `(R, C)` alignment with internal nodes filled with the ungapped-unobserved token.
+
+**Returns:** dict with `alignment` (int32 `(R, C)`), `parentIndex`, `distanceToParent`, `alphabet`, `leaf_names`.
+
+```python
+tree = parse_newick("((A:0.1,B:0.2):0.05,C:0.3);")
+aln = parse_fasta(">A\nACGT\n>B\nTGCA\n>C\nGGGG\n")
+combined = combine_tree_alignment(tree, aln)
+ll = LogLike(combined['alignment'],
+             {'parentIndex': combined['parentIndex'],
+              'distanceToParent': combined['distanceToParent']},
+             jukes_cantor_model(4))
 ```
 
 ---

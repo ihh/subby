@@ -8,44 +8,59 @@ The oracle implementation has no dependencies beyond NumPy and SciPy:
 
 ```python
 import numpy as np
-from src.phylo.oracle import (
+from subby.oracle import (
     LogLike, Counts, RootProb, MixturePosterior,
     hky85_diag, jukes_cantor_model, f81_model,
     gamma_rate_categories, scale_model,
     compute_sub_matrices, upward_pass, downward_pass,
     compute_J, eigenbasis_project, accumulate_C, back_transform,
     compute_branch_mask, children_of,
+    parse_newick, parse_fasta, combine_tree_alignment,
 )
 ```
 
 ## Step 1: Define the tree
 
-A phylogenetic tree is represented as two arrays. `parentIndex` encodes the topology in preorder (each node's parent has a smaller index), and `distanceToParent` gives branch lengths.
+The easiest way to define a tree is from a Newick string:
+
+```python
+tree_result = parse_newick("((leaf2:0.05,leaf3:0.15):0.1,(leaf4:0.3):0.0):0.0;")
+# tree_result['parentIndex']:      [-1, 0, 1, 1, 0, 4]
+# tree_result['distanceToParent']: [0.0, 0.1, 0.05, 0.15, 0.0, 0.3]
+# tree_result['leaf_names']:       ['leaf2', 'leaf3', 'leaf4']
+```
+
+This produces a DFS preorder indexed tree:
 
 ```
 Tree:         0 (root)
              / \
-            1   2
-           / \
-          3   4
+            1   4
+           / \   \
+          2   3   5
 ```
+
+Under the hood, subby represents trees as two arrays. `parentIndex` encodes the topology (each node's parent has a smaller index), and `distanceToParent` gives branch lengths:
+
+```python
+tree = {
+    'parentIndex': tree_result['parentIndex'],
+    'distanceToParent': tree_result['distanceToParent'],
+}
+```
+
+You can also construct these arrays directly:
 
 ```python
 parentIndex = np.array([-1, 0, 0, 1, 1], dtype=np.int32)
 distanceToParent = np.array([0.0, 0.1, 0.3, 0.05, 0.15])
-
-tree = {
-    'parentIndex': parentIndex,
-    'distanceToParent': distanceToParent,
-}
+tree = {'parentIndex': parentIndex, 'distanceToParent': distanceToParent}
 ```
-
-Node 0 is the root (`parentIndex[0] = -1`). Nodes 2, 3, 4 are leaves. Node 1 is an internal node.
 
 We can inspect the tree structure:
 
 ```python
-left_child, right_child, sibling = children_of(parentIndex)
+left_child, right_child, sibling = children_of(tree['parentIndex'])
 # left_child:  [1, 3, -1, -1, -1]  (node 0's left child is 1, etc.)
 # right_child: [2, 4, -1, -1, -1]
 # sibling:     [-1, 2, 1, 4, 3]    (node 1's sibling is 2, etc.)
@@ -53,11 +68,38 @@ left_child, right_child, sibling = children_of(parentIndex)
 
 ## Step 2: Define the alignment
 
-An alignment is an `(R, C)` integer array where `R` = number of sequences (= number of tree nodes) and `C` = number of columns.
+The easiest way to provide an alignment is from FASTA format:
 
 ```python
-# 5 sequences × 6 columns
-# Alphabet: A=0, C=1, G=2, T=3
+fasta_text = """\
+>leaf2
+CACGAA
+>leaf3
+ACTGCA
+>leaf4
+ACGAAA
+"""
+aln_result = parse_fasta(fasta_text)
+# aln_result['alignment']: (3, 6) int32 array of leaf sequences
+# aln_result['alphabet']:  ['A', 'C', 'G', 'T']
+```
+
+To combine a tree and alignment (mapping leaves by name), use `combine_tree_alignment`:
+
+```python
+tree_result = parse_newick("((leaf2:0.05,leaf3:0.15):0.1,leaf4:0.3);")
+combined = combine_tree_alignment(tree_result, aln_result)
+alignment = combined['alignment']  # (R, C) int32 — full tree, internal nodes filled
+tree = {'parentIndex': combined['parentIndex'],
+        'distanceToParent': combined['distanceToParent']}
+```
+
+Internal nodes are automatically filled with the ungapped-unobserved token (`A = len(alphabet)`).
+
+You can also construct the alignment tensor directly as an `(R, C)` integer array where `R` = number of tree nodes and `C` = number of columns:
+
+```python
+# 5 sequences × 6 columns, Alphabet: A=0, C=1, G=2, T=3
 alignment = np.array([
     [0, 1, 2, 3, 0, -1],   # root (internal — typically unobserved, but can be)
     [0, 1, 2, 3, 0,  4],   # internal node 1 (token 4 = ungapped-unobserved)
@@ -68,6 +110,7 @@ alignment = np.array([
 ```
 
 Token encoding:
+
 - `0–3`: observed nucleotide (one-hot likelihood)
 - `4` (= A): ungapped but unobserved (uniform likelihood)
 - `-1`: gapped (uniform likelihood)
@@ -177,7 +220,7 @@ Fast-evolving columns will have higher posterior weight on larger rate categorie
 Not all branches are informative for every column. The Steiner tree mask identifies which branches connect ungapped leaves:
 
 ```python
-mask = compute_branch_mask(alignment, parentIndex, A=4)
+mask = compute_branch_mask(alignment, tree['parentIndex'], A=4)
 # Shape: (5, 6) — boolean per branch per column
 
 # Column 5 has a gap at root and unobserved at node 1:
@@ -242,32 +285,42 @@ print(f"HKY85 features shape: {hky_features.shape}")  # (6, 20)
 
 ## Step 10: Browser deployment
 
-For in-browser inference, the same computation runs on WebGPU or WASM:
+For in-browser inference, the same computation runs on WebGPU or WASM. Format parsers are available in JS for converting standard files to subby's internal arrays:
 
 ```javascript
-import { createPhyloEngine } from './src/phylo/webgpu/index.js';
+import {
+  createPhyloEngine,
+  parseNewick, parseFasta, combineTreeAlignment, jukesCantor,
+} from './subby/webgpu/index.js';
 
 const { engine, backend } = await createPhyloEngine({
-  shaderBasePath: './src/phylo/webgpu/shaders/',
+  shaderBasePath: './subby/webgpu/shaders/',
   wasmUrl: './phylo_wasm_bg.wasm',
 });
 console.log(`Using ${backend} backend`);
 
-// Flatten alignment to 1D (row-major)
-const alignment = new Int32Array([0,1,2,3, 0,1,2,3, 1,0,2,3, 0,1,3,3, 0,1,2,2]);
-const parentIndex = new Int32Array([-1, 0, 0, 1, 1]);
-const distances = new Float32Array([0.0, 0.1, 0.3, 0.05, 0.15]);
+// Parse tree and alignment from standard formats
+const tree = parseNewick('((A:0.1,B:0.2):0.05,C:0.3);');
+const aln = parseFasta('>A\nACGT\n>B\nTGCA\n>C\nGGGG\n');
+const combined = combineTreeAlignment(tree, aln);
 
-// Model parameters (from oracle or precomputed)
-const eigenvalues = new Float32Array([0, -1.333, -1.333, -1.333]);
-const eigenvectors = new Float32Array(/* 4×4 matrix, row-major */);
-const pi = new Float32Array([0.25, 0.25, 0.25, 0.25]);
+// Get model parameters
+const model = jukesCantor(4);
 
 const logLike = await engine.LogLike(
-  alignment, parentIndex, distances, eigenvalues, eigenvectors, pi
+  combined.alignment, combined.parentIndex, combined.distanceToParent,
+  model.eigenvalues, model.eigenvectors, model.pi
 );
 
 engine.destroy();
+```
+
+You can also construct flat typed arrays directly:
+
+```javascript
+const alignment = new Int32Array([0,1,2,3, 0,1,2,3, 1,0,2,3, 0,1,3,3, 0,1,2,2]);
+const parentIndex = new Int32Array([-1, 0, 0, 1, 1]);
+const distances = new Float32Array([0.0, 0.1, 0.3, 0.05, 0.15]);
 ```
 
 ## Intermediates deep dive
