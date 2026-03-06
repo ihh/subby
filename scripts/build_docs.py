@@ -47,8 +47,42 @@ NAV = [
 ]
 
 
+def _protect_math(md_text):
+    """Extract math blocks before Markdown processing to prevent mangling.
+
+    The Python markdown library treats underscores as emphasis and backslashes
+    as escapes, which destroys LaTeX math. This replaces all $...$ and $$...$$
+    blocks with unique placeholders, returning (modified_text, replacements).
+    """
+    placeholders = {}
+    counter = [0]
+
+    def replace(m):
+        key = f"\x00MATH{counter[0]}\x00"
+        counter[0] += 1
+        placeholders[key] = m.group(0)
+        return key
+
+    # Display math first ($$...$$), then inline ($...$).
+    # Display: match $$ ... $$ (possibly multiline)
+    text = re.sub(r'\$\$(.+?)\$\$', replace, md_text, flags=re.DOTALL)
+    # Inline: match $ ... $ (single line, non-greedy, not preceded/followed by $)
+    text = re.sub(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', replace, text)
+    return text, placeholders
+
+
+def _restore_math(html, placeholders):
+    """Re-insert math blocks after Markdown processing."""
+    for key, original in placeholders.items():
+        html = html.replace(key, original)
+    return html
+
+
 def md_to_html(md_text):
-    """Convert Markdown to HTML with extensions."""
+    """Convert Markdown to HTML with extensions, preserving LaTeX math."""
+    # Protect math from markdown processing
+    protected_text, math_placeholders = _protect_math(md_text)
+
     extensions = [
         TableExtension(),
         FencedCodeExtension(),
@@ -60,7 +94,11 @@ def md_to_html(md_text):
         pass
 
     md = markdown.Markdown(extensions=extensions, output_format="html")
-    return md.convert(md_text)
+    html = md.convert(protected_text)
+
+    # Restore math blocks
+    html = _restore_math(html, math_placeholders)
+    return html
 
 
 def render_sidebar(current_path):
