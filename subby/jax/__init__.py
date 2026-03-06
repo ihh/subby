@@ -26,6 +26,7 @@ from .models import (
     gamma_rate_categories, scale_model,
     irrev_model_from_rate_matrix, model_from_rate_matrix,
 )
+from .ctmc import ExpectedCounts, expected_counts_eigen, expected_counts_eigen_irrev
 
 
 def _ensure_diag(model: AnyModel) -> AnyDiagModel:

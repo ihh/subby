@@ -238,6 +238,45 @@ export class PhyloWASM {
   }
 
   /**
+   * Expected substitution counts and dwell times for a single CTMC branch.
+   *
+   * Accepts either:
+   *   ExpectedCounts(eigenvalues, eigenvectors, pi, t)   — reversible
+   *   ExpectedCounts(model, t)                           — auto-detect
+   *
+   * @returns {Float64Array} (A^4,) result[a*A^3 + b*A^2 + i*A + j]
+   */
+  async ExpectedCounts(arg1, arg2, arg3, arg4) {
+    if (typeof arg1 === 'object' && arg1.pi !== undefined && typeof arg2 === 'number') {
+      // Model object + t
+      const model = arg1;
+      const t = arg2;
+      if (model.eigenvalues_complex !== undefined) {
+        return this.wasm.wasm_expected_counts_irrev(
+          new Float64Array(model.eigenvalues_complex),
+          new Float64Array(model.eigenvectors_complex),
+          new Float64Array(model.eigenvectors_inv_complex),
+          new Float64Array(model.pi),
+          t,
+        );
+      }
+      return this.wasm.wasm_expected_counts(
+        new Float64Array(model.eigenvalues),
+        new Float64Array(model.eigenvectors),
+        new Float64Array(model.pi),
+        t,
+      );
+    }
+    // Positional: eigenvalues, eigenvectors, pi, t
+    return this.wasm.wasm_expected_counts(
+      new Float64Array(arg1),
+      new Float64Array(arg2),
+      new Float64Array(arg3),
+      arg4,
+    );
+  }
+
+  /**
    * Compute branch mask.
    */
   computeBranchMask(alignment, parentIndex, A) {

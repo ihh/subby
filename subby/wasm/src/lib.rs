@@ -14,6 +14,7 @@ pub mod f81_fast;
 pub mod mixture;
 pub mod branch_mask;
 pub mod complex;
+pub mod ctmc;
 
 use model::{DiagModel, IrrevDiagModel};
 
@@ -255,6 +256,23 @@ pub fn mixture_posterior_full(
     }
 
     mixture::mixture_posterior(&log_likes, log_weights, k, c)
+}
+
+/// Expected substitution counts and dwell times for a single CTMC branch (reversible).
+/// Returns flat (A^4) array: result[a*A^3 + b*A^2 + i*A + j].
+pub fn expected_counts(model: &DiagModel, t: f64) -> Vec<f64> {
+    let a = model.pi.len();
+    ctmc::expected_counts_eigen(&model.eigenvalues, &model.eigenvectors, &model.pi, t, a)
+}
+
+/// Expected substitution counts and dwell times for a single CTMC branch (irreversible).
+/// Returns flat (A^4) real array: result[a*A^3 + b*A^2 + i*A + j].
+pub fn expected_counts_irrev(model: &IrrevDiagModel, t: f64) -> Vec<f64> {
+    let a = model.pi.len();
+    ctmc::expected_counts_eigen_irrev(
+        &model.eigenvalues_complex, &model.eigenvectors_complex,
+        &model.eigenvectors_inv_complex, &model.pi, t, a,
+    )
 }
 
 // ---- InsideOutside table ----
@@ -760,6 +778,38 @@ mod wasm_api {
             pi: pi.to_vec(),
         };
         crate::branch_counts_irrev(alignment, parent_index, distances, &m)
+    }
+
+    #[wasm_bindgen]
+    pub fn wasm_expected_counts(
+        eigenvalues: &[f64],
+        eigenvectors: &[f64],
+        pi: &[f64],
+        t: f64,
+    ) -> Vec<f64> {
+        let m = model::DiagModel {
+            eigenvalues: eigenvalues.to_vec(),
+            eigenvectors: eigenvectors.to_vec(),
+            pi: pi.to_vec(),
+        };
+        crate::expected_counts(&m, t)
+    }
+
+    #[wasm_bindgen]
+    pub fn wasm_expected_counts_irrev(
+        eigenvalues_complex: &[f64],
+        eigenvectors_complex: &[f64],
+        eigenvectors_inv_complex: &[f64],
+        pi: &[f64],
+        t: f64,
+    ) -> Vec<f64> {
+        let m = crate::model::IrrevDiagModel {
+            eigenvalues_complex: eigenvalues_complex.to_vec(),
+            eigenvectors_complex: eigenvectors_complex.to_vec(),
+            eigenvectors_inv_complex: eigenvectors_inv_complex.to_vec(),
+            pi: pi.to_vec(),
+        };
+        crate::expected_counts_irrev(&m, t)
     }
 
     // ---- InsideOutside WASM bindings ----

@@ -38,4 +38,7 @@ from .oracle import (
     accumulate_C_complex_per_branch,
     back_transform_irrev,
     back_transform_irrev_per_branch,
+    ExpectedCounts,
+    expected_counts_eigen,
+    expected_counts_eigen_irrev,
 )

@@ -1814,3 +1814,201 @@ class InsideOutside:
                             for j in range(A):
                                 result[n, i, j, c] /= total
             return result
+
+
+# ---------------------------------------------------------------------------
+# Standalone CTMC branch integral functions
+# ---------------------------------------------------------------------------
+
+def expected_counts_eigen(eigenvalues, eigenvectors, pi, t):
+    """Expected counts from pre-computed eigendecomposition (reversible).
+
+    For a reversible CTMC with symmetrized rate matrix S = V diag(mu) V^T:
+
+    W[a,b,i,j] = sum_{kl} V[a,k]*V[i,k] * J[k,l](t) * V[b,l]*V[j,l]
+    S_t[a,b] = sum_k V[a,k] exp(mu_k*t) V[b,k]  (symmetrized transition matrix)
+    S[i,j] = sum_k V[i,k] mu_k V[j,k]
+
+    result[a,b,i,i] = W[a,b,i,i] / S_t[a,b]                    (dwell)
+    result[a,b,i,j] = S[i,j] * W[a,b,i,j] / S_t[a,b]          (subs, i!=j)
+
+    Args:
+        eigenvalues: (A,) real eigenvalues
+        eigenvectors: (A, A) real orthogonal eigenvectors
+        pi: (A,) equilibrium distribution
+        t: scalar branch length
+
+    Returns:
+        (A, A, A, A) tensor: result[a, b, i, j]
+    """
+    A = len(eigenvalues)
+    mu = eigenvalues
+    V = eigenvectors
+
+    # J matrix for a single branch
+    J = np.zeros((A, A), dtype=np.float64)
+    for k in range(A):
+        exp_k = np.exp(mu[k] * t)
+        for l in range(A):
+            diff = mu[k] - mu[l]
+            if abs(diff) < 1e-8:
+                J[k, l] = t * exp_k
+            else:
+                J[k, l] = (exp_k - np.exp(mu[l] * t)) / diff
+
+    # Symmetrized transition matrix: S_t[a,b] = sum_k V[a,k] exp(mu_k*t) V[b,k]
+    S_t = np.zeros((A, A), dtype=np.float64)
+    for a in range(A):
+        for b in range(A):
+            s = 0.0
+            for k in range(A):
+                s += V[a, k] * np.exp(mu[k] * t) * V[b, k]
+            S_t[a, b] = s
+
+    # Symmetrized rate matrix: S[i,j] = sum_k V[i,k] mu_k V[j,k]
+    S_mat = np.zeros((A, A), dtype=np.float64)
+    for i in range(A):
+        for j in range(A):
+            s = 0.0
+            for k in range(A):
+                s += V[i, k] * mu[k] * V[j, k]
+            S_mat[i, j] = s
+
+    # W[a,b,i,j] = sum_{kl} V[a,k]*V[i,k] * J[k,l] * V[b,l]*V[j,l]
+    W = np.zeros((A, A, A, A), dtype=np.float64)
+    for a in range(A):
+        for b in range(A):
+            for i in range(A):
+                for j in range(A):
+                    s = 0.0
+                    for k in range(A):
+                        for l in range(A):
+                            s += V[a, k] * V[i, k] * J[k, l] * V[b, l] * V[j, l]
+                    W[a, b, i, j] = s
+
+    # Build result (divide by S_t, not M, in the symmetrized basis)
+    result = np.zeros((A, A, A, A), dtype=np.float64)
+    for a in range(A):
+        for b in range(A):
+            if abs(S_t[a, b]) < 1e-300:
+                continue
+            for i in range(A):
+                for j in range(A):
+                    if i == j:
+                        result[a, b, i, j] = W[a, b, i, j] / S_t[a, b]
+                    else:
+                        result[a, b, i, j] = S_mat[i, j] * W[a, b, i, j] / S_t[a, b]
+
+    return result
+
+
+def expected_counts_eigen_irrev(eigenvalues, eigenvectors, eigenvectors_inv, pi, t):
+    """Expected counts from pre-computed eigendecomposition (irreversible).
+
+    For an irreversible CTMC with Q = V diag(mu) V^{-1}:
+
+    L[a,i,k] = V[a,k] * V_inv[k,i]
+    R[b,j,l] = V[j,l] * V_inv[l,b]
+    W[a,b,i,j] = sum_{kl} L[a,i,k] * J[k,l] * R[b,j,l]
+    M[a,b] = Re(sum_k V[a,k] exp(mu_k*t) V_inv[k,b])
+    Q[i,j] = Re(sum_k V[i,k] mu_k V_inv[k,j])
+
+    result[a,b,i,i] = Re(W[a,b,i,i]) / M[a,b]
+    result[a,b,i,j] = Re(Q[i,j] * W[a,b,i,j]) / M[a,b]      (i!=j)
+
+    Args:
+        eigenvalues: (A,) complex eigenvalues
+        eigenvectors: (A, A) complex right eigenvectors V
+        eigenvectors_inv: (A, A) complex V^{-1}
+        pi: (A,) real equilibrium distribution
+        t: scalar branch length
+
+    Returns:
+        (A, A, A, A) real tensor: result[a, b, i, j]
+    """
+    A = len(eigenvalues)
+    mu = eigenvalues
+    V = eigenvectors
+    V_inv = eigenvectors_inv
+
+    # J matrix (complex) for a single branch
+    J = np.zeros((A, A), dtype=np.complex128)
+    for k in range(A):
+        exp_k = np.exp(mu[k] * t)
+        for l in range(A):
+            diff = mu[k] - mu[l]
+            if abs(diff) < 1e-8:
+                J[k, l] = t * exp_k
+            else:
+                J[k, l] = (exp_k - np.exp(mu[l] * t)) / diff
+
+    # Transition matrix: M[a,b] = Re(sum_k V[a,k] exp(mu_k*t) V_inv[k,b])
+    M = np.zeros((A, A), dtype=np.float64)
+    for a in range(A):
+        for b in range(A):
+            s = 0.0 + 0.0j
+            for k in range(A):
+                s += V[a, k] * np.exp(mu[k] * t) * V_inv[k, b]
+            M[a, b] = s.real
+
+    # Rate matrix: Q[i,j] = sum_k V[i,k] mu_k V_inv[k,j]
+    Q_mat = np.zeros((A, A), dtype=np.complex128)
+    for i in range(A):
+        for j in range(A):
+            s = 0.0 + 0.0j
+            for k in range(A):
+                s += V[i, k] * mu[k] * V_inv[k, j]
+            Q_mat[i, j] = s
+
+    # W[a,b,i,j] = sum_{kl} V[a,k]*V_inv[k,i] * J[k,l] * V[j,l]*V_inv[l,b]
+    W = np.zeros((A, A, A, A), dtype=np.complex128)
+    for a in range(A):
+        for b in range(A):
+            for i in range(A):
+                for j in range(A):
+                    s = 0.0 + 0.0j
+                    for k in range(A):
+                        for l in range(A):
+                            s += V[a, k] * V_inv[k, i] * J[k, l] * V[j, l] * V_inv[l, b]
+                    W[a, b, i, j] = s
+
+    # Build result
+    result = np.zeros((A, A, A, A), dtype=np.float64)
+    for a in range(A):
+        for b in range(A):
+            if abs(M[a, b]) < 1e-300:
+                continue
+            for i in range(A):
+                for j in range(A):
+                    if i == j:
+                        result[a, b, i, j] = W[a, b, i, j].real / M[a, b]
+                    else:
+                        result[a, b, i, j] = (Q_mat[i, j] * W[a, b, i, j]).real / M[a, b]
+
+    return result
+
+
+def ExpectedCounts(model, t):
+    """Expected substitution counts and dwell times for a single CTMC branch.
+
+    Outer function: accepts reversible or irreversible model dict.
+    Auto-detects model type from 'reversible' flag or presence of 'eigenvectors_inv'.
+
+    Args:
+        model: dict with eigenvalues, eigenvectors, pi (and eigenvectors_inv if irreversible)
+        t: scalar branch length
+
+    Returns:
+        (A, A, A, A) tensor: result[a, b, i, j]
+        Diagonal [a,b,i,i] = dwell time; off-diagonal [a,b,i,j] = sub count.
+    """
+    is_irrev = model.get('reversible', True) is False or 'eigenvectors_inv' in model
+    if is_irrev:
+        return expected_counts_eigen_irrev(
+            model['eigenvalues'], model['eigenvectors'],
+            model['eigenvectors_inv'], model['pi'], t,
+        )
+    else:
+        return expected_counts_eigen(
+            model['eigenvalues'], model['eigenvectors'], model['pi'], t,
+        )

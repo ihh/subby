@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 
-from subby.jax import LogLike, Counts, BranchCounts, RootProb, MixturePosterior, LogLikeCustomGrad, pad_alignment, unpad_columns, InsideOutside
+from subby.jax import LogLike, Counts, BranchCounts, RootProb, MixturePosterior, LogLikeCustomGrad, pad_alignment, unpad_columns, InsideOutside, ExpectedCounts, expected_counts_eigen, expected_counts_eigen_irrev
 from subby.jax.types import Tree, RateModel
 from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model, irrev_model_from_rate_matrix
 
@@ -965,3 +965,186 @@ class TestBranchCounts:
         c = Counts(alignment, tree, models)
         assert bc.shape == (R, 4, 4, C)
         np.testing.assert_allclose(bc.sum(axis=-4), c, atol=1e-10)
+
+
+class TestExpectedCounts:
+
+    def test_dwell_sum_to_t(self):
+        """sum_i result[a,b,i,i] = t for every reachable (a,b)."""
+        model = jukes_cantor_model(4)
+        t = 0.3
+        ec = ExpectedCounts(model, t)
+        assert ec.shape == (4, 4, 4, 4)
+        from subby.jax.diagonalize import compute_sub_matrices
+        M = compute_sub_matrices(model, jnp.array([t]))[0]  # (A, A)
+        for a in range(4):
+            for b in range(4):
+                if M[a, b] > 1e-10:
+                    dwell_sum = sum(float(ec[a, b, i, i]) for i in range(4))
+                    np.testing.assert_allclose(dwell_sum, t, atol=1e-10)
+
+    def test_nonnegative(self):
+        """All entries >= 0."""
+        model = jukes_cantor_model(4)
+        ec = ExpectedCounts(model, 0.5)
+        assert jnp.all(ec >= -1e-10)
+
+    def test_t_zero(self):
+        """ExpectedCounts at t=0 should be all zeros."""
+        model = jukes_cantor_model(4)
+        ec = ExpectedCounts(model, 0.0)
+        np.testing.assert_allclose(ec, 0.0, atol=1e-12)
+
+    def test_consistency_with_branch_counts(self):
+        """For a 2-node tree (root+child), BranchCounts should equal
+        sum_{a,b} pi_a * M_{ab} * ExpectedCounts[a,b,:,:] weighted by data.
+
+        Specifically, for a single alignment column where node 0 has state s0
+        and node 1 has state s1:
+        BranchCounts[1,i,j,c] = pi[s0] * M[s0,s1] * EC[s0,s1,i,j] / Z
+        where Z normalizes.
+
+        We use a simpler aggregate check: summing EC over (a,b) weighted by
+        the joint posterior P(a,b) = pi_a * M_ab * L_b / Z (for uninformative child)
+        should recover the per-branch counts from BranchCounts on a 2-node tree.
+        """
+        A = 4
+        model = jukes_cantor_model(A)
+        t = 0.2
+
+        # 2-node tree: root=0, child=1
+        parentIndex = jnp.array([-1, 0], dtype=jnp.int32)
+        distances = jnp.array([0.0, t])
+        tree = Tree(parentIndex=parentIndex, distanceToParent=distances)
+
+        # Single column, all observed (no gaps)
+        alignment = jnp.array([[0], [2]], dtype=jnp.int32)
+
+        bc = BranchCounts(alignment, tree, model)  # (R, A, A, C)
+        bc_branch1 = bc[1, :, :, 0]  # (A, A) for the single branch
+
+        ec = ExpectedCounts(model, t)  # (A, A, A, A)
+
+        # BranchCounts returns the raw EM sufficient statistics (S*W in the
+        # symmetrized basis), while ExpectedCounts returns the true conditional
+        # expected counts (S*W/S_t). The relationship is bc = M[a,b] * ec.
+        from subby.jax.diagonalize import compute_sub_matrices
+        M = compute_sub_matrices(model, distances)
+        M_01_02 = float(M[1, 0, 2])  # M(t)[s0=0, s1=2] for branch 1
+        np.testing.assert_allclose(
+            np.array(bc_branch1), M_01_02 * np.array(ec[0, 2, :, :]), atol=1e-10
+        )
+
+    def test_hky85_model(self):
+        """Works with non-uniform pi (HKY85)."""
+        pi = jnp.array([0.1, 0.2, 0.3, 0.4])
+        model = hky85_diag(2.5, pi)
+        ec = ExpectedCounts(model, 0.3)
+        assert ec.shape == (4, 4, 4, 4)
+        # Dwell sum should be t
+        from subby.jax.diagonalize import compute_sub_matrices
+        M = compute_sub_matrices(model, jnp.array([0.3]))[0]
+        for a in range(4):
+            for b in range(4):
+                if M[a, b] > 1e-10:
+                    dwell_sum = sum(float(ec[a, b, i, i]) for i in range(4))
+                    np.testing.assert_allclose(dwell_sum, 0.3, atol=1e-10)
+
+    def test_reversible_vs_irreversible(self):
+        """For a symmetric Q (JC), reversible and irreversible paths agree."""
+        model_rev = jukes_cantor_model(4)
+        ec_rev = ExpectedCounts(model_rev, 0.3)
+
+        # Build the same model as irreversible
+        A = 4
+        subRate = jnp.ones((A, A)) / (A - 1)
+        subRate = subRate - jnp.diag(jnp.sum(subRate, axis=-1))
+        # Normalize
+        pi = jnp.ones(A) / A
+        norm = -jnp.sum(pi * jnp.diag(subRate))
+        subRate = subRate / norm
+        model_irrev = irrev_model_from_rate_matrix(subRate, pi)
+        ec_irrev = ExpectedCounts(model_irrev, 0.3)
+
+        np.testing.assert_allclose(ec_irrev, np.array(ec_rev), atol=1e-6)
+
+    def test_cross_implementation_oracle(self):
+        """JAX vs Oracle should agree."""
+        from subby.oracle import ExpectedCounts as OracleEC
+        from subby.oracle import jukes_cantor_model as oracle_jc
+
+        model_jax = jukes_cantor_model(4)
+        ec_jax = np.array(ExpectedCounts(model_jax, 0.3))
+
+        model_oracle = oracle_jc(4)
+        ec_oracle = OracleEC(model_oracle, 0.3)
+
+        np.testing.assert_allclose(ec_jax, ec_oracle, atol=1e-10)
+
+    def test_cross_implementation_oracle_hky(self):
+        """JAX vs Oracle with HKY85."""
+        from subby.oracle import ExpectedCounts as OracleEC
+        from subby.oracle import hky85_diag as oracle_hky
+
+        pi = jnp.array([0.1, 0.2, 0.3, 0.4])
+        model_jax = hky85_diag(2.5, pi)
+        ec_jax = np.array(ExpectedCounts(model_jax, 0.4))
+
+        model_oracle = oracle_hky(2.5, np.array([0.1, 0.2, 0.3, 0.4]))
+        ec_oracle = OracleEC(model_oracle, 0.4)
+
+        np.testing.assert_allclose(ec_jax, ec_oracle, atol=1e-10)
+
+    def test_cross_implementation_oracle_irrev(self):
+        """JAX vs Oracle with irreversible model."""
+        from subby.oracle import ExpectedCounts as OracleEC
+        from subby.oracle import irrev_model_from_rate_matrix as oracle_irrev
+
+        A = 4
+        rng = np.random.RandomState(42)
+        rate = rng.uniform(0.01, 1.0, (A, A))
+        np.fill_diagonal(rate, 0.0)
+        np.fill_diagonal(rate, -rate.sum(axis=1))
+        pi = np.ones(A) / A
+        norm = -np.sum(pi * np.diag(rate))
+        rate /= norm
+
+        model_jax = irrev_model_from_rate_matrix(jnp.array(rate), jnp.array(pi))
+        ec_jax = np.array(ExpectedCounts(model_jax, 0.3))
+
+        model_oracle = oracle_irrev(rate, pi)
+        ec_oracle = OracleEC(model_oracle, 0.3)
+
+        np.testing.assert_allclose(ec_jax, ec_oracle, atol=1e-8)
+
+    def test_large_alphabet(self):
+        """A=20 works."""
+        model = jukes_cantor_model(20)
+        ec = ExpectedCounts(model, 0.2)
+        assert ec.shape == (20, 20, 20, 20)
+        assert jnp.all(jnp.isfinite(ec))
+
+    def test_inner_function_reuse(self):
+        """Calling expected_counts_eigen with different t values gives correct results."""
+        model = jukes_cantor_model(4)
+        for t in [0.1, 0.3, 0.5, 1.0]:
+            ec = expected_counts_eigen(model.eigenvalues, model.eigenvectors, model.pi, t)
+            from subby.jax.diagonalize import compute_sub_matrices
+            M = compute_sub_matrices(model, jnp.array([t]))[0]
+            for a in range(4):
+                for b in range(4):
+                    if M[a, b] > 1e-10:
+                        dwell_sum = sum(float(ec[a, b, i, i]) for i in range(4))
+                        np.testing.assert_allclose(dwell_sum, t, atol=1e-10)
+
+    def test_auto_diagonalize(self):
+        """ExpectedCounts should accept RateModel and auto-diagonalize."""
+        A = 4
+        subRate = jnp.ones((A, A)) / (A - 1)
+        subRate = subRate - jnp.diag(jnp.sum(subRate, axis=-1))
+        rootProb = jnp.ones(A) / A
+        rate_model = RateModel(subRate=subRate, rootProb=rootProb)
+
+        ec = ExpectedCounts(rate_model, 0.3)
+        assert ec.shape == (A, A, A, A)
+        assert jnp.all(jnp.isfinite(ec))

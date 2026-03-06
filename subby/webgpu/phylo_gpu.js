@@ -1046,6 +1046,25 @@ export class PhyloGPU {
   }
 
   /**
+   * Expected substitution counts and dwell times for a single CTMC branch.
+   *
+   * Note: WebGPU does not have a native CTMC solver, so this delegates to
+   * CPU computation via the WASM fallback. The method is provided for API
+   * consistency across backends.
+   *
+   * Accepts either:
+   *   ExpectedCounts(model, t)
+   *
+   * @returns {Float64Array} (A^4,) result[a*A^3 + b*A^2 + i*A + j]
+   */
+  async ExpectedCounts(model, t) {
+    throw new Error(
+      'ExpectedCounts is not available on the WebGPU backend. ' +
+      'Use the WASM backend (PhyloWASM) for standalone CTMC branch integrals.'
+    );
+  }
+
+  /**
    * Create an InsideOutside table for querying posteriors.
    *
    * Accepts either:

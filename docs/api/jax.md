@@ -184,6 +184,49 @@ Compute per-branch expected substitution counts and dwell times per column. Retu
 
 **Returns:** `(*H, R, A, A, C)` float tensor. Branch 0 (root) is zeros. Diagonal entries are dwell times; off-diagonal entries are substitution counts. Summing over the `R` axis recovers `Counts`.
 
+### `ExpectedCounts(model, t)`
+
+Expected substitution counts and dwell times for a single CTMC branch, independent of any alignment or tree.
+
+Computes $\mathbb{E}[N_{i \to j}(t) \mid X(0)=a, X(t)=b]$ (off-diagonal) and $\mathbb{E}[T_i(t) \mid X(0)=a, X(t)=b]$ (diagonal) for all $(a, b, i, j)$.
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `model` | `DiagModel`, `IrrevDiagModel`, or `RateModel` | Substitution model |
+| `t` | `float` | Branch length |
+
+**Returns:** `(*H, A, A, A, A)` float tensor. `result[..., a, b, i, j]` is the expected number of $i \to j$ substitutions (off-diagonal) or the expected dwell time in state $i$ (diagonal), conditioned on endpoint states $a$ and $b$.
+
+**Properties:**
+- Dwell times sum to $t$: $\sum_i \text{result}[a, b, i, i] = t$ for every reachable $(a, b)$.
+- All entries are non-negative.
+- At $t = 0$, all entries are zero.
+
+#### `expected_counts_eigen(eigenvalues, eigenvectors, pi, t)`
+
+Inner function for reversible models. Takes pre-computed eigendecomposition, so it can be called repeatedly for different $t$ without re-diagonalizing.
+
+| Parameter | Type | Shape | Description |
+|-----------|------|-------|-------------|
+| `eigenvalues` | float | `(*H, A)` | Eigenvalues of symmetrized rate matrix |
+| `eigenvectors` | float | `(*H, A, A)` | Orthogonal eigenvectors |
+| `pi` | float | `(*H, A)` | Equilibrium distribution |
+| `t` | float | scalar | Branch length |
+
+#### `expected_counts_eigen_irrev(eigenvalues, eigenvectors, eigenvectors_inv, pi, t)`
+
+Inner function for irreversible models. Takes pre-computed complex eigendecomposition.
+
+| Parameter | Type | Shape | Description |
+|-----------|------|-------|-------------|
+| `eigenvalues` | complex128 | `(*H, A)` | Complex eigenvalues |
+| `eigenvectors` | complex128 | `(*H, A, A)` | Right eigenvectors $V$ |
+| `eigenvectors_inv` | complex128 | `(*H, A, A)` | $V^{-1}$ |
+| `pi` | float | `(*H, A)` | Stationary distribution |
+| `t` | float | scalar | Branch length |
+
 ### `RootProb(alignment, tree, model, maxChunkSize=128)`
 
 Compute posterior root state distribution per column.

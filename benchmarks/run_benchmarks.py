@@ -236,7 +236,7 @@ PARAM_GRID = {
     "R": [7, 15, 31],
 }
 
-FUNCTIONS = ["LogLike", "Counts", "BranchCounts", "LogLikeGrad", "LogLikeCustomGrad"]
+FUNCTIONS = ["LogLike", "Counts", "BranchCounts", "LogLikeGrad", "LogLikeCustomGrad", "ExpectedCounts"]
 MODEL_TYPES = ["reversible", "irreversible"]
 
 
@@ -337,12 +337,29 @@ def run_benchmarks(backends, n_reps, dry_run=False, timeout=60.0, model_types=No
 
                             fn_map = {"LogLike": ll_fn, "Counts": counts_fn, "BranchCounts": bc_fn}
 
+                            # ExpectedCounts: standalone (no alignment/tree), only JAX/oracle
+                            if func_name == "ExpectedCounts":
+                                if backend_name not in ("jax_cpu", "jax_gpu", "oracle"):
+                                    print(f"  {label} ... SKIPPED (ExpectedCounts requires JAX or oracle)")
+                                    continue
+                                if backend_name.startswith("jax"):
+                                    from subby.jax import ExpectedCounts as _EC
+                                else:
+                                    from subby.oracle import ExpectedCounts as _EC
+                                _model_for_ec = model
+                                def _ec_fn(_model=_model_for_ec, _A=A):
+                                    return _EC(_model, 0.3)
+                                fn = None
+                                _grad_fn = _ec_fn
+
                             # For gradient functions, only available with JAX
-                            if func_name in ("LogLikeGrad", "LogLikeCustomGrad") and backend_name not in ("jax_cpu", "jax_gpu"):
+                            elif func_name in ("LogLikeGrad", "LogLikeCustomGrad") and backend_name not in ("jax_cpu", "jax_gpu"):
                                 print(f"  {label} ... SKIPPED (gradient fn requires JAX)")
                                 continue
 
-                            if func_name == "LogLikeGrad":
+                            if func_name == "ExpectedCounts":
+                                pass  # already handled above
+                            elif func_name == "LogLikeGrad":
                                 import jax
                                 import jax.numpy as jnp
                                 from subby.jax.types import Tree as JTree
