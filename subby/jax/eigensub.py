@@ -432,3 +432,181 @@ def back_transform_irrev_per_branch(
         R[..., None] * VCV
     )
     return counts.real
+
+
+# ── Per-row (per-branch) model variants ──────────────────────────────────
+
+
+def compute_J_per_row(eigenvalues: jnp.ndarray, distances: jnp.ndarray) -> jnp.ndarray:
+    """Compute J interaction matrix where each branch has its own eigenvalues.
+
+    Unlike compute_J which broadcasts shared eigenvalues over all branches,
+    this pairs each branch's eigenvalues with its own distance.
+
+    Args:
+        eigenvalues: (R, A) per-branch eigenvalues
+        distances: (R,) branch lengths
+
+    Returns:
+        (R, A, A) J matrices per branch
+    """
+    mu = eigenvalues  # (R, A)
+    t = distances     # (R,)
+
+    mu_t = mu * t[:, None]          # (R, A)
+    exp_mu_t = jnp.exp(mu_t)       # (R, A)
+
+    mu_diff = mu[:, :, None] - mu[:, None, :]  # (R, A, A)
+
+    exp_k = exp_mu_t[:, :, None]   # (R, A, 1)
+    exp_l = exp_mu_t[:, None, :]   # (R, 1, A)
+
+    J_nondeg = (exp_k - exp_l) / (mu_diff + 1e-30)
+
+    t_expanded = t[:, None, None]  # (R, 1, 1)
+    J_deg = t_expanded * exp_k
+
+    is_degenerate = jnp.abs(mu_diff) < 1e-8
+    J = jnp.where(is_degenerate, J_deg, J_nondeg)
+
+    return J
+
+
+def compute_J_per_row_complex(eigenvalues: jnp.ndarray, distances: jnp.ndarray) -> jnp.ndarray:
+    """Compute J interaction matrix per branch for complex eigenvalues.
+
+    Args:
+        eigenvalues: (R, A) complex per-branch eigenvalues
+        distances: (R,) real branch lengths
+
+    Returns:
+        (R, A, A) complex J matrices per branch
+    """
+    mu = eigenvalues
+    t = distances
+
+    mu_t = mu * t[:, None]
+    exp_mu_t = jnp.exp(mu_t)
+
+    mu_diff = mu[:, :, None] - mu[:, None, :]
+
+    exp_k = exp_mu_t[:, :, None]
+    exp_l = exp_mu_t[:, None, :]
+
+    J_nondeg = (exp_k - exp_l) / (mu_diff + 1e-30)
+
+    t_expanded = t[:, None, None]
+    J_deg = t_expanded * exp_k
+
+    is_degenerate = jnp.abs(mu_diff) < 1e-8
+    J = jnp.where(is_degenerate, J_deg, J_nondeg)
+
+    return J
+
+
+def eigenbasis_project_per_row(
+    U: jnp.ndarray, D: jnp.ndarray,
+    V_per_row: jnp.ndarray, pi_per_row: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Project inside/outside vectors using per-branch eigenvectors.
+
+    Each branch r uses V_per_row[r] and pi_per_row[r].
+
+    Args:
+        U: (R, C, A) inside vectors
+        D: (R, C, A) outside vectors
+        V_per_row: (R, A, A) per-branch eigenvectors
+        pi_per_row: (R, A) per-branch equilibrium distributions
+
+    Returns:
+        U_tilde: (R, C, A) projected inside
+        D_tilde: (R, C, A) projected outside
+    """
+    sqrt_pi = jnp.sqrt(pi_per_row)        # (R, A)
+    inv_sqrt_pi = 1.0 / sqrt_pi
+
+    U_weighted = U * sqrt_pi[:, None, :]   # (R, C, A)
+    U_tilde = jnp.einsum('rcb,rbk->rck', U_weighted, V_per_row)
+
+    D_weighted = D * inv_sqrt_pi[:, None, :]
+    D_tilde = jnp.einsum('rca,rak->rck', D_weighted, V_per_row)
+
+    return U_tilde, D_tilde
+
+
+def eigenbasis_project_per_row_irrev(
+    U: jnp.ndarray, D: jnp.ndarray,
+    V_per_row: jnp.ndarray, V_inv_per_row: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Project inside/outside vectors using per-branch eigenvectors (irreversible).
+
+    Args:
+        U: (R, C, A) inside vectors (real)
+        D: (R, C, A) outside vectors (real)
+        V_per_row: (R, A, A) complex per-branch right eigenvectors
+        V_inv_per_row: (R, A, A) complex per-branch V^{-1}
+
+    Returns:
+        U_tilde: (R, C, A) complex projected inside
+        D_tilde: (R, C, A) complex projected outside
+    """
+    U_tilde = jnp.einsum('rcb,rbk->rck', U, V_per_row)
+
+    V_inv_T = jnp.swapaxes(V_inv_per_row, -2, -1)  # (R, A, A)
+    D_tilde = jnp.einsum('rca,rak->rck', D, V_inv_T)
+
+    return U_tilde, D_tilde
+
+
+def back_transform_per_row(
+    C_per_branch: jnp.ndarray,
+    V_per_row: jnp.ndarray,
+    eigenvalues_per_row: jnp.ndarray,
+) -> jnp.ndarray:
+    """Transform per-branch eigenbasis counts using per-branch eigenvectors.
+
+    Each branch r is back-transformed using its own V[r] and eigenvalues[r].
+
+    Args:
+        C_per_branch: (R, A, A, C) per-branch eigenbasis counts
+        V_per_row: (R, A, A) per-branch eigenvectors
+        eigenvalues_per_row: (R, A) per-branch eigenvalues
+
+    Returns:
+        (R, A, A, C) per-branch natural-basis counts
+    """
+    VCV = jnp.einsum('rik,rklc,rjl->rijc', V_per_row, C_per_branch, V_per_row)
+
+    S = jnp.einsum('rak,rk,rbk->rab', V_per_row, eigenvalues_per_row, V_per_row)
+
+    diag_mask = jnp.eye(V_per_row.shape[-1], dtype=bool)
+    counts = jnp.where(diag_mask[..., None], VCV, S[..., None] * VCV)
+
+    return counts
+
+
+def back_transform_per_row_irrev(
+    C_per_branch: jnp.ndarray,
+    V_per_row: jnp.ndarray,
+    V_inv_per_row: jnp.ndarray,
+    eigenvalues_per_row: jnp.ndarray,
+) -> jnp.ndarray:
+    """Transform per-branch eigenbasis counts for irreversible per-row models.
+
+    Args:
+        C_per_branch: (R, A, A, C) complex per-branch eigenbasis counts
+        V_per_row: (R, A, A) complex per-branch right eigenvectors
+        V_inv_per_row: (R, A, A) complex per-branch V^{-1}
+        eigenvalues_per_row: (R, A) complex per-branch eigenvalues
+
+    Returns:
+        (R, A, A, C) real per-branch counts
+    """
+    VCV = jnp.einsum('rik,rklc,rlj->rijc', V_per_row, C_per_branch, V_inv_per_row)
+
+    R_mat = jnp.einsum('rak,rk,rkj->raj', V_per_row, eigenvalues_per_row, V_inv_per_row)
+
+    diag_mask = jnp.eye(V_per_row.shape[-1], dtype=bool)
+    counts = jnp.where(diag_mask[..., None], VCV, R_mat[..., None] * VCV)
+
+    return counts.real

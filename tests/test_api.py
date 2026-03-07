@@ -270,6 +270,263 @@ class TestPerColumnModel:
         np.testing.assert_allclose(sums, 1.0, atol=1e-4)
 
 
+class TestPerRowModel:
+    """Test per-row (per-branch) model support via (1, R) model grid."""
+
+    def test_same_model_loglike(self):
+        """[[model] * R] gives same LogLike as single model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(50), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        ll_single = LogLike(alignment, tree, model)
+        ll_grid = LogLike(alignment, tree, [[model] * R])
+        np.testing.assert_allclose(ll_grid, ll_single, atol=1e-8)
+
+    def test_same_model_counts(self):
+        """[[model] * R] gives same Counts as single model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(51), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        counts_single = Counts(alignment, tree, model)
+        counts_grid = Counts(alignment, tree, [[model] * R])
+        np.testing.assert_allclose(counts_grid, counts_single, atol=1e-6)
+
+    def test_same_model_rootprob(self):
+        """[[model] * R] gives same RootProb as single model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(52), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        rp_single = RootProb(alignment, tree, model)
+        rp_grid = RootProb(alignment, tree, [[model] * R])
+        np.testing.assert_allclose(rp_grid, rp_single, atol=1e-6)
+
+    def test_same_model_branch_counts(self):
+        """[[model] * R] gives same BranchCounts as single model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(53), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        bc_single = BranchCounts(alignment, tree, model)
+        bc_grid = BranchCounts(alignment, tree, [[model] * R])
+        np.testing.assert_allclose(bc_grid, bc_single, atol=1e-6)
+
+    def test_different_rates_loglike(self):
+        """Per-row with different rates produces valid log-likelihoods."""
+        tree = _make_medium_tree(3)
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(jax.random.PRNGKey(54), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        models_row = [scale_model(base, 0.5 + 0.3 * r) for r in range(R)]
+
+        ll = LogLike(alignment, tree, [models_row])
+        assert ll.shape == (C,)
+        assert jnp.all(jnp.isfinite(ll))
+        assert jnp.all(ll <= 0)
+
+    def test_counts_sum_equals_branch_counts(self):
+        """Counts = sum(BranchCounts) with per-row models."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(55), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        models_row = [scale_model(base, 0.5 + 0.2 * r) for r in range(R)]
+
+        counts = Counts(alignment, tree, [models_row])
+        bc = BranchCounts(alignment, tree, [models_row])
+
+        assert bc.shape == (R, 4, 4, C)
+        np.testing.assert_allclose(bc.sum(axis=0), counts, atol=1e-8)
+
+    def test_rootprob_sums_to_one(self):
+        """RootProb sums to 1 with per-row models."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(jax.random.PRNGKey(56), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        models_row = [scale_model(base, 0.5 + 0.2 * r) for r in range(R)]
+
+        rp = RootProb(alignment, tree, [models_row])
+        assert rp.shape == (4, C)
+        np.testing.assert_allclose(jnp.sum(rp, axis=0), 1.0, atol=1e-4)
+
+    def test_counts_nonnegative(self):
+        """Per-row counts are nonnegative."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(57), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        models_row = [scale_model(base, 0.5 + 0.2 * r) for r in range(R)]
+
+        counts = Counts(alignment, tree, [models_row])
+        assert jnp.all(counts >= -1e-10)
+
+    def test_hky85_per_row(self):
+        """Per-row with HKY85 models."""
+        tree = _make_medium_tree(3)
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(jax.random.PRNGKey(58), (R, C), 0, 4).astype(jnp.int32)
+
+        pi = jnp.array([0.3, 0.2, 0.25, 0.25])
+        models_row = [hky85_diag(1.0 + 0.5 * r, pi) for r in range(R)]
+
+        ll = LogLike(alignment, tree, [models_row])
+        assert jnp.all(jnp.isfinite(ll))
+
+        counts = Counts(alignment, tree, [models_row])
+        assert counts.shape == (4, 4, C)
+        assert jnp.all(counts >= -1e-10)
+
+
+class TestModelGrid:
+    """Test (C, R) model grids."""
+
+    def test_same_model_loglike(self):
+        """[[model]*R]*C gives same LogLike as single model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(jax.random.PRNGKey(60), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        ll_single = LogLike(alignment, tree, model)
+        ll_grid = LogLike(alignment, tree, [[model] * R] * C)
+        np.testing.assert_allclose(ll_grid, ll_single, atol=1e-8)
+
+    def test_same_model_counts(self):
+        """[[model]*R]*C gives same Counts as single model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(jax.random.PRNGKey(61), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        counts_single = Counts(alignment, tree, model)
+        counts_grid = Counts(alignment, tree, [[model] * R] * C)
+        np.testing.assert_allclose(counts_grid, counts_single, atol=1e-6)
+
+    def test_loglike_matches_column_by_column(self):
+        """(C, R) grid LogLike matches column-by-column computation."""
+        tree = _make_medium_tree(3)
+        R = tree.parentIndex.shape[0]
+        C = 3
+        alignment = jax.random.randint(jax.random.PRNGKey(62), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        grid = [
+            [scale_model(base, 0.5 + 0.1 * c + 0.2 * r) for r in range(R)]
+            for c in range(C)
+        ]
+
+        ll_grid = LogLike(alignment, tree, grid)
+        ll_ref = jnp.array([
+            LogLike(alignment[:, c:c+1], tree, [grid[c]])[0]
+            for c in range(C)
+        ])
+        np.testing.assert_allclose(ll_grid, ll_ref, atol=1e-8)
+
+    def test_counts_matches_column_by_column(self):
+        """(C, R) grid Counts matches column-by-column computation."""
+        tree = _make_medium_tree(3)
+        R = tree.parentIndex.shape[0]
+        C = 3
+        alignment = jax.random.randint(jax.random.PRNGKey(63), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        grid = [
+            [scale_model(base, 0.5 + 0.1 * c + 0.2 * r) for r in range(R)]
+            for c in range(C)
+        ]
+
+        counts_grid = Counts(alignment, tree, grid)
+        counts_ref = jnp.concatenate([
+            Counts(alignment[:, c:c+1], tree, [grid[c]])
+            for c in range(C)
+        ], axis=-1)
+        np.testing.assert_allclose(counts_grid, counts_ref, atol=1e-6)
+
+    def test_broadcast_matches_explicit(self):
+        """(1, R) gives same as (C, R) with same row repeated."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(jax.random.PRNGKey(64), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        models_row = [scale_model(base, 0.5 + 0.2 * r) for r in range(R)]
+
+        ll_1r = LogLike(alignment, tree, [models_row])
+        ll_cr = LogLike(alignment, tree, [models_row] * C)
+        np.testing.assert_allclose(ll_1r, ll_cr, atol=1e-8)
+
+    def test_branch_counts_matches_column_by_column(self):
+        """(C, R) grid BranchCounts matches column-by-column."""
+        tree = _make_medium_tree(3)
+        R = tree.parentIndex.shape[0]
+        C = 3
+        alignment = jax.random.randint(jax.random.PRNGKey(65), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        grid = [
+            [scale_model(base, 0.5 + 0.1 * c + 0.2 * r) for r in range(R)]
+            for c in range(C)
+        ]
+
+        bc_grid = BranchCounts(alignment, tree, grid)
+        bc_ref = jnp.concatenate([
+            BranchCounts(alignment[:, c:c+1], tree, [grid[c]])
+            for c in range(C)
+        ], axis=-1)
+        np.testing.assert_allclose(bc_grid, bc_ref, atol=1e-6)
+
+    def test_rootprob_sums_to_one(self):
+        """RootProb sums to 1 with (C, R) grid."""
+        tree = _make_medium_tree(3)
+        R = tree.parentIndex.shape[0]
+        C = 3
+        alignment = jax.random.randint(jax.random.PRNGKey(66), (R, C), 0, 4).astype(jnp.int32)
+
+        base = jukes_cantor_model(4)
+        grid = [
+            [scale_model(base, 0.5 + 0.1 * c + 0.2 * r) for r in range(R)]
+            for c in range(C)
+        ]
+
+        rp = RootProb(alignment, tree, grid)
+        assert rp.shape == (4, C)
+        np.testing.assert_allclose(jnp.sum(rp, axis=0), 1.0, atol=1e-4)
+
+    def test_insideoutside_rejects_grid(self):
+        """InsideOutside raises NotImplementedError for model grids."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 4
+        alignment = jax.random.randint(jax.random.PRNGKey(67), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        with pytest.raises(NotImplementedError):
+            InsideOutside(alignment, tree, [[model] * R])
+
+
 class TestMixturePosterior:
 
     def test_posteriors_sum_to_one(self):

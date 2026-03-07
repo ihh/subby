@@ -16,6 +16,9 @@ from .eigensub import (
     compute_J_complex, eigenbasis_project_irrev, accumulate_C_complex, back_transform_irrev,
     accumulate_C_per_branch, back_transform_per_branch,
     accumulate_C_complex_per_branch, back_transform_irrev_per_branch,
+    compute_J_per_row, compute_J_per_row_complex,
+    eigenbasis_project_per_row, eigenbasis_project_per_row_irrev,
+    back_transform_per_row, back_transform_per_row_irrev,
 )
 from ._utils import pad_alignment, unpad_columns
 from .f81_fast import f81_counts, f81_counts_per_branch
@@ -41,6 +44,98 @@ def _ensure_diag(model: AnyModel) -> AnyDiagModel:
 def _is_model_list(model) -> bool:
     """Check if model is a list/tuple of models (per-column)."""
     return isinstance(model, (list, tuple)) and len(model) > 0 and not isinstance(model, (Tree, DiagModel, IrrevDiagModel, RateModel))
+
+
+def _is_model_grid(model) -> bool:
+    """Check if model is a 2D list of models (per-column-per-row grid).
+
+    A model grid is a list of lists: model[c][r] gives the model for
+    column c, row (branch) r.  Shape (C, R) or (1, R).
+    """
+    if not isinstance(model, (list, tuple)) or len(model) == 0:
+        return False
+    first = model[0]
+    # Model NamedTuples are tuples but not grids
+    if isinstance(first, (DiagModel, IrrevDiagModel, RateModel)):
+        return False
+    return isinstance(first, (list, tuple))
+
+
+def _compute_sub_matrices_per_row(
+    models_row: list[AnyDiagModel], distances: jnp.ndarray, is_irrev: bool,
+) -> jnp.ndarray:
+    """Compute substitution matrices where each branch has its own model.
+
+    Args:
+        models_row: list of R DiagModel or IrrevDiagModel
+        distances: (R,) branch lengths
+        is_irrev: True for irreversible models
+
+    Returns:
+        (R, A, A) substitution matrices
+    """
+    eigenvalues = jnp.stack([m.eigenvalues for m in models_row])  # (R, A)
+    V = jnp.stack([m.eigenvectors for m in models_row])           # (R, A, A)
+
+    exp_mu_t = jnp.exp(eigenvalues * distances[:, None])          # (R, A)
+
+    if is_irrev:
+        V_inv = jnp.stack([m.eigenvectors_inv for m in models_row])
+        M = jnp.einsum('rak,rk,rkj->raj', V, exp_mu_t, V_inv)
+        return M.real
+    else:
+        pi = jnp.stack([m.pi for m in models_row])
+        S = jnp.einsum('rak,rk,rbk->rab', V, exp_mu_t, V)
+        sqrt_pi = jnp.sqrt(pi)
+        M = S * (1.0 / sqrt_pi)[:, :, None] * sqrt_pi[:, None, :]
+        return M
+
+
+def _branch_counts_per_row(
+    alignment: jnp.ndarray,
+    tree: Tree,
+    models_row: list[AnyDiagModel],
+    maxChunkSize: int = 128,
+) -> jnp.ndarray:
+    """Compute per-branch counts where each branch has its own model.
+
+    Args:
+        alignment: (R, C) int32 tokens
+        tree: Tree
+        models_row: list of R diagonalized models
+
+    Returns:
+        (R, A, A, C) per-branch counts (branch 0 = zeros)
+    """
+    R = alignment.shape[0]
+    assert len(models_row) == R
+    is_irrev = isinstance(models_row[0], IrrevDiagModel)
+
+    eigenvalues_row = jnp.stack([m.eigenvalues for m in models_row])
+    V_row = jnp.stack([m.eigenvectors for m in models_row])
+    pi_row = jnp.stack([m.pi for m in models_row])
+
+    subMatrices = _compute_sub_matrices_per_row(models_row, tree.distanceToParent, is_irrev)
+    rootProb = pi_row[0]
+
+    U, logNormU, logLike = upward_pass(alignment, tree, subMatrices, rootProb, maxChunkSize)
+    D, logNormD = downward_pass(U, logNormU, tree, subMatrices, rootProb, alignment)
+
+    if is_irrev:
+        V_inv_row = jnp.stack([m.eigenvectors_inv for m in models_row])
+        J = compute_J_per_row_complex(eigenvalues_row, tree.distanceToParent)
+        U_tilde, D_tilde = eigenbasis_project_per_row_irrev(U, D, V_row, V_inv_row)
+        C_pb = accumulate_C_per_branch(
+            D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree.parentIndex,
+        )
+        return back_transform_per_row_irrev(C_pb, V_row, V_inv_row, eigenvalues_row)
+    else:
+        J = compute_J_per_row(eigenvalues_row, tree.distanceToParent)
+        U_tilde, D_tilde = eigenbasis_project_per_row(U, D, V_row, pi_row)
+        C_pb = accumulate_C_per_branch(
+            D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree.parentIndex,
+        )
+        return back_transform_per_row(C_pb, V_row, eigenvalues_row)
 
 
 def _stack_models(models: list[AnyModel]) -> tuple[AnyDiagModel, bool]:
@@ -111,13 +206,62 @@ def LogLike(
     Args:
         alignment: (R, C) int32 tokens
         tree: Tree
-        model: DiagModel, IrrevDiagModel, RateModel, or list of models
-            (one per column, len must equal C)
+        model: DiagModel, IrrevDiagModel, RateModel, list of C models
+            (per-column), or list of lists (model grid):
+            - ``[[m0, m1, ..., m_{R-1}]]`` — (1, R) per-row, broadcast to all columns
+            - ``[[...], [...], ...]`` — (C, R) per-column-per-row
         maxChunkSize: chunk columns for memory
 
     Returns:
         (*H, C) log-likelihoods
     """
+    if _is_model_grid(model):
+        grid = model
+        C_grid = len(grid)
+        R, C = alignment.shape
+
+        if C_grid == 1:
+            # (1, R): per-row, broadcast to all columns
+            models_row = [_ensure_diag(m) for m in grid[0]]
+            assert len(models_row) == R, f"Expected {R} per-row models, got {len(models_row)}"
+            is_irrev = isinstance(models_row[0], IrrevDiagModel)
+            subMatrices = _compute_sub_matrices_per_row(
+                models_row, tree.distanceToParent, is_irrev
+            )
+            rootProb = models_row[0].pi
+            _, _, logLike = upward_pass(
+                alignment, tree, subMatrices, rootProb, maxChunkSize
+            )
+            return logLike
+        else:
+            # (C, R): per-column-per-row
+            assert C_grid == C, f"Model grid has {C_grid} columns but alignment has {C}"
+            grid_diag = [[_ensure_diag(m) for m in grid[c]] for c in range(C)]
+            is_irrev = isinstance(grid_diag[0][0], IrrevDiagModel)
+            sub_cols = []
+            for c in range(C):
+                assert len(grid_diag[c]) == R
+                M_c = _compute_sub_matrices_per_row(
+                    grid_diag[c], tree.distanceToParent, is_irrev
+                )
+                sub_cols.append(M_c)  # (R, A, A)
+            subMatrices = jnp.stack(sub_cols, axis=1)  # (R, C, A, A)
+
+            # Upward pass with per_column=True; rootProb is a dummy for the pass
+            # (U and logNormU don't depend on rootProb)
+            rootProb_dummy = grid_diag[0][0].pi
+            U, logNormU, _ = upward_pass(
+                alignment, tree, subMatrices, rootProb_dummy, maxChunkSize,
+                per_column=True,
+            )
+            # Recompute logLike with correct per-column rootProb
+            rootProb_per_col = jnp.stack([grid_diag[c][0].pi for c in range(C)])
+            root_like = U[..., 0, :, :]  # (*H, C, A)
+            logLike = logNormU[..., 0, :] + jnp.log(
+                jnp.sum(root_like * rootProb_per_col, axis=-1)
+            )
+            return logLike
+
     if _is_model_list(model):
         stacked, is_irrev = _stack_models(model)
         subMatrices = _compute_sub_matrices_per_column(
@@ -190,6 +334,40 @@ def Counts(
     Returns:
         (*H, A, A, C) counts tensor (diag=dwell, off-diag=substitution counts)
     """
+    if _is_model_grid(model):
+        grid = model
+        C_grid = len(grid)
+        R, C = alignment.shape
+
+        if C_grid == 1:
+            # (1, R): per-row, broadcast to all columns
+            models_row = [_ensure_diag(m) for m in grid[0]]
+            assert len(models_row) == R, f"Expected {R} per-row models, got {len(models_row)}"
+            assert not f81_fast_flag, "F81 fast path not supported with per-row models"
+
+            if isinstance(branch_mask, str) and branch_mask == "auto":
+                from .components import compute_branch_mask
+                A = models_row[0].pi.shape[-1]
+                branch_mask = compute_branch_mask(alignment, tree.parentIndex, A)
+
+            bc = _branch_counts_per_row(alignment, tree, models_row, maxChunkSize)
+            if branch_mask is not None:
+                bc = bc * branch_mask[:, None, None, :]
+            return jnp.sum(bc, axis=0)
+        else:
+            # (C, R): per-column-per-row
+            assert C_grid == C, f"Model grid has {C_grid} columns but alignment has {C}"
+            results = []
+            for c in range(C):
+                col_counts = Counts(
+                    alignment[:, c:c+1], tree, [grid[c]],
+                    maxChunkSize=maxChunkSize,
+                    f81_fast_flag=f81_fast_flag,
+                    branch_mask=branch_mask[..., c:c+1] if branch_mask is not None and not isinstance(branch_mask, str) else branch_mask,
+                )
+                results.append(col_counts)
+            return jnp.concatenate(results, axis=-1)
+
     if _is_model_list(model):
         # Per-column models: compute column-by-column since the eigensub
         # pipeline requires model fields to align with *H batch dims,
@@ -269,6 +447,29 @@ def BranchCounts(
         (*H, R, A, A, C) per-branch counts (diag=dwell, off-diag=substitutions).
         Branch 0 (root) is zeros.
     """
+    if _is_model_grid(model):
+        grid = model
+        C_grid = len(grid)
+        R, C = alignment.shape
+
+        if C_grid == 1:
+            # (1, R): per-row, broadcast to all columns
+            models_row = [_ensure_diag(m) for m in grid[0]]
+            assert len(models_row) == R
+            assert not f81_fast_flag, "F81 fast path not supported with per-row models"
+            return _branch_counts_per_row(alignment, tree, models_row, maxChunkSize)
+        else:
+            # (C, R): per-column-per-row
+            assert C_grid == C
+            results = []
+            for c in range(C):
+                col_bc = BranchCounts(
+                    alignment[:, c:c+1], tree, [grid[c]],
+                    maxChunkSize=maxChunkSize, f81_fast_flag=f81_fast_flag,
+                )
+                results.append(col_bc)
+            return jnp.concatenate(results, axis=-1)
+
     if _is_model_list(model):
         models_diag = [_ensure_diag(m) for m in model]
         C = alignment.shape[1]
@@ -335,6 +536,60 @@ def RootProb(
     Returns:
         (*H, A, C) posterior root distribution
     """
+    if _is_model_grid(model):
+        grid = model
+        C_grid = len(grid)
+        R, C = alignment.shape
+
+        if C_grid == 1:
+            # (1, R): per-row, broadcast to all columns
+            models_row = [_ensure_diag(m) for m in grid[0]]
+            assert len(models_row) == R
+            is_irrev = isinstance(models_row[0], IrrevDiagModel)
+            subMatrices = _compute_sub_matrices_per_row(
+                models_row, tree.distanceToParent, is_irrev
+            )
+            rootProb = models_row[0].pi
+            U, logNormU, logLike = upward_pass(
+                alignment, tree, subMatrices, rootProb, maxChunkSize
+            )
+            root_U = U[..., 0, :, :]
+            log_scale = logNormU[..., 0, :] - logLike
+            scale = jnp.exp(log_scale)
+            q = rootProb[..., None, :] * root_U * scale[..., None]
+            q = jnp.moveaxis(q, -1, -2)
+            return q
+        else:
+            # (C, R): per-column-per-row — vectorize via upward pass
+            assert C_grid == C
+            grid_diag = [[_ensure_diag(m) for m in grid[c]] for c in range(C)]
+            is_irrev = isinstance(grid_diag[0][0], IrrevDiagModel)
+            sub_cols = []
+            for c in range(C):
+                assert len(grid_diag[c]) == R
+                M_c = _compute_sub_matrices_per_row(
+                    grid_diag[c], tree.distanceToParent, is_irrev
+                )
+                sub_cols.append(M_c)
+            subMatrices = jnp.stack(sub_cols, axis=1)  # (R, C, A, A)
+
+            rootProb_dummy = grid_diag[0][0].pi
+            U, logNormU, _ = upward_pass(
+                alignment, tree, subMatrices, rootProb_dummy, maxChunkSize,
+                per_column=True,
+            )
+            rootProb_per_col = jnp.stack([grid_diag[c][0].pi for c in range(C)])
+            root_like = U[..., 0, :, :]
+            logLike = logNormU[..., 0, :] + jnp.log(
+                jnp.sum(root_like * rootProb_per_col, axis=-1)
+            )
+            root_U = root_like
+            log_scale = logNormU[..., 0, :] - logLike
+            scale = jnp.exp(log_scale)
+            q = rootProb_per_col * root_U * scale[..., None]
+            q = jnp.moveaxis(q, -1, -2)
+            return q
+
     if _is_model_list(model):
         stacked, is_irrev = _stack_models(model)
         subMatrices = _compute_sub_matrices_per_column(
@@ -432,6 +687,12 @@ class InsideOutside:
         self._alignment = alignment
         self._tree = tree
         self._maxChunkSize = maxChunkSize
+
+        if _is_model_grid(model):
+            raise NotImplementedError(
+                "InsideOutside does not support model grids (2D model arrays). "
+                "Use LogLike, Counts, BranchCounts, RootProb directly."
+            )
 
         if _is_model_list(model):
             stacked, is_irrev = _stack_models(model)

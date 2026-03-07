@@ -76,10 +76,21 @@ Compute per-column log-likelihoods via Felsenstein pruning.
 |------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
 | `tree` | `Tree` | Phylogenetic tree |
-| `model` | `DiagModel`, `RateModel`, or `list` | Substitution model (or list of C models for per-column rates) |
+| `model` | `DiagModel`, `RateModel`, list, or grid | Substitution model (see below) |
 | `maxChunkSize` | `int` | Column chunk size for memory control |
 
 **Returns:** `(*H, C)` float array of log-likelihoods.
+
+**Model parameter forms:**
+
+| Form | Description |
+|------|-------------|
+| Single model | Same model for all columns and branches |
+| `[m_0, m_1, ..., m_{C-1}]` | Per-column: each column uses its own model |
+| `[[m_0, m_1, ..., m_{R-1}]]` | (1, R) per-row: each branch uses its own model, broadcast to all columns |
+| `[[...], [...], ...]` (C lists of R) | (C, R) grid: different model at every column and branch |
+
+The (1, R) form broadcasts the same per-branch configuration to all columns. The (C, R) form allows fully independent models at every (column, branch) pair.
 
 When `model` is a list of C models, each column uses its own substitution model (per-column substitution matrices). This enables position-specific rates, e.g., from a neural network predicting rates per site.
 
@@ -162,9 +173,9 @@ Compute expected substitution counts and dwell times per column.
 |------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
 | `tree` | `Tree` | Phylogenetic tree |
-| `model` | `DiagModel`, `RateModel`, or `list` | Substitution model (or list of C models for per-column rates) |
+| `model` | model, list, or grid | Substitution model (same forms as `LogLike`) |
 | `maxChunkSize` | `int` | Column chunk size |
-| `f81_fast_flag` | `bool` | Use $O(CRA^2)$ fast path (F81/JC only) |
+| `f81_fast_flag` | `bool` | Use $O(CRA^2)$ fast path (F81/JC only; not with per-row models) |
 
 **Returns:** `(*H, A, A, C)` float tensor. Diagonal entries are dwell times $E[w_i(c)]$; off-diagonal entries are substitution counts $E[s_{ij}(c)]$.
 
@@ -178,9 +189,9 @@ Compute per-branch expected substitution counts and dwell times per column. Retu
 |------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
 | `tree` | `Tree` | Phylogenetic tree |
-| `model` | `DiagModel`, `RateModel`, or `list` | Substitution model (or list of C models for per-column rates) |
+| `model` | model, list, or grid | Substitution model (same forms as `LogLike`) |
 | `maxChunkSize` | `int` | Column chunk size |
-| `f81_fast_flag` | `bool` | Use $O(CRA^2)$ fast path (F81/JC only) |
+| `f81_fast_flag` | `bool` | Use $O(CRA^2)$ fast path (F81/JC only; not with per-row models) |
 
 **Returns:** `(*H, R, A, A, C)` float tensor. Branch 0 (root) is zeros. Diagonal entries are dwell times; off-diagonal entries are substitution counts. Summing over the `R` axis recovers `Counts`.
 
@@ -239,7 +250,7 @@ $$q_a(c) = \frac{\pi_a \cdot U^{(0)}_a(c)}{P(x_c)}$$
 |------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
 | `tree` | `Tree` | Phylogenetic tree |
-| `model` | `DiagModel`, `RateModel`, or `list` | Substitution model (or list of C models for per-column rates) |
+| `model` | model, list, or grid | Substitution model (same forms as `LogLike`) |
 | `maxChunkSize` | `int` | Column chunk size |
 
 **Returns:** `(*H, A, C)` float array. Sums to 1 over the $A$ dimension for each column.
