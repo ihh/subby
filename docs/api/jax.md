@@ -138,6 +138,77 @@ for step in range(500):
 
 See [`examples/conv_rate_prediction.py`](https://github.com/ihh/subby/blob/main/examples/conv_rate_prediction.py) for a complete runnable script that simulates an alignment with slow/fast columns and trains the CNN to recover the rate pattern.
 
+**Example — fitting per-branch transition/transversion ratio:**
+
+Each branch of the tree can have its own kappa (transition/transversion ratio) while sharing the same equilibrium frequencies. Wrap R models in a single-element list `[[m_0, ..., m_{R-1}]]` to create a (1, R) per-row grid.
+
+```python
+import jax
+import jax.numpy as jnp
+import numpy as np
+from scipy.optimize import minimize
+from subby.jax import LogLike, BranchCounts
+from subby.jax.types import Tree
+from subby.jax.models import hky85_diag
+
+# Star tree: 4 leaves, all branches directly from root
+tree = Tree(
+    parentIndex=jnp.array([-1, 0, 0, 0, 0], dtype=jnp.int32),
+    distanceToParent=jnp.array([0.0, 0.15, 0.25, 0.1, 0.2]),
+)
+R, A = 5, 4
+pi = jnp.array([0.3, 0.2, 0.25, 0.25])
+
+# --- Simulate 10000 columns with known per-branch kappas ---
+true_kappas = [2.0, 1.5, 4.0, 0.8, 3.0]
+C = 10000
+key = jax.random.PRNGKey(42)
+
+# Substitution matrix M(t) = exp(Q*t) from eigendecomposition
+def sub_matrix(model, t):
+    V, mu = model.eigenvectors, model.eigenvalues
+    S = jnp.einsum('ak,k,bk->ab', V, jnp.exp(mu * t), V)
+    sp = jnp.sqrt(model.pi)
+    return S * (1.0 / sp)[:, None] * sp[None, :]
+
+true_models = [hky85_diag(k, pi) for k in true_kappas]
+Ms = [sub_matrix(true_models[r], float(tree.distanceToParent[r]))
+      for r in range(R)]
+
+# Propagate states root → leaves
+key, k1 = jax.random.split(key)
+states = [jax.random.categorical(k1, jnp.log(pi), shape=(C,))]
+for n in range(1, R):
+    key, k = jax.random.split(key)
+    states.append(jax.random.categorical(
+        k, jnp.log(jnp.clip(Ms[n], 1e-30))[states[0]], axis=-1,
+    ))
+
+# Alignment: leaves observed, root unobserved (token A)
+alignment = jnp.stack([jnp.full(C, A, dtype=jnp.int32)] +
+                       [states[n] for n in range(1, R)])
+
+# --- Fit kappa per branch by maximum likelihood ---
+def neg_ll(log_kappas):
+    models = [hky85_diag(float(np.exp(lk)), pi) for lk in log_kappas]
+    return -float(jnp.sum(LogLike(alignment, tree, [models])))
+
+result = minimize(neg_ll, x0=np.log(2.0) * np.ones(R), method='Nelder-Mead')
+fitted_kappas = np.exp(result.x)
+
+# Branch 0 (root, t=0) is unidentifiable; leaf branches recover true values
+for r in range(1, R):
+    print(f"Branch {r}: true κ={true_kappas[r]:.1f}, fitted κ={fitted_kappas[r]:.2f}")
+# Branch 1: true κ=1.5, fitted κ≈1.36
+# Branch 2: true κ=4.0, fitted κ≈3.75
+# Branch 3: true κ=0.8, fitted κ≈0.88
+# Branch 4: true κ=3.0, fitted κ≈2.74
+
+# Per-branch substitution counts at the fitted values
+models_row = [hky85_diag(k, pi) for k in fitted_kappas]
+bc = BranchCounts(alignment, tree, [models_row])  # (R, 4, 4, C)
+```
+
 ### `LogLikeCustomGrad(alignment, tree, model, maxChunkSize=128)`
 
 Like `LogLike` but with a custom VJP for faster distance gradients.

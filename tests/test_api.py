@@ -31,6 +31,46 @@ def _make_medium_tree(n_leaves=10, key=None):
     return Tree(parentIndex=parentIndex, distanceToParent=distances)
 
 
+def _simulate_on_tree(tree, models_row, C, key):
+    """Simulate sequences on a tree with per-branch substitution models.
+
+    Returns (R, C) int32 alignment with leaves observed and internal nodes
+    set to the ungapped-unobserved token (A = alphabet size).
+    """
+    R = len(models_row)
+    A = int(models_row[0].pi.shape[0])
+    pi = models_row[0].pi
+
+    # Simulate root states
+    key, k1 = jax.random.split(key)
+    states = [jax.random.categorical(k1, jnp.log(pi), shape=(C,))]
+
+    # Propagate down tree in preorder
+    for n in range(1, R):
+        m = models_row[n]
+        t = float(tree.distanceToParent[n])
+        V, mu = m.eigenvectors, m.eigenvalues
+        S = jnp.einsum('ak,k,bk->ab', V, jnp.exp(mu * t), V)
+        sp = jnp.sqrt(m.pi)
+        M = S * (1.0 / sp)[:, None] * sp[None, :]
+
+        parent = int(tree.parentIndex[n])
+        log_M = jnp.log(jnp.clip(M, 1e-30))
+        key, subkey = jax.random.split(key)
+        child_states = jax.random.categorical(
+            subkey, log_M[states[parent]], axis=-1,
+        )
+        states.append(child_states)
+
+    # Leaves = nodes that aren't parents; internal nodes get token A
+    parent_set = set(int(tree.parentIndex[i]) for i in range(1, R))
+    alignment = jnp.stack([
+        states[n] if n not in parent_set else jnp.full(C, A, dtype=jnp.int32)
+        for n in range(R)
+    ])
+    return alignment
+
+
 class TestLogLike:
 
     def test_shape(self):
@@ -395,6 +435,41 @@ class TestPerRowModel:
         counts = Counts(alignment, tree, [models_row])
         assert counts.shape == (4, 4, C)
         assert jnp.all(counts >= -1e-10)
+
+    def test_recover_per_branch_kappa(self):
+        """Fit per-branch kappa from simulated data and recover true values."""
+        from scipy.optimize import minimize
+
+        pi = jnp.array([0.3, 0.2, 0.25, 0.25])
+        # Star tree: all non-root branches are leaf branches (maximally identifiable)
+        tree = Tree(
+            parentIndex=jnp.array([-1, 0, 0, 0, 0], dtype=jnp.int32),
+            distanceToParent=jnp.array([0.0, 0.15, 0.25, 0.1, 0.2]),
+        )
+        R = 5
+        C = 10000
+
+        true_kappas = [2.0, 1.5, 4.0, 0.8, 3.0]
+        true_models = [hky85_diag(k, pi) for k in true_kappas]
+
+        alignment = _simulate_on_tree(tree, true_models, C, jax.random.PRNGKey(42))
+
+        def neg_ll(log_kappas):
+            models = [hky85_diag(float(np.exp(lk)), pi) for lk in log_kappas]
+            return -float(jnp.sum(LogLike(alignment, tree, [models])))
+
+        result = minimize(
+            neg_ll, x0=np.log(2.0) * np.ones(R), method='Nelder-Mead',
+            options={'maxiter': 10000, 'xatol': 0.001, 'fatol': 0.01},
+        )
+        fitted_kappas = np.exp(result.x)
+
+        # Root branch (t=0) is unidentifiable; check leaf branches 1–4
+        for r in range(1, R):
+            np.testing.assert_allclose(
+                fitted_kappas[r], true_kappas[r], rtol=0.25,
+                err_msg=f"Branch {r}: fitted={fitted_kappas[r]:.2f}, true={true_kappas[r]}",
+            )
 
 
 class TestModelGrid:
