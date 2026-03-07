@@ -8,7 +8,15 @@ The oracle is a pure NumPy reference implementation using explicit for-loops. It
 
 ### Tree
 
-A plain dict:
+From a Newick string:
+
+```python
+tree_result = parse_newick("((A:0.1,B:0.2):0.05,C:0.3);")
+tree = {'parentIndex': tree_result['parentIndex'],
+        'distanceToParent': tree_result['distanceToParent']}
+```
+
+Or as a plain dict with numpy arrays:
 
 ```python
 tree = {
@@ -19,25 +27,34 @@ tree = {
 
 ### Model
 
-A plain dict:
+A plain dict (constructed via model functions below):
 
 ```python
-model = {
-    'eigenvalues': np.array([0.0, -1.333, -1.333, -1.333]),
-    'eigenvectors': V,  # (A, A) orthogonal matrix
-    'pi': np.array([0.25, 0.25, 0.25, 0.25]),
-}
+model = jukes_cantor_model(4)
+# {'eigenvalues': array([0., -1.333, -1.333, -1.333]),
+#  'eigenvectors': V,   # (4, 4) orthogonal matrix
+#  'pi': array([0.25, 0.25, 0.25, 0.25])}
 ```
 
 ### Alignment
 
-`(R, C)` int32 array with token encoding:
+Use parsers to create alignments from standard formats (see [Format parsers](#format-parsers) below):
+
+```python
+aln = parse_fasta(">A\nACGT\n>B\nTGCA\n")
+aln = parse_dict({"A": "ACGT", "B": "TGCA"})
+combined = combine_tree_alignment(tree_result, aln)
+```
+
+The resulting `(R, C)` int32 array uses this token encoding:
 
 | Token | Meaning | Likelihood vector |
 |-------|---------|-------------------|
-| `0` to `A-1` | Observed state | One-hot |
-| `A` | Ungapped, unobserved | All ones |
-| `A+1` or `-1` | Gapped | All ones |
+| `0` to `A-1` | Observed state (alphabet position) | One-hot |
+| `A` | Ungapped, unobserved (internal nodes) | All ones |
+| `A+1` or `-1` | Gapped (`-` or `.`) | All ones |
+
+Alphabet detection is automatic: DNA (`ACGT`), RNA (`ACGU`), protein (20 AAs), or sorted unique characters. Override with the `alphabet` parameter on any parser.
 
 ---
 
@@ -164,7 +181,10 @@ mask = compute_branch_mask(alignment, parentIndex, A=4)
 Standard phylogenetic file format parsers are re-exported from `subby.oracle` for convenience:
 
 ```python
-from subby.oracle import parse_newick, parse_fasta, parse_stockholm, parse_maf, parse_strings, combine_tree_alignment, detect_alphabet
+from subby.oracle import (
+    parse_newick, parse_fasta, parse_stockholm, parse_maf,
+    parse_strings, parse_dict, combine_tree_alignment, detect_alphabet,
+)
 ```
 
 ### `parse_newick(newick_str) -> dict`
@@ -194,6 +214,16 @@ Parse MAF (Multiple Alignment Format). Concatenates alignment blocks; fills gaps
 ### `parse_strings(sequences, alphabet=None) -> dict`
 
 Parse a list of equal-length strings into an alignment tensor.
+
+### `parse_dict(sequences, alphabet=None) -> dict`
+
+Parse a `{name: sequence}` dictionary into an alignment tensor.
+
+**Returns:** dict with `alignment` (int32 `(N, C)`), `leaf_names`, `alphabet`.
+
+```python
+aln = parse_dict({"human": "ACGT", "mouse": "TGCA", "dog": "GGGG"})
+```
 
 ### `combine_tree_alignment(tree_result, alignment_result) -> dict`
 

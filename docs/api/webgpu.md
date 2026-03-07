@@ -134,7 +134,15 @@ const combined = combineTreeAlignment(tree, aln);
 // combined.alignment is a flat (R*C) Int32Array ready for engine.LogLike()
 ```
 
-Also available: `parseStockholm(text)`, `parseMaf(text)`, `parseStrings(sequences)`, `detectAlphabet(chars)`.
+Also available: `parseStockholm(text)`, `parseMaf(text)`, `parseStrings(sequences)`, `parseDict(sequences)`, `detectAlphabet(chars)`.
+
+### `parseDict(sequences) -> object`
+
+Parse a `{name: sequence}` object. Returns same shape as `parseFasta`.
+
+```javascript
+const aln = parseDict({ human: 'ACGT', mouse: 'TGCA' });
+```
 
 ---
 

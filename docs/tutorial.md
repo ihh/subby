@@ -15,7 +15,7 @@ from subby.oracle import (
     compute_sub_matrices, upward_pass, downward_pass,
     compute_J, eigenbasis_project, accumulate_C, back_transform,
     compute_branch_mask, children_of,
-    parse_newick, parse_fasta, combine_tree_alignment,
+    parse_newick, parse_fasta, parse_dict, combine_tree_alignment,
 )
 ```
 
@@ -96,12 +96,24 @@ tree = {'parentIndex': combined['parentIndex'],
 
 Internal nodes are automatically filled with the ungapped-unobserved token (`A = len(alphabet)`).
 
-You can also construct the alignment tensor directly as an `(R, C)` integer array where `R` = number of tree nodes and `C` = number of columns:
+Alternatively, you can supply sequences as a dictionary:
 
 ```python
-# 5 sequences × 6 columns, Alphabet: A=0, C=1, G=2, T=3
+aln_result = parse_dict({
+    "leaf2": "CACGAA",
+    "leaf3": "ACTGCA",
+    "leaf4": "ACGAAA",
+})
+```
+
+<details>
+<summary>Advanced: constructing the alignment tensor manually</summary>
+
+Under the hood, the alignment is an `(R, C)` int32 array with integer tokens. For a DNA alphabet (A=0, C=1, G=2, T=3):
+
+```python
 alignment = np.array([
-    [0, 1, 2, 3, 0, -1],   # root (internal — typically unobserved, but can be)
+    [0, 1, 2, 3, 0, -1],   # root (internal — typically unobserved)
     [0, 1, 2, 3, 0,  4],   # internal node 1 (token 4 = ungapped-unobserved)
     [1, 0, 2, 3, 0,  0],   # leaf 2
     [0, 1, 3, 3, 1,  0],   # leaf 3
@@ -111,11 +123,12 @@ alignment = np.array([
 
 Token encoding:
 
-- `0–3`: observed nucleotide (one-hot likelihood)
-- `4` (= A): ungapped but unobserved (uniform likelihood)
-- `-1`: gapped (uniform likelihood)
+- `0–3`: observed nucleotide (maps to alphabet position)
+- `4` (= `A`, the alphabet size): ungapped but unobserved (uniform likelihood)
+- `-1` or `A+1`: gapped (uniform likelihood)
 
-Column 5 has a gap at the root and an unobserved token at node 1. The branch mask will identify which branches are informative.
+The parsers handle this conversion automatically — most users do not need to work with integer tokens directly.
+</details>
 
 ## Step 3: Choose a substitution model
 
@@ -315,12 +328,10 @@ const logLike = await engine.LogLike(
 engine.destroy();
 ```
 
-You can also construct flat typed arrays directly:
+You can also supply sequences as a dictionary:
 
 ```javascript
-const alignment = new Int32Array([0,1,2,3, 0,1,2,3, 1,0,2,3, 0,1,3,3, 0,1,2,2]);
-const parentIndex = new Int32Array([-1, 0, 0, 1, 1]);
-const distances = new Float32Array([0.0, 0.1, 0.3, 0.05, 0.15]);
+const aln = parseDict({ A: 'ACGT', B: 'TGCA', C: 'GGGG' });
 ```
 
 ## Intermediates deep dive

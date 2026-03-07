@@ -5,6 +5,7 @@ from ..formats import (
     parse_stockholm,
     parse_maf,
     parse_strings,
+    parse_dict,
     combine_tree_alignment,
 )
 

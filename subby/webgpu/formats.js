@@ -476,6 +476,54 @@ export function parseStrings(sequences, alphabet = null) {
   return { alignment, alphabet, N, C };
 }
 
+// ---- Dictionary parser ----
+
+/**
+ * Parse a name→sequence object into an alignment.
+ * @param {Object} sequences - e.g. { "human": "ACGT", "mouse": "TGCA" }
+ * @param {string[]|null} [alphabet=null]
+ * @returns {{alignment: Int32Array, leafNames: string[], alphabet: string[],
+ *            N: number, C: number}}
+ */
+export function parseDict(sequences, alphabet = null) {
+  const names = Object.keys(sequences);
+  if (names.length === 0) throw new Error('Empty sequence dictionary');
+
+  const seqs = names.map(name => sequences[name]);
+  const lengths = new Set(seqs.map(s => s.length));
+  if (lengths.size > 1) throw new Error(`Unequal sequence lengths: ${[...lengths].sort()}`);
+
+  const C = [...lengths][0];
+  if (C === 0) throw new Error('Empty sequences');
+
+  const allChars = new Set();
+  for (const s of seqs) for (const ch of s) allChars.add(ch.toUpperCase());
+  for (const g of GAP_CHARS) allChars.delete(g);
+
+  if (!alphabet) alphabet = detectAlphabet(allChars);
+
+  const charMap = buildCharMap(alphabet);
+  const gapIdx = alphabet.length + 1;
+  const N = seqs.length;
+  const alignment = new Int32Array(N * C);
+
+  for (let r = 0; r < N; r++) {
+    const seq = seqs[r];
+    for (let c = 0; c < C; c++) {
+      const ch = seq[c];
+      if (GAP_CHARS.has(ch)) {
+        alignment[r * C + c] = gapIdx;
+      } else if (charMap.has(ch)) {
+        alignment[r * C + c] = charMap.get(ch);
+      } else {
+        throw new Error(`Unknown character '${ch}' in sequence '${names[r]}' at position ${c}`);
+      }
+    }
+  }
+
+  return { alignment, leafNames: names, alphabet, N, C };
+}
+
 // ---- Combine tree + alignment ----
 
 /**

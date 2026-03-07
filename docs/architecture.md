@@ -55,13 +55,47 @@ Nodes $0 \ldots R-1$ are ordered such that node 0 is the root. Internal nodes ha
 |-------|------|-------|-------------|
 | `alignment` | int32 | `(R, C)` | Token per sequence per column |
 
-Token encoding:
+The simplest way to create an alignment is from standard formats using the built-in parsers:
+
+```python
+from subby.oracle import parse_newick, parse_fasta, parse_dict, combine_tree_alignment
+
+# From FASTA
+aln = parse_fasta(">human\nACGT\n>mouse\nTGCA\n")
+
+# From a dictionary
+aln = parse_dict({"human": "ACGT", "mouse": "TGCA"})
+
+# Combine with a tree (maps leaves by name, fills internal nodes)
+tree = parse_newick("(human:0.1,mouse:0.2);")
+combined = combine_tree_alignment(tree, aln)
+alignment = combined['alignment']  # (R, C) int32, ready for LogLike/Counts/etc.
+```
+
+#### Alphabet detection
+
+When no alphabet is specified, parsers auto-detect from the characters present:
+
+| Characters | Detected alphabet | Token order |
+|------------|-------------------|-------------|
+| Subset of `ACGT` | DNA | A=0, C=1, G=2, T=3 |
+| Subset of `ACGU` | RNA | A=0, C=1, G=2, U=3 |
+| Subset of 20 standard amino acids | Protein | A=0, C=1, D=2, ..., Y=19 |
+| Anything else | Sorted unique characters | Alphabetical order |
+
+You can override auto-detection by passing `alphabet=["A", "C", "G", "T"]` (or any list) to any parser.
+
+#### Token encoding
+
+Internally, characters are converted to integer tokens:
 
 | Token | Meaning | Likelihood vector |
 |-------|---------|-------------------|
-| `0` to `A-1` | Observed nucleotide | One-hot |
-| `A` | Ungapped, unobserved | All ones |
-| `A+1` or `-1` | Gapped | All ones |
+| `0` to `A-1` | Observed state (maps to alphabet position) | One-hot |
+| `A` | Ungapped, unobserved (used for internal tree nodes) | All ones |
+| `A+1` or `-1` | Gapped (gap characters `-` and `.`) | All ones |
+
+Users typically do not need to construct token arrays manually — the parsers handle this conversion automatically.
 
 ### Model (diagonalized)
 

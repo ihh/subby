@@ -25,31 +25,30 @@ The core algorithm is the **eigensubstitution accumulation** method of [Holmes &
 ## Quick start
 
 ```python
-import numpy as np
-from subby.oracle import LogLike, Counts, RootProb, jukes_cantor_model
+from subby.oracle import (
+    LogLike, Counts, RootProb, jukes_cantor_model,
+    parse_newick, parse_dict, combine_tree_alignment,
+)
 
-# Define a 5-node binary tree (preorder parent indices)
-tree = {
-    'parentIndex': np.array([-1, 0, 0, 1, 1], dtype=np.int32),
-    'distanceToParent': np.array([0.0, 0.1, 0.2, 0.15, 0.25]),
-}
-
-# Alignment: 5 sequences × 4 columns, nucleotides {A=0, C=1, G=2, T=3}
-alignment = np.array([
-    [0, 1, 2, 3],
-    [0, 1, 2, 3],
-    [1, 0, 3, 2],
-    [0, 1, 2, 3],
-    [0, 0, 2, 3],
-], dtype=np.int32)
+# Parse tree from Newick and sequences from a dictionary
+tree = parse_newick("((human:0.1,chimp:0.15):0.05,(mouse:0.2,rat:0.25):0.1);")
+aln = parse_dict({
+    "human": "ACGT",
+    "chimp": "ACGT",
+    "mouse": "CAGT",
+    "rat":   "AAGT",
+})
+combined = combine_tree_alignment(tree, aln)
 
 # Jukes-Cantor model (4-state, uniform equilibrium)
 model = jukes_cantor_model(4)
 
-# Compute
-log_likelihoods = LogLike(alignment, tree, model)        # (4,)
-counts = Counts(alignment, tree, model)                   # (4, 4, 4)
-root_posterior = RootProb(alignment, tree, model)          # (4, 4)
+# Compute per-column statistics
+tree_dict = {'parentIndex': combined['parentIndex'],
+             'distanceToParent': combined['distanceToParent']}
+log_likelihoods = LogLike(combined['alignment'], tree_dict, model)   # (4,)
+counts = Counts(combined['alignment'], tree_dict, model)              # (4, 4, 4)
+root_posterior = RootProb(combined['alignment'], tree_dict, model)     # (4, 4)
 ```
 
 ## Documentation

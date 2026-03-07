@@ -408,6 +408,66 @@ pub fn parse_strings(sequences: &[&str], alphabet: Option<&[char]>) -> ParsedAli
     }
 }
 
+// ---- Dictionary parser ----
+
+/// Parse a name→sequence map into an alignment tensor.
+pub fn parse_dict(
+    sequences: &std::collections::HashMap<String, String>,
+    alphabet: Option<&[char]>,
+) -> ParsedAlignment {
+    assert!(!sequences.is_empty(), "Empty sequence dictionary");
+
+    let names: Vec<String> = sequences.keys().cloned().collect();
+    let seqs: Vec<&str> = names.iter().map(|n| sequences[n].as_str()).collect();
+
+    let c = seqs[0].len();
+    for (i, s) in seqs.iter().enumerate() {
+        assert_eq!(s.len(), c, "Unequal sequence length at '{}'", names[i]);
+    }
+    assert!(c > 0, "Empty sequences");
+
+    let mut all_chars = std::collections::HashSet::new();
+    for s in &seqs {
+        for ch in s.chars() {
+            if !is_gap(ch) {
+                all_chars.insert(ch.to_ascii_uppercase());
+            }
+        }
+    }
+
+    let alpha: Vec<char> = match alphabet {
+        Some(a) => a.to_vec(),
+        None => detect_alphabet(&all_chars),
+    };
+
+    let char_map = build_char_map(&alpha);
+    let gap_idx = alpha.len() as i32 + 1;
+    let n = seqs.len();
+    let mut alignment = vec![0i32; n * c];
+
+    for (r, seq) in seqs.iter().enumerate() {
+        for (col, ch) in seq.chars().enumerate() {
+            if is_gap(ch) {
+                alignment[r * c + col] = gap_idx;
+            } else if let Some(&idx) = char_map.get(&ch) {
+                alignment[r * c + col] = idx;
+            } else if let Some(&idx) = char_map.get(&ch.to_ascii_lowercase()) {
+                alignment[r * c + col] = idx;
+            } else {
+                panic!("Unknown character '{}' in sequence '{}' at position {}", ch, names[r], col);
+            }
+        }
+    }
+
+    ParsedAlignment {
+        alignment,
+        leaf_names: names,
+        alphabet: alpha,
+        n,
+        c,
+    }
+}
+
 // ---- Combine tree + alignment ----
 
 /// Map leaf sequences to tree positions by name matching.
@@ -567,6 +627,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_parse_dict() {
+        let mut seqs = std::collections::HashMap::new();
+        seqs.insert("human".to_string(), "ACGT".to_string());
+        seqs.insert("mouse".to_string(), "TGCA".to_string());
+        let result = parse_dict(&seqs, None);
+        assert_eq!(result.n, 2);
+        assert_eq!(result.c, 4);
+        assert_eq!(result.alphabet, vec!['A', 'C', 'G', 'T']);
+        assert!(result.leaf_names.contains(&"human".to_string()));
+        assert!(result.leaf_names.contains(&"mouse".to_string()));
     }
 
     #[test]

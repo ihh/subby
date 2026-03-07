@@ -548,6 +548,67 @@ def parse_strings(sequences, alphabet=None):
 
 
 # ---------------------------------------------------------------------------
+# Dictionary parser
+# ---------------------------------------------------------------------------
+
+def parse_dict(sequences, alphabet=None):
+    """Parse a name→sequence dictionary into an alignment tensor.
+
+    Args:
+        sequences: dict mapping sequence name to string (e.g. {"human": "ACGT", ...})
+        alphabet: list of characters, or None for auto-detect
+
+    Returns:
+        dict with alignment (N, C) int32, leaf_names, alphabet
+    """
+    if not sequences:
+        raise ValueError("Empty sequence dictionary")
+
+    names = list(sequences.keys())
+    seqs = [sequences[name] for name in names]
+
+    lengths = {len(s) for s in seqs}
+    if len(lengths) > 1:
+        raise ValueError(f"Unequal sequence lengths: {sorted(lengths)}")
+
+    C = lengths.pop()
+    if C == 0:
+        raise ValueError("Empty sequences")
+
+    all_chars = set()
+    for s in seqs:
+        all_chars.update(s.upper())
+    all_chars -= _GAP_CHARS
+
+    if alphabet is None:
+        alphabet = detect_alphabet(all_chars)
+
+    char_to_idx = {ch: i for i, ch in enumerate(alphabet)}
+    for ch, i in list(char_to_idx.items()):
+        char_to_idx[ch.lower()] = i
+    gap_idx = len(alphabet) + 1
+
+    N = len(seqs)
+    alignment = np.zeros((N, C), dtype=np.int32)
+    for r, seq in enumerate(seqs):
+        for c, ch in enumerate(seq):
+            if ch in _GAP_CHARS:
+                alignment[r, c] = gap_idx
+            elif ch in char_to_idx:
+                alignment[r, c] = char_to_idx[ch]
+            else:
+                raise ValueError(
+                    f"Unknown character '{ch}' in sequence '{names[r]}' at position {c}"
+                )
+
+    return {
+        "alignment": alignment,
+        "leaf_names": names,
+        "alphabet": alphabet,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Combine tree + alignment
 # ---------------------------------------------------------------------------
 

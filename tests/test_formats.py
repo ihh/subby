@@ -10,6 +10,7 @@ from subby.formats import (
     parse_stockholm,
     parse_maf,
     parse_strings,
+    parse_dict,
     combine_tree_alignment,
 )
 
@@ -311,6 +312,59 @@ class TestParseStrings:
     def test_unequal_error(self):
         with pytest.raises(ValueError, match="Unequal"):
             parse_strings(["ACGT", "AC"])
+
+
+# ---- parse_dict ----
+
+class TestParseDict:
+    def test_simple(self):
+        result = parse_dict({"human": "ACGT", "mouse": "TGCA"})
+        assert result["alignment"].shape == (2, 4)
+        assert result["alphabet"] == list("ACGT")
+        assert set(result["leaf_names"]) == {"human", "mouse"}
+
+    def test_gaps(self):
+        result = parse_dict({"s1": "A-GT", "s2": "AC-T"})
+        A = len(result["alphabet"])
+        gap_idx = A + 1
+        # Find the row for s1
+        s1_row = result["leaf_names"].index("s1")
+        assert result["alignment"][s1_row, 1] == gap_idx
+
+    def test_empty_error(self):
+        with pytest.raises(ValueError):
+            parse_dict({})
+
+    def test_unequal_error(self):
+        with pytest.raises(ValueError, match="Unequal"):
+            parse_dict({"a": "ACGT", "b": "AC"})
+
+    def test_preserves_names(self):
+        result = parse_dict({"human": "ACGT", "mouse": "TGCA", "dog": "GGGG"})
+        assert len(result["leaf_names"]) == 3
+        assert set(result["leaf_names"]) == {"human", "mouse", "dog"}
+
+    def test_combine_with_tree(self):
+        tree = parse_newick("((human:0.1,mouse:0.2):0.05,dog:0.3);")
+        aln = parse_dict({"human": "ACGT", "mouse": "TGCA", "dog": "GGGG"})
+        result = combine_tree_alignment(tree, aln)
+        R = len(tree["parentIndex"])
+        assert result["alignment"].shape == (R, 4)
+
+    def test_pipeline_integration(self):
+        from subby.oracle import LogLike, jukes_cantor_model
+
+        tree = parse_newick("((A:0.1,B:0.2):0.05,C:0.3);")
+        aln = parse_dict({"A": "ACGT", "B": "ACGT", "C": "ACGT"})
+        combined = combine_tree_alignment(tree, aln)
+        model = jukes_cantor_model(4)
+        tree_dict = {
+            "parentIndex": combined["parentIndex"],
+            "distanceToParent": combined["distanceToParent"],
+        }
+        ll = LogLike(combined["alignment"], tree_dict, model)
+        assert ll.shape == (4,)
+        assert np.all(np.isfinite(ll))
 
 
 # ---- combine_tree_alignment ----
