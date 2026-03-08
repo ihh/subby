@@ -104,6 +104,35 @@ Release GPU resources.
 
 ---
 
+## Model constructors
+
+Model constructors are exported from `./subby/webgpu/models.js`:
+
+```javascript
+import { jukesCantor, f81, hky85, gy94, diagonalize } from './subby/webgpu/models.js';
+```
+
+### `gy94(omega, kappa, pi?)`
+
+Goldman-Yang (1994) codon substitution model. Operates on 61 sense codons.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `omega` | `number` | dN/dS ratio (Ka/Ks) |
+| `kappa` | `number` | Transition/transversion ratio |
+| `pi` | `Float64Array` or `null` | `(61,)` codon equilibrium frequencies (default: uniform $1/61$) |
+
+**Returns:** `{ eigenvalues: Float64Array, eigenvectors: Float64Array, pi: Float64Array }` with $A = 61$.
+
+```javascript
+const model = gy94(0.5, 2.0);
+// model.eigenvalues has length 61
+```
+
+Also available: `jukesCantor(A)`, `f81(pi)`, `hky85(kappa, pi)`, `diagonalize(Q, pi)`.
+
+---
+
 ## Format parsers
 
 Standard file format parsers are exported from the same module:
@@ -142,6 +171,51 @@ Parse a `{name: sequence}` object. Returns same shape as `parseFasta`.
 
 ```javascript
 const aln = parseDict({ human: 'ACGT', mouse: 'TGCA' });
+```
+
+### `geneticCode() -> object`
+
+Return the standard genetic code. Codons in ACGT lexicographic order; stop codons marked with `'*'`.
+
+**Returns:** `{ codons: string[], aminoAcids: string[], senseMask: boolean[], senseIndices: Int32Array, codonToSense: Int32Array, senseCodons: string[], senseAminoAcids: string[] }`.
+
+```javascript
+import { geneticCode } from './subby/webgpu/index.js';
+const gc = geneticCode();
+console.log(gc.senseCodons.length);  // 61
+```
+
+### `codonToSense(alignment, A?) -> object`
+
+Remap a 64-codon tokenized flat alignment to 61-sense-codon tokens. Stop codons become the gap token.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `Int32Array` | Flat token array (64-codon encoding) |
+| `A` | `number` | Input alphabet size (default 64) |
+
+**Returns:** `{ alignment: Int32Array, A_sense: 61, alphabet: string[] }`.
+
+### `kmerTokenize(alignment, N, C, A, k, gapMode?, alphabet?) -> object`
+
+Convert a single-character token alignment to k-mer tokens. Groups `k` consecutive columns into one k-mer column (non-overlapping). `C` must be divisible by `k`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `Int32Array` | Flat `(N*C)` row-major tokens |
+| `N` | `number` | Number of sequences |
+| `C` | `number` | Number of columns |
+| `A` | `number` | Single-character alphabet size |
+| `k` | `number` | k-mer size (e.g., 3 for codons) |
+| `gapMode` | `string` | `'any'` (default): gap in any position gaps the k-mer; `'all'`: only all-gap k-mers become gaps |
+| `alphabet` | `string[]` or `null` | Single-character labels for building k-mer labels |
+
+**Returns:** `{ alignment: Int32Array, Ak: number, N: number, Ck: number, alphabet?: string[] }`. Token encoding: 0..$A^k - 1$ for observed k-mers, $A^k$ for ungapped-unobserved, $A^k + 1$ for gap.
+
+```javascript
+import { kmerTokenize } from './subby/webgpu/index.js';
+const kmer = kmerTokenize(dnaAlignment, 3, 9, 4, 3, 'any', ['A','C','G','T']);
+// kmer.alignment has Ak=64, Ck=3
 ```
 
 ---

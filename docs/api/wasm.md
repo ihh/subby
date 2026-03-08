@@ -92,6 +92,101 @@ Discretized gamma rate categories.
 
 Scale eigenvalues by a rate multiplier.
 
+### `eig_symmetric(s: &mut [f64], a: usize) -> (Vec<f64>, Vec<f64>)`
+
+Cyclic Jacobi eigendecomposition for a symmetric matrix. Computes eigenvalues and eigenvectors in-place.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `s` | `&mut [f64]` | Flat `(a*a)` row-major symmetric matrix (modified in-place) |
+| `a` | `usize` | Matrix dimension |
+
+**Returns:** `(eigenvalues, eigenvectors)` — eigenvalues as `Vec<f64>` of length `a`, eigenvectors as `Vec<f64>` of length `a*a` (row-major, `v[i*a+k]` = component $i$ of eigenvector $k$).
+
+### `diagonalize_rate_matrix(sub_rate: &[f64], pi: &[f64]) -> DiagModel`
+
+Diagonalize a reversible rate matrix via symmetrization and Jacobi eigendecomposition. Symmetrizes $Q$ as $S_{ij} = Q_{ij} \sqrt{\pi_i} / \sqrt{\pi_j}$, then computes eigenvalues/eigenvectors of $S$.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `sub_rate` | `&[f64]` | Flat `(A*A)` row-major rate matrix $Q$ |
+| `pi` | `&[f64]` | `(A,)` equilibrium distribution |
+
+**Returns:** `DiagModel`.
+
+### `gy94_model(omega: f64, kappa: f64, pi: Option<&[f64]>) -> DiagModel`
+
+Goldman-Yang (1994) codon substitution model. Operates on 61 sense codons.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `omega` | `f64` | dN/dS ratio (Ka/Ks) |
+| `kappa` | `f64` | Transition/transversion ratio |
+| `pi` | `Option<&[f64]>` | `(61,)` codon equilibrium frequencies (`None` = uniform $1/61$) |
+
+**Returns:** `DiagModel` with $A = 61$ states.
+
+---
+
+## Format utilities
+
+### `GeneticCode`
+
+```rust
+pub struct GeneticCode {
+    pub codons: Vec<String>,           // 64 codon strings
+    pub amino_acids: Vec<char>,        // 64 amino acid letters (stop = '*')
+    pub sense_mask: Vec<bool>,         // (64,) true for sense codons
+    pub sense_indices: Vec<usize>,     // (61,) indices of sense codons in 0..63
+    pub codon_to_sense: Vec<i32>,      // (64,) maps codon idx to sense idx (stop -> -1)
+    pub sense_codons: Vec<String>,     // 61 sense codon strings
+    pub sense_amino_acids: Vec<char>,  // 61 amino acid letters
+}
+```
+
+### `genetic_code() -> GeneticCode`
+
+Return the standard genetic code. Codons in ACGT lexicographic order; stop codons (TAA, TAG, TGA) marked with `'*'`.
+
+### `codon_to_sense(alignment: &[i32], n: usize, c: usize, a: usize) -> Vec<i32>`
+
+Remap a 64-codon tokenized flat alignment to 61-sense-codon tokens. Stop codons become the gap token.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `&[i32]` | Flat `(n*c)` row-major tokens (64-codon encoding) |
+| `n` | `usize` | Number of sequences |
+| `c` | `usize` | Number of columns |
+| `a` | `usize` | Input codon alphabet size (64) |
+
+**Returns:** `Vec<i32>` of length `n*c` with $A_\text{sense} = 61$ tokens.
+
+### `KmerResult`
+
+```rust
+pub struct KmerResult {
+    pub alignment: Vec<i32>,  // flat (n * c_k) tokens
+    pub a_kmer: usize,        // A^k
+    pub n: usize,             // number of sequences
+    pub c_k: usize,           // C / k columns
+}
+```
+
+### `kmer_tokenize(alignment: &[i32], n: usize, c: usize, a: usize, k: usize, gap_mode: &str) -> KmerResult`
+
+Convert single-character tokens to k-mer tokens. Groups `k` consecutive columns into one k-mer column (non-overlapping). `c` must be divisible by `k`.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `&[i32]` | Flat `(n*c)` row-major tokens |
+| `n` | `usize` | Number of sequences |
+| `c` | `usize` | Number of columns |
+| `a` | `usize` | Single-character alphabet size |
+| `k` | `usize` | k-mer size (e.g., 3 for codons) |
+| `gap_mode` | `&str` | `"any"`: gap in any position gaps the k-mer; `"all"`: only all-gap k-mers become gaps |
+
+**Returns:** `KmerResult`. Token encoding: 0..$A^k - 1$ for observed k-mers, $A^k$ for ungapped-unobserved, $A^k + 1$ for gap.
+
 ---
 
 ## Internal modules
@@ -99,7 +194,7 @@ Scale eigenvalues by a rate multiplier.
 | Module | Functions |
 |--------|-----------|
 | `tree` | `children_of`, `validate_binary_tree` |
-| `model` | Model constructors, `DiagModel` |
+| `model` | Model constructors, `DiagModel`, `eig_symmetric`, `diagonalize_rate_matrix`, `gy94_model` |
 | `token` | `token_to_likelihood` |
 | `sub_matrices` | `compute_sub_matrices` |
 | `pruning` | `upward_pass` |
@@ -108,7 +203,7 @@ Scale eigenvalues by a rate multiplier.
 | `f81_fast` | `f81_counts` |
 | `mixture` | `mixture_posterior` |
 | `branch_mask` | `compute_branch_mask` |
-| `formats` | `parse_newick`, `parse_fasta`, `parse_strings`, `combine_tree_alignment`, `detect_alphabet` |
+| `formats` | `parse_newick`, `parse_fasta`, `parse_strings`, `combine_tree_alignment`, `detect_alphabet`, `genetic_code`, `codon_to_sense`, `kmer_tokenize` |
 
 ---
 

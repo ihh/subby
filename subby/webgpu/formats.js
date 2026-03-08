@@ -584,3 +584,176 @@ export function combineTreeAlignment(treeResult, alignmentResult) {
     C,
   };
 }
+
+// ---- Genetic code helpers ----
+
+/**
+ * Return the standard genetic code: 64 codons, sense/stop classification,
+ * and mapping from 64-codon indices to 61-sense-codon indices.
+ * @returns {{codons: string[], aminoAcids: string[], senseMask: boolean[],
+ *            senseIndices: Int32Array, codonToSense: Int32Array,
+ *            senseCodons: string[], senseAminoAcids: string[]}}
+ */
+export function geneticCode() {
+  const bases = ['A', 'C', 'G', 'T'];
+  const codons = [];
+  for (const b1 of bases)
+    for (const b2 of bases)
+      for (const b3 of bases)
+        codons.push(b1 + b2 + b3);
+
+  const codeTable = {
+    'AAA':'K','AAC':'N','AAG':'K','AAT':'N',
+    'ACA':'T','ACC':'T','ACG':'T','ACT':'T',
+    'AGA':'R','AGC':'S','AGG':'R','AGT':'S',
+    'ATA':'I','ATC':'I','ATG':'M','ATT':'I',
+    'CAA':'Q','CAC':'H','CAG':'Q','CAT':'H',
+    'CCA':'P','CCC':'P','CCG':'P','CCT':'P',
+    'CGA':'R','CGC':'R','CGG':'R','CGT':'R',
+    'CTA':'L','CTC':'L','CTG':'L','CTT':'L',
+    'GAA':'E','GAC':'D','GAG':'E','GAT':'D',
+    'GCA':'A','GCC':'A','GCG':'A','GCT':'A',
+    'GGA':'G','GGC':'G','GGG':'G','GGT':'G',
+    'GTA':'V','GTC':'V','GTG':'V','GTT':'V',
+    'TAA':'*','TAC':'Y','TAG':'*','TAT':'Y',
+    'TCA':'S','TCC':'S','TCG':'S','TCT':'S',
+    'TGA':'*','TGC':'C','TGG':'W','TGT':'C',
+    'TTA':'L','TTC':'F','TTG':'L','TTT':'F',
+  };
+
+  const aminoAcids = codons.map(c => codeTable[c]);
+  const senseMask = aminoAcids.map(aa => aa !== '*');
+  const senseIndices = [];
+  const codonToSenseMap = new Int32Array(64).fill(-1);
+  let senseIdx = 0;
+  for (let i = 0; i < 64; i++) {
+    if (senseMask[i]) {
+      senseIndices.push(i);
+      codonToSenseMap[i] = senseIdx++;
+    }
+  }
+  const senseCodons = senseIndices.map(i => codons[i]);
+  const senseAminoAcids = senseIndices.map(i => aminoAcids[i]);
+
+  return {
+    codons, aminoAcids, senseMask,
+    senseIndices: new Int32Array(senseIndices),
+    codonToSense: codonToSenseMap,
+    senseCodons, senseAminoAcids,
+  };
+}
+
+// ---- Codon-to-sense remapping ----
+
+/**
+ * Remap a 64-codon tokenized alignment to 61-sense-codon tokens.
+ * Stop codons are mapped to gap.
+ * @param {Int32Array} alignment - flat token array (64-codon encoding)
+ * @param {number} [A=64] - input alphabet size (64 for full codons)
+ * @returns {{alignment: Int32Array, A_sense: number, alphabet: string[]}}
+ */
+export function codonToSense(alignment, A = 64) {
+  const gc = geneticCode();
+  const codonMap = gc.codonToSense;
+  const N = alignment.length;
+  const ASense = 61;
+  const unobsIn = A;        // 64
+  const gapIn = A + 1;      // 65
+  const unobsOut = ASense;   // 61
+  const gapOut = ASense + 1; // 62
+
+  const result = new Int32Array(N);
+  for (let i = 0; i < N; i++) {
+    const tok = alignment[i];
+    if (tok >= 0 && tok < 64) {
+      result[i] = codonMap[tok] >= 0 ? codonMap[tok] : gapOut;
+    } else if (tok === unobsIn) {
+      result[i] = unobsOut;
+    } else {
+      result[i] = gapOut;
+    }
+  }
+  return { alignment: result, A_sense: ASense, alphabet: gc.senseCodons };
+}
+
+// ---- K-mer tokenization ----
+
+/**
+ * Convert single-character token alignment to k-mer tokens.
+ * Groups k consecutive columns into one k-mer column (non-overlapping).
+ * C must be divisible by k.
+ *
+ * Token encoding: 0..A^k-1 observed, A^k ungapped-unobserved, A^k+1 gap.
+ * When gapMode='all', partial gaps produce illegal token (A^k+2).
+ *
+ * @param {Int32Array} alignment - flat (N*C) token array
+ * @param {number} N - number of sequences
+ * @param {number} C - number of columns
+ * @param {number} A - single-character alphabet size
+ * @param {number} k - k-mer size (e.g. 3 for codons)
+ * @param {string} [gapMode='any'] - 'any' or 'all'
+ * @param {string[]|null} [alphabet=null] - single-char labels for k-mer labels
+ * @returns {{alignment: Int32Array, A_kmer: number, N: number, C_k: number,
+ *            alphabet: string[]|null}}
+ */
+export function kmerTokenize(alignment, N, C, A, k, gapMode = 'any', alphabet = null) {
+  if (C % k !== 0) throw new Error(`Number of columns (${C}) not divisible by k (${k})`);
+  const Ck = C / k;
+  const Ak = Math.pow(A, k);
+  const gapTok = Ak + 1;
+  const unobsTok = Ak;
+  const illegalTok = Ak + 2;
+
+  const result = new Int32Array(N * Ck);
+
+  for (let n = 0; n < N; n++) {
+    for (let ck = 0; ck < Ck; ck++) {
+      const base = n * C + ck * k;
+      let allObs = true, allUnobs = true, hasGap = false, allGap = true;
+      let kmerIdx = 0;
+      for (let p = 0; p < k; p++) {
+        const tok = alignment[base + p];
+        const isObs = tok >= 0 && tok < A;
+        const isUnobs = tok === A;
+        const isGap = tok < 0 || tok > A;
+        if (!isObs) allObs = false;
+        if (!isUnobs) allUnobs = false;
+        if (isGap) hasGap = true;
+        if (!isGap) allGap = false;
+        if (isObs) kmerIdx = kmerIdx * A + tok;
+        else kmerIdx = kmerIdx * A;
+      }
+
+      const outIdx = n * Ck + ck;
+      if (allObs) {
+        result[outIdx] = kmerIdx;
+      } else if (gapMode === 'any' && hasGap) {
+        result[outIdx] = gapTok;
+      } else if (gapMode === 'all' && allGap) {
+        result[outIdx] = gapTok;
+      } else if (gapMode === 'all' && hasGap) {
+        result[outIdx] = illegalTok;
+      } else {
+        result[outIdx] = unobsTok;
+      }
+    }
+  }
+
+  let kmerAlphabet = null;
+  if (alphabet !== null) {
+    kmerAlphabet = [];
+    const indices = new Array(k).fill(0);
+    for (let i = 0; i < Ak; i++) {
+      let label = '';
+      let val = i;
+      for (let p = k - 1; p >= 0; p--) {
+        indices[p] = val % A;
+        val = Math.floor(val / A);
+      }
+      for (let p = 0; p < k; p++) label += alphabet[indices[p]];
+      kmerAlphabet.push(label);
+    }
+  }
+
+  return { alignment: result, A_kmer: Ak, N, C_k: Ck, alphabet: kmerAlphabet };
+}

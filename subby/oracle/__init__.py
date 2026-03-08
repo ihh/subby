@@ -8,6 +8,10 @@ from ..formats import (
     parse_dict,
     combine_tree_alignment,
     kmer_tokenize,
+    genetic_code,
+    codon_to_sense,
+    split_paired_columns,
+    merge_paired_columns,
 )
 
 from .oracle import (
@@ -43,6 +47,7 @@ from .oracle import (
     irrev_model_from_rate_matrix,
     model_from_rate_matrix,
     check_detailed_balance,
+    gy94_model,
     compute_sub_matrices_irrev,
     compute_J_complex,
     eigenbasis_project_irrev,

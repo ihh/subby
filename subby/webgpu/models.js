@@ -552,3 +552,93 @@ export function diagonalizeAuto(Q, pi, tol = 1e-10) {
   }
   return reversible ? diagonalize(Q, pi) : diagonalizeIrreversible(Q, pi);
 }
+
+/**
+ * Goldman-Yang 1994 (GY94) codon model.
+ * Builds a 61x61 rate matrix over sense codons with transition/transversion
+ * ratio kappa and nonsynonymous/synonymous ratio omega.
+ * @param {number} omega - dN/dS ratio
+ * @param {number} kappa - transition/transversion ratio
+ * @param {number[]|Float64Array|null} [pi=null] - equilibrium frequencies (length 61); uniform if null
+ * @returns {{ eigenvalues: Float64Array, eigenvectors: Float64Array, pi: Float64Array }}
+ */
+export function gy94(omega, kappa, pi = null) {
+  const A = 61;
+  if (pi === null) {
+    pi = new Float64Array(A).fill(1 / A);
+  }
+  const piArr = new Float64Array(pi);
+
+  // Build codon table
+  const bases = ['A', 'C', 'G', 'T'];
+  const codons = [];
+  for (const b1 of bases)
+    for (const b2 of bases)
+      for (const b3 of bases)
+        codons.push(b1 + b2 + b3);
+
+  const codeTable = {
+    'AAA':'K','AAC':'N','AAG':'K','AAT':'N',
+    'ACA':'T','ACC':'T','ACG':'T','ACT':'T',
+    'AGA':'R','AGC':'S','AGG':'R','AGT':'S',
+    'ATA':'I','ATC':'I','ATG':'M','ATT':'I',
+    'CAA':'Q','CAC':'H','CAG':'Q','CAT':'H',
+    'CCA':'P','CCC':'P','CCG':'P','CCT':'P',
+    'CGA':'R','CGC':'R','CGG':'R','CGT':'R',
+    'CTA':'L','CTC':'L','CTG':'L','CTT':'L',
+    'GAA':'E','GAC':'D','GAG':'E','GAT':'D',
+    'GCA':'A','GCC':'A','GCG':'A','GCT':'A',
+    'GGA':'G','GGC':'G','GGG':'G','GGT':'G',
+    'GTA':'V','GTC':'V','GTG':'V','GTT':'V',
+    'TAA':'*','TAC':'Y','TAG':'*','TAT':'Y',
+    'TCA':'S','TCC':'S','TCG':'S','TCT':'S',
+    'TGA':'*','TGC':'C','TGG':'W','TGT':'C',
+    'TTA':'L','TTC':'F','TTG':'L','TTT':'F',
+  };
+
+  const aminoAcids = codons.map(c => codeTable[c]);
+  const senseIndices = [];
+  for (let i = 0; i < 64; i++) if (aminoAcids[i] !== '*') senseIndices.push(i);
+
+  const transitions = new Set(['AG', 'GA', 'CT', 'TC']);
+
+  // Build Q matrix (61x61)
+  const Q = new Float64Array(A * A);
+  for (let si = 0; si < A; si++) {
+    const idxI = senseIndices[si];
+    const codonI = codons[idxI];
+    const aaI = aminoAcids[idxI];
+    for (let sj = 0; sj < A; sj++) {
+      if (si === sj) continue;
+      const idxJ = senseIndices[sj];
+      const codonJ = codons[idxJ];
+      // Count nucleotide differences
+      let ndiff = 0, diffNucI = '', diffNucJ = '';
+      for (let p = 0; p < 3; p++) {
+        if (codonI[p] !== codonJ[p]) { ndiff++; diffNucI = codonI[p]; diffNucJ = codonJ[p]; }
+      }
+      if (ndiff !== 1) continue;
+      const isTs = transitions.has(diffNucI + diffNucJ);
+      const aaJ = aminoAcids[idxJ];
+      const isNonsyn = aaI !== aaJ;
+      let rate = piArr[sj];
+      if (isTs) rate *= kappa;
+      if (isNonsyn) rate *= omega;
+      Q[si * A + sj] = rate;
+    }
+  }
+
+  // Set diagonal so rows sum to zero
+  for (let i = 0; i < A; i++) {
+    let rowSum = 0;
+    for (let j = 0; j < A; j++) rowSum += Q[i * A + j];
+    Q[i * A + i] = -rowSum;
+  }
+
+  // Normalize so expected rate = 1
+  let expectedRate = 0;
+  for (let i = 0; i < A; i++) expectedRate -= piArr[i] * Q[i * A + i];
+  for (let i = 0; i < A * A; i++) Q[i] /= expectedRate;
+
+  return diagonalize(Q, piArr);
+}

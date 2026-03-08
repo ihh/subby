@@ -23,13 +23,15 @@ from .eigensub import (
 from ._utils import pad_alignment, unpad_columns
 from .f81_fast import f81_counts, f81_counts_per_branch
 from .mixture import mixture_posterior
-from .vjp import make_loglike_custom_grad
+from .vjp import make_loglike_custom_grad, make_loglike_pade_grad, _extract_rate_matrix
 from .models import (
     hky85_diag, jukes_cantor_model, f81_model,
     gamma_rate_categories, scale_model,
     irrev_model_from_rate_matrix, model_from_rate_matrix,
+    gy94_model,
 )
 from .ctmc import ExpectedCounts, expected_counts_eigen, expected_counts_eigen_irrev
+from .presets import cherryml_siteRM
 
 
 def _ensure_diag(model: AnyModel) -> AnyDiagModel:
@@ -287,27 +289,42 @@ def LogLikeCustomGrad(
     tree: Tree,
     model: AnyModel,
     maxChunkSize: int = 128,
+    method: str = 'eigen',
 ) -> jnp.ndarray:
     """Like LogLike but with custom VJP for faster distance gradients.
 
-    Uses the Fisher identity: the gradient of log-likelihood w.r.t. branch
-    lengths equals a contraction of expected substitution counts, which can
-    be computed via the downward pass + eigenbasis projection without tracing
-    through the full computation graph.
+    Two methods are available:
 
-    Same signature and output as LogLike. Only the backward pass differs.
+    - ``'eigen'`` (default): Uses eigenbasis projection. The backward pass
+      projects inside/outside vectors into the eigenbasis and contracts with
+      μ_k·exp(μ_k·t). Requires eigendecomposition of the rate matrix.
+
+    - ``'pade'``: Uses Padé matrix exponential (``jax.scipy.linalg.expm``)
+      for the forward pass and Q·M(t) contraction for the backward pass.
+      Avoids eigendecomposition entirely.
+
+    Both methods compute the same gradient with the same asymptotic
+    complexity O(CRA²). They differ in constant factors.
 
     Args:
         alignment: (R, C) int32 tokens
         tree: Tree
         model: DiagModel, IrrevDiagModel, or RateModel
         maxChunkSize: chunk columns for memory
+        method: 'eigen' or 'pade'
 
     Returns:
         (*H, C) log-likelihoods
     """
-    model = _ensure_diag(model)
-    f = make_loglike_custom_grad(model, alignment, tree.parentIndex, maxChunkSize)
+    if method == 'pade':
+        Q, pi = _extract_rate_matrix(
+            model if isinstance(model, (DiagModel, IrrevDiagModel, RateModel))
+            else _ensure_diag(model)
+        )
+        f = make_loglike_pade_grad(Q, pi, alignment, tree.parentIndex, maxChunkSize)
+    else:
+        model = _ensure_diag(model)
+        f = make_loglike_custom_grad(model, alignment, tree.parentIndex, maxChunkSize)
     return f(tree.distanceToParent)
 
 

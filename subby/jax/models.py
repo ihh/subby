@@ -186,6 +186,51 @@ def scale_model(model: DiagModel, rate_multiplier: float | jnp.ndarray) -> DiagM
     return DiagModel(eigenvalues=eigenvalues, eigenvectors=eigenvectors, pi=pi)
 
 
+def gy94_model(omega: float, kappa: float, pi: jnp.ndarray = None) -> DiagModel:
+    """Goldman-Yang (1994) codon substitution model.
+
+    Operates on 61 sense codons. Rate matrix:
+      Q_ij = 0 if codons differ at more than 1 nucleotide position
+      Q_ij = pi_j * kappa^(is_transition) * omega^(is_nonsynonymous)
+      Q_ii = -sum_{j != i} Q_ij
+      Normalized so -sum_i pi_i Q_ii = 1.
+
+    Args:
+        omega: dN/dS ratio (Ka/Ks)
+        kappa: transition/transversion ratio
+        pi: (61,) codon equilibrium frequencies (default: uniform 1/61)
+
+    Returns:
+        DiagModel with A=61 states
+    """
+    from subby.oracle.oracle import _gy94_codon_neighbors
+    A = 61
+    if pi is None:
+        pi = jnp.ones(A, dtype=jnp.float64) / A
+    pi = jnp.asarray(pi, dtype=jnp.float64)
+
+    neighbors = _gy94_codon_neighbors()
+
+    Q = jnp.zeros((A, A), dtype=jnp.float64)
+    for si, sj, is_ts, is_nonsyn in neighbors:
+        rate = float(pi[sj])
+        if is_ts:
+            rate *= kappa
+        if is_nonsyn:
+            rate *= omega
+        Q = Q.at[si, sj].set(rate)
+
+    # Set diagonal
+    row_sums = jnp.sum(Q, axis=1)
+    Q = Q - jnp.diag(row_sums)
+
+    # Normalize: -sum_i pi_i Q_ii = 1
+    expected_rate = -jnp.sum(pi * jnp.diag(Q))
+    Q = Q / expected_rate
+
+    return diagonalize_rate_matrix_auto(Q, pi, reversible=True)
+
+
 def irrev_model_from_rate_matrix(subRate: jnp.ndarray, pi: jnp.ndarray) -> IrrevDiagModel:
     """Construct an IrrevDiagModel from a (possibly irreversible) rate matrix.
 

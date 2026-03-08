@@ -143,6 +143,32 @@ rates, weights = gamma_rate_categories(alpha=0.5, K=4)
 # weights: [0.25, 0.25, 0.25, 0.25]
 ```
 
+### `gy94_model(omega, kappa, pi=None)`
+
+Goldman-Yang (1994) codon substitution model. Operates on 61 sense codons.
+
+Rate matrix:
+- $Q_{ij} = 0$ if codons differ at more than 1 nucleotide position
+- $Q_{ij} = \pi_j \cdot \kappa^{\mathbb{1}[\text{transition}]} \cdot \omega^{\mathbb{1}[\text{nonsynonymous}]}$
+- Diagonal: $Q_{ii} = -\sum_{j \neq i} Q_{ij}$
+- Normalized so $-\sum_i \pi_i Q_{ii} = 1$
+
+This is reversible ($\pi_i Q_{ij} = \pi_j Q_{ji}$), so uses symmetric eigendecomposition.
+
+```python
+model = gy94_model(omega=0.5, kappa=2.0)
+# {'eigenvalues': ..., 'eigenvectors': ..., 'pi': ..., 'reversible': True}
+# A=61 sense codons
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `omega` | scalar | dN/dS ratio (Ka/Ks) |
+| `kappa` | scalar | Transition/transversion ratio |
+| `pi` | `(61,)` or `None` | Codon equilibrium frequencies (default: uniform $1/61$) |
+
+**Returns:** dict with `eigenvalues`, `eigenvectors`, `pi`, `reversible: True`. $A = 61$ states.
+
 ### `scale_model(model, rate_multiplier)`
 
 Scale eigenvalues by a rate multiplier (scalar).
@@ -240,6 +266,29 @@ ll = LogLike(combined['alignment'],
               'distanceToParent': combined['distanceToParent']},
              jukes_cantor_model(4))
 ```
+
+### `genetic_code() -> dict`
+
+Return the standard genetic code. Codons in ACGT lexicographic order; stop codons (TAA=48, TAG=50, TGA=56) marked with `'*'`.
+
+**Returns:** dict with `codons` (64 strings), `amino_acids` (64 letters), `sense_mask` (64 bools), `sense_indices` (61 ints), `codon_to_sense` (64 ints, stop -> -1), `sense_codons` (61 strings), `sense_amino_acids` (61 letters).
+
+```python
+from subby.formats import genetic_code
+gc = genetic_code()
+print(len(gc['sense_codons']))  # 61
+```
+
+### `codon_to_sense(alignment, A=64) -> dict`
+
+Remap a 64-codon tokenized alignment to 61-sense-codon tokens. Stop codons become the gap token.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `int32 (N, C)` | Tokens 0..63 for codons, 64 unobserved, 65 gap |
+| `A` | `int` | Input codon alphabet size (default 64) |
+
+**Returns:** dict with `alignment` (int32 `(N, C)` with $A_\text{sense} = 61$), `A_sense`, `alphabet`.
 
 ---
 

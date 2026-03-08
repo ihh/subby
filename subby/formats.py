@@ -695,6 +695,258 @@ def kmer_tokenize(alignment, A, k, gap_mode='any', alphabet=None):
 
 
 # ---------------------------------------------------------------------------
+# Genetic code helpers
+# ---------------------------------------------------------------------------
+
+_STANDARD_GENETIC_CODE = {
+    'AAA': 'K', 'AAC': 'N', 'AAG': 'K', 'AAT': 'N',
+    'ACA': 'T', 'ACC': 'T', 'ACG': 'T', 'ACT': 'T',
+    'AGA': 'R', 'AGC': 'S', 'AGG': 'R', 'AGT': 'S',
+    'ATA': 'I', 'ATC': 'I', 'ATG': 'M', 'ATT': 'I',
+    'CAA': 'Q', 'CAC': 'H', 'CAG': 'Q', 'CAT': 'H',
+    'CCA': 'P', 'CCC': 'P', 'CCG': 'P', 'CCT': 'P',
+    'CGA': 'R', 'CGC': 'R', 'CGG': 'R', 'CGT': 'R',
+    'CTA': 'L', 'CTC': 'L', 'CTG': 'L', 'CTT': 'L',
+    'GAA': 'E', 'GAC': 'D', 'GAG': 'E', 'GAT': 'D',
+    'GCA': 'A', 'GCC': 'A', 'GCG': 'A', 'GCT': 'A',
+    'GGA': 'G', 'GGC': 'G', 'GGG': 'G', 'GGT': 'G',
+    'GTA': 'V', 'GTC': 'V', 'GTG': 'V', 'GTT': 'V',
+    'TAA': '*', 'TAC': 'Y', 'TAG': '*', 'TAT': 'Y',
+    'TCA': 'S', 'TCC': 'S', 'TCG': 'S', 'TCT': 'S',
+    'TGA': '*', 'TGC': 'C', 'TGG': 'W', 'TGT': 'C',
+    'TTA': 'L', 'TTC': 'F', 'TTG': 'L', 'TTT': 'F',
+}
+
+
+def genetic_code():
+    """Return the standard genetic code as a structured dict.
+
+    Codons are in ACGT lexicographic order (AAA, AAC, AAG, ..., TTT).
+    Stop codons (TAA=48, TAG=50, TGA=56) are marked with '*'.
+
+    Returns:
+        dict with:
+            codons: list of 64 codon strings
+            amino_acids: list of 64 amino acid letters (stop = '*')
+            sense_mask: (64,) bool — True for sense codons
+            sense_indices: (61,) int — indices of sense codons in 0..63
+            codon_to_sense: (64,) int — maps codon index to sense index (stop → -1)
+            sense_codons: list of 61 sense codon strings
+            sense_amino_acids: list of 61 amino acid letters
+    """
+    from itertools import product as itertools_product
+    bases = list("ACGT")
+    codons = [''.join(combo) for combo in itertools_product(bases, repeat=3)]
+    amino_acids = [_STANDARD_GENETIC_CODE[c] for c in codons]
+
+    sense_mask = np.array([aa != '*' for aa in amino_acids], dtype=bool)
+    sense_indices = np.where(sense_mask)[0].astype(np.int64)
+
+    codon_to_sense_map = np.full(64, -1, dtype=np.int64)
+    sense_idx = 0
+    for i in range(64):
+        if sense_mask[i]:
+            codon_to_sense_map[i] = sense_idx
+            sense_idx += 1
+
+    sense_codons = [codons[i] for i in sense_indices]
+    sense_amino_acids = [amino_acids[i] for i in sense_indices]
+
+    return {
+        'codons': codons,
+        'amino_acids': amino_acids,
+        'sense_mask': sense_mask,
+        'sense_indices': sense_indices,
+        'codon_to_sense': codon_to_sense_map,
+        'sense_codons': sense_codons,
+        'sense_amino_acids': sense_amino_acids,
+    }
+
+
+def codon_to_sense(alignment, A=64):
+    """Remap a 64-codon tokenized alignment to 61-sense-codon tokens.
+
+    Stop codons become the gap token. Unobserved and gap tokens are
+    remapped to the new alphabet size.
+
+    Args:
+        alignment: (N, C) int32 with tokens 0..63 for codons,
+                   64 for ungapped-unobserved, 65 (or A+1) for gap
+        A: codon alphabet size (default 64)
+
+    Returns:
+        dict with:
+            alignment: (N, C) int32 with A_sense=61-state tokens
+            A_sense: 61
+            alphabet: list of 61 sense codon strings
+    """
+    alignment = np.asarray(alignment, dtype=np.int32)
+    gc = genetic_code()
+    codon_map = gc['codon_to_sense']  # (64,) int, stop → -1
+
+    unobs_in = A       # 64
+    gap_in = A + 1     # 65
+
+    A_sense = 61
+    unobs_out = A_sense       # 61
+    gap_out = A_sense + 1     # 62
+
+    result = np.full_like(alignment, unobs_out)
+    for i in range(64):
+        mask = alignment == i
+        if codon_map[i] >= 0:
+            result[mask] = codon_map[i]
+        else:
+            result[mask] = gap_out  # stop → gap
+
+    result[alignment == unobs_in] = unobs_out
+    result[(alignment == gap_in) | (alignment < 0)] = gap_out
+
+    return {
+        'alignment': result,
+        'A_sense': A_sense,
+        'alphabet': gc['sense_codons'],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Paired-column helpers (for site-pair coevolution models)
+# ---------------------------------------------------------------------------
+
+def split_paired_columns(alignment, paired_columns, A=20):
+    """Split an alignment into paired and single-column alignments.
+
+    For coevolution models that operate on pairs of columns (e.g. CherryML
+    SiteRM with A=400 = 20x20 amino acid pairs).
+
+    Args:
+        alignment: (N, C) int32 with A-state tokens (0..A-1 observed,
+                   A ungapped-unobserved, A+1 gap)
+        paired_columns: list of (col_i, col_j) tuples
+        A: single-column alphabet size (default 20 for amino acids)
+
+    Returns:
+        dict with:
+            paired_alignment: (N, P) int32 with A_paired = A*A states
+            singles_alignment: (N, S) int32 with A_singles = A states
+            paired_columns: list of (int, int) — echoed back
+            single_columns: list of int — columns not in any pair
+            A_paired: A*A
+            A_singles: A
+    """
+    alignment = np.asarray(alignment, dtype=np.int32)
+    N, C = alignment.shape
+
+    unobs = A
+    gap = A + 1
+    A_paired = A * A
+    unobs_paired = A_paired
+    gap_paired = A_paired + 1
+
+    # Determine which columns are in pairs
+    paired_set = set()
+    for ci, cj in paired_columns:
+        paired_set.add(ci)
+        paired_set.add(cj)
+    single_columns = [c for c in range(C) if c not in paired_set]
+
+    P = len(paired_columns)
+    S = len(single_columns)
+
+    # Build paired alignment
+    paired_aln = np.full((N, P), unobs_paired, dtype=np.int32)
+    for p, (ci, cj) in enumerate(paired_columns):
+        ti = alignment[:, ci]
+        tj = alignment[:, cj]
+
+        obs_i = (ti >= 0) & (ti < A)
+        obs_j = (tj >= 0) & (tj < A)
+        unobs_i = ti == unobs
+        unobs_j = tj == unobs
+        gap_i = (ti == gap) | (ti < 0)
+        gap_j = (tj == gap) | (tj < 0)
+
+        # Both observed → paired token
+        both_obs = obs_i & obs_j
+        paired_aln[both_obs, p] = ti[both_obs] * A + tj[both_obs]
+
+        # Either is gap → paired gap
+        any_gap = gap_i | gap_j
+        paired_aln[any_gap, p] = gap_paired
+
+        # Either is unobserved (but no gap) → paired unobserved
+        any_unobs = (unobs_i | unobs_j) & ~any_gap
+        paired_aln[any_unobs, p] = unobs_paired
+
+    # Build singles alignment
+    singles_aln = alignment[:, single_columns].copy() if S > 0 else np.zeros((N, 0), dtype=np.int32)
+
+    return {
+        'paired_alignment': paired_aln,
+        'singles_alignment': singles_aln,
+        'paired_columns': list(paired_columns),
+        'single_columns': single_columns,
+        'A_paired': A_paired,
+        'A_singles': A,
+    }
+
+
+def merge_paired_columns(paired_posterior, singles_posterior, split_info):
+    """Reassemble per-column posteriors from paired and single results.
+
+    Marginalizes the A_paired=A*A dimensional paired posteriors into
+    two A-dimensional single-column posteriors, then reassembles into
+    the original column order.
+
+    Args:
+        paired_posterior: (A_paired, P) array — posterior for paired columns
+        singles_posterior: (A_singles, S) array — posterior for single columns
+        split_info: dict from split_paired_columns
+
+    Returns:
+        (A, C) array — posterior for all columns in original order
+    """
+    paired_posterior = np.asarray(paired_posterior, dtype=np.float64)
+    singles_posterior = np.asarray(singles_posterior, dtype=np.float64)
+
+    paired_columns = split_info['paired_columns']
+    single_columns = split_info['single_columns']
+    A = split_info['A_singles']
+    A_paired = split_info['A_paired']
+
+    P = len(paired_columns)
+    S = len(single_columns)
+    C = 2 * P + S  # total columns (each pair contributes 2)
+
+    # Determine total number of original columns
+    all_cols = set()
+    for ci, cj in paired_columns:
+        all_cols.add(ci)
+        all_cols.add(cj)
+    for c in single_columns:
+        all_cols.add(c)
+    C_total = max(all_cols) + 1 if all_cols else 0
+
+    result = np.zeros((A, C_total), dtype=np.float64)
+
+    # Marginalize paired posteriors
+    for p, (ci, cj) in enumerate(paired_columns):
+        # paired_posterior[:, p] is (A*A,) with state (i,j) = i*A+j
+        pair_post = paired_posterior[:, p]  # (A*A,)
+        pair_2d = pair_post[:A_paired].reshape(A, A)
+        # Marginalize over j → posterior for column i
+        result[:, ci] = pair_2d.sum(axis=1)
+        # Marginalize over i → posterior for column j
+        result[:, cj] = pair_2d.sum(axis=0)
+
+    # Copy singles
+    for s_idx, c in enumerate(single_columns):
+        result[:, c] = singles_posterior[:, s_idx]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Combine tree + alignment
 # ---------------------------------------------------------------------------
 

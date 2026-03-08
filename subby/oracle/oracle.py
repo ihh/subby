@@ -382,6 +382,92 @@ def model_from_rate_matrix(subRate, pi, reversible=None, tol=1e-10):
 
 
 # ---------------------------------------------------------------------------
+# 6b2. Goldman-Yang (GY94) codon substitution model
+# ---------------------------------------------------------------------------
+
+def _gy94_codon_neighbors():
+    """Precompute single-nucleotide codon neighbor relationships.
+
+    Returns:
+        list of (i, j, is_transition, is_nonsynonymous) for all pairs of
+        sense codons differing at exactly one nucleotide position.
+    """
+    from subby.formats import genetic_code
+    gc = genetic_code()
+    sense_indices = gc['sense_indices']
+    codons = gc['codons']
+    amino_acids = gc['amino_acids']
+
+    transitions = {('A', 'G'), ('G', 'A'), ('C', 'T'), ('T', 'C')}
+
+    neighbors = []
+    for si, idx_i in enumerate(sense_indices):
+        codon_i = codons[idx_i]
+        aa_i = amino_acids[idx_i]
+        for sj, idx_j in enumerate(sense_indices):
+            if si == sj:
+                continue
+            codon_j = codons[idx_j]
+            # Count nucleotide differences
+            diffs = [(p, codon_i[p], codon_j[p]) for p in range(3) if codon_i[p] != codon_j[p]]
+            if len(diffs) != 1:
+                continue
+            _, nuc_i, nuc_j = diffs[0]
+            is_ts = (nuc_i, nuc_j) in transitions
+            aa_j = amino_acids[idx_j]
+            is_nonsyn = aa_i != aa_j
+            neighbors.append((si, sj, is_ts, is_nonsyn))
+    return neighbors
+
+
+def gy94_model(omega, kappa, pi=None):
+    """Goldman-Yang (1994) codon substitution model.
+
+    Operates on 61 sense codons. Rate matrix:
+      Q_ij = 0 if codons differ at more than 1 nucleotide position
+      Q_ij = pi_j * kappa^(is_transition) * omega^(is_nonsynonymous)
+      Q_ii = -sum_{j != i} Q_ij
+      Normalized so -sum_i pi_i Q_ii = 1.
+
+    This is reversible (pi_i Q_ij = pi_j Q_ji), so uses symmetric
+    eigendecomposition.
+
+    Args:
+        omega: dN/dS ratio (Ka/Ks)
+        kappa: transition/transversion ratio
+        pi: (61,) codon equilibrium frequencies (default: uniform 1/61)
+
+    Returns:
+        dict with 'eigenvalues', 'eigenvectors', 'pi', 'reversible': True
+    """
+    A = 61
+    if pi is None:
+        pi = np.ones(A, dtype=np.float64) / A
+    pi = np.asarray(pi, dtype=np.float64)
+
+    neighbors = _gy94_codon_neighbors()
+
+    Q = np.zeros((A, A), dtype=np.float64)
+    for si, sj, is_ts, is_nonsyn in neighbors:
+        rate = pi[sj]
+        if is_ts:
+            rate *= kappa
+        if is_nonsyn:
+            rate *= omega
+        Q[si, sj] = rate
+
+    # Set diagonal
+    for i in range(A):
+        Q[i, i] = -np.sum(Q[i, :])
+
+    # Normalize: -sum_i pi_i Q_ii = 1
+    expected_rate = -np.sum(pi * np.diag(Q))
+    Q /= expected_rate
+
+    return diagonalize_rate_matrix(Q, pi)
+
+
+# ---------------------------------------------------------------------------
 # 6c. Irreversible substitution matrices
 # ---------------------------------------------------------------------------
 

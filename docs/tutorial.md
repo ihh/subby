@@ -367,3 +367,148 @@ check *= np.exp(logNormD[n, c] + logNormU[n, c])
 print(f"Sum-product: {check:.6e}, P(x): {np.exp(logLike[c]):.6e}")
 # These should be equal (up to numerical precision)
 ```
+
+## Step 11: Codon models (GY94)
+
+Codon-level substitution models capture selection at the protein level. The Goldman-Yang (1994) model parameterizes the rate of codon substitution in terms of:
+
+- **omega** ($\omega = dN/dS$): the ratio of nonsynonymous to synonymous substitution rates
+- **kappa** ($\kappa$): the transition/transversion ratio
+
+The workflow is: tokenize a DNA alignment into codons via `kmer_tokenize`, remap stop codons to gaps via `codon_to_sense`, build a GY94 model, and compute log-likelihoods.
+
+```python
+from subby.formats import (
+    parse_fasta, kmer_tokenize, codon_to_sense, genetic_code,
+    combine_tree_alignment, parse_newick,
+)
+from subby.jax.models import gy94_model
+from subby.jax import LogLike, Counts
+from subby.jax.types import Tree
+
+# Parse a DNA alignment (9 nucleotides = 3 codons per sequence)
+dna_aln = parse_fasta(">seq1\nATGGCCAAA\n>seq2\nATGGCTAAG\n>seq3\nATGGCAAAA\n")
+print(f"DNA alignment: {dna_aln['alignment'].shape}")
+# DNA alignment: (3, 9) — 3 sequences, 9 columns
+
+# Tokenize into codons (k=3, A=4 for DNA)
+codon_aln = kmer_tokenize(dna_aln['alignment'], A=4, k=3, alphabet=list("ACGT"))
+print(f"Codon alignment: {codon_aln['alignment'].shape}, A_kmer={codon_aln['A_kmer']}")
+# Codon alignment: (3, 3), A_kmer=64 — 3 sequences, 3 codon columns
+
+# Remap to 61 sense codons (stop codons become gaps)
+sense_aln = codon_to_sense(codon_aln['alignment'], A=64)
+print(f"Sense alignment: A_sense={sense_aln['A_sense']}")
+# Sense alignment: A_sense=61
+
+# Build tree and combine
+tree_result = parse_newick("((seq1:0.1,seq2:0.2):0.05,seq3:0.3);")
+combined = combine_tree_alignment(tree_result, {
+    'alignment': sense_aln['alignment'],
+    'leaf_names': dna_aln['leaf_names'],
+    'alphabet': sense_aln['alphabet'],
+})
+
+tree = Tree(
+    parentIndex=combined['parentIndex'],
+    distanceToParent=combined['distanceToParent'],
+)
+
+# Build GY94 model (omega < 1 = purifying selection, kappa > 1 = transition bias)
+model = gy94_model(omega=0.5, kappa=2.0)
+
+# Compute per-codon log-likelihoods
+ll = LogLike(combined['alignment'], tree, model)
+print(f"Log-likelihoods: {ll}")
+# 3 values, one per codon column
+
+# Compute expected substitution counts (61 x 61 x 3 tensor)
+counts = Counts(combined['alignment'], tree, model)
+print(f"Counts shape: {counts.shape}")
+# (61, 61, 3) — substitution counts and dwell times per codon column
+```
+
+The `genetic_code()` function provides the mapping between codons and amino acids:
+
+```python
+gc = genetic_code()
+print(f"Sense codons: {gc['sense_codons'][:5]}...")
+# ['AAA', 'AAC', 'AAG', 'AAT', 'ACA']...
+print(f"Amino acids:  {gc['sense_amino_acids'][:5]}...")
+# ['K', 'N', 'K', 'N', 'T']...
+print(f"Stop codons at indices: TAA={gc['codon_to_sense'][48]}, "
+      f"TAG={gc['codon_to_sense'][50]}, TGA={gc['codon_to_sense'][56]}")
+# Stop codons at indices: TAA=-1, TAG=-1, TGA=-1
+```
+
+## Step 12: Ancestral reconstruction with site-pair coevolution
+
+Structurally contacting residues in a protein coevolve: substitutions at one site shift the fitness landscape at the other. The CherryML SiteRM model captures this with a $400 \times 400$ rate matrix over amino acid pairs ($20 \times 20$). To use it:
+
+1. Start with an amino acid MSA and a contact map (list of contacting column pairs)
+2. Split the alignment into paired ($A = 400$) and singles ($A = 20$) sub-alignments
+3. Compute posteriors for each
+4. Merge the results back into the original column order
+
+```python
+import numpy as np
+from subby.formats import (
+    parse_fasta, parse_newick, combine_tree_alignment,
+    split_paired_columns, merge_paired_columns,
+)
+from subby.jax import RootProb
+from subby.jax.types import Tree
+from subby.jax.models import jukes_cantor_model
+from subby.jax.presets import cherryml_siteRM
+
+# Amino acid MSA (5 columns)
+aln = parse_fasta(">seq1\nMKAIL\n>seq2\nMRAVL\n>seq3\nMKAVL\n")
+tree_result = parse_newick("((seq1:0.1,seq2:0.2):0.05,seq3:0.3);")
+combined = combine_tree_alignment(tree_result, aln)
+
+alignment = combined['alignment']   # (R, 5) int32
+tree = Tree(
+    parentIndex=combined['parentIndex'],
+    distanceToParent=combined['distanceToParent'],
+)
+
+# Contact map: columns 1-3 and columns 2-4 are in contact
+paired_columns = [(1, 3), (2, 4)]
+
+# Split into paired (400-state) and singles (20-state) alignments
+split = split_paired_columns(alignment, paired_columns, A=20)
+print(f"Paired alignment: {split['paired_alignment'].shape}, "
+      f"A_paired={split['A_paired']}")
+# Paired alignment: (R, 2), A_paired=400
+print(f"Singles alignment: {split['singles_alignment'].shape}, "
+      f"A_singles={split['A_singles']}")
+# Singles alignment: (R, 1), A_singles=20
+print(f"Single columns: {split['single_columns']}")
+# Single columns: [0]  (column 0 is not in any pair)
+
+# Load CherryML site-pair model (400 states)
+model_400 = cherryml_siteRM()
+
+# Single-column model (20 states)
+model_20 = jukes_cantor_model(20)
+
+# Compute root posteriors separately
+paired_post = RootProb(split['paired_alignment'], tree, model_400)
+# Shape: (400, 2) — posterior over AA pairs for 2 paired columns
+
+singles_post = RootProb(split['singles_alignment'], tree, model_20)
+# Shape: (20, 1) — posterior for 1 unpaired column
+
+# Merge back: marginalizes 400-state pairs into 20-state singles
+full_post = merge_paired_columns(paired_post, singles_post, split)
+print(f"Full posterior: {full_post.shape}")
+# Full posterior: (20, 5) — ancestral AA distribution for all 5 columns
+print(f"Sums to 1: {np.allclose(full_post.sum(axis=0), 1.0)}")
+# Sums to 1: True
+```
+
+The `merge_paired_columns` function marginalizes the $400$-dimensional paired posteriors:
+- For pair $(i, j)$: posterior over state $a$ at column $i$ is $\sum_b P(\text{pair} = a \cdot 20 + b)$; posterior over state $b$ at column $j$ is $\sum_a P(\text{pair} = a \cdot 20 + b)$.
+- Unpaired columns pass through unchanged.
+
+This enables joint modeling of coevolution at contacting sites while maintaining the standard per-column output format.

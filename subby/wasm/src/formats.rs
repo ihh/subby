@@ -521,6 +521,158 @@ pub fn combine_tree_alignment(tree: &ParsedTree, aln: &ParsedAlignment) -> Combi
     }
 }
 
+// ---- Genetic code ----
+
+/// Standard genetic code.
+#[derive(Debug, Clone)]
+pub struct GeneticCode {
+    pub codons: Vec<String>,           // 64 codon strings
+    pub amino_acids: Vec<char>,        // 64 amino acid letters (stop = '*')
+    pub sense_mask: Vec<bool>,         // (64,) true for sense codons
+    pub sense_indices: Vec<usize>,     // (61,) indices of sense codons in 0..63
+    pub codon_to_sense: Vec<i32>,      // (64,) maps codon idx to sense idx (stop -> -1)
+    pub sense_codons: Vec<String>,     // 61 sense codon strings
+    pub sense_amino_acids: Vec<char>,  // 61 amino acid letters
+}
+
+pub fn genetic_code() -> GeneticCode {
+    let bases = ['A', 'C', 'G', 'T'];
+    let mut codons = Vec::with_capacity(64);
+    for &b1 in &bases {
+        for &b2 in &bases {
+            for &b3 in &bases {
+                codons.push(format!("{}{}{}", b1, b2, b3));
+            }
+        }
+    }
+
+    let code_table: std::collections::HashMap<&str, char> = [
+        ("AAA",'K'),("AAC",'N'),("AAG",'K'),("AAT",'N'),
+        ("ACA",'T'),("ACC",'T'),("ACG",'T'),("ACT",'T'),
+        ("AGA",'R'),("AGC",'S'),("AGG",'R'),("AGT",'S'),
+        ("ATA",'I'),("ATC",'I'),("ATG",'M'),("ATT",'I'),
+        ("CAA",'Q'),("CAC",'H'),("CAG",'Q'),("CAT",'H'),
+        ("CCA",'P'),("CCC",'P'),("CCG",'P'),("CCT",'P'),
+        ("CGA",'R'),("CGC",'R'),("CGG",'R'),("CGT",'R'),
+        ("CTA",'L'),("CTC",'L'),("CTG",'L'),("CTT",'L'),
+        ("GAA",'E'),("GAC",'D'),("GAG",'E'),("GAT",'D'),
+        ("GCA",'A'),("GCC",'A'),("GCG",'A'),("GCT",'A'),
+        ("GGA",'G'),("GGC",'G'),("GGG",'G'),("GGT",'G'),
+        ("GTA",'V'),("GTC",'V'),("GTG",'V'),("GTT",'V'),
+        ("TAA",'*'),("TAC",'Y'),("TAG",'*'),("TAT",'Y'),
+        ("TCA",'S'),("TCC",'S'),("TCG",'S'),("TCT",'S'),
+        ("TGA",'*'),("TGC",'C'),("TGG",'W'),("TGT",'C'),
+        ("TTA",'L'),("TTC",'F'),("TTG",'L'),("TTT",'F'),
+    ].iter().cloned().collect();
+
+    let amino_acids: Vec<char> = codons.iter().map(|c| *code_table.get(c.as_str()).unwrap()).collect();
+    let sense_mask: Vec<bool> = amino_acids.iter().map(|&aa| aa != '*').collect();
+    let mut sense_indices = Vec::with_capacity(61);
+    let mut codon_to_sense = vec![-1i32; 64];
+    let mut sense_idx = 0i32;
+    for i in 0..64 {
+        if sense_mask[i] {
+            sense_indices.push(i);
+            codon_to_sense[i] = sense_idx;
+            sense_idx += 1;
+        }
+    }
+    let sense_codons: Vec<String> = sense_indices.iter().map(|&i| codons[i].clone()).collect();
+    let sense_amino_acids: Vec<char> = sense_indices.iter().map(|&i| amino_acids[i]).collect();
+
+    GeneticCode {
+        codons, amino_acids, sense_mask, sense_indices,
+        codon_to_sense, sense_codons, sense_amino_acids,
+    }
+}
+
+/// Remap a 64-codon tokenized alignment to 61-sense-codon tokens.
+/// Stop codons become gap tokens.
+pub fn codon_to_sense(alignment: &[i32], n: usize, c: usize, a: usize) -> Vec<i32> {
+    let gc = genetic_code();
+    let codon_map = &gc.codon_to_sense;
+    let a_sense = 61usize;
+    let unobs_in = a as i32;       // 64
+    let _gap_in = a as i32 + 1;    // 65
+    let unobs_out = a_sense as i32; // 61
+    let gap_out = a_sense as i32 + 1; // 62
+
+    let mut result = vec![unobs_out; n * c];
+    for i in 0..n * c {
+        let tok = alignment[i];
+        if tok >= 0 && tok < 64 {
+            result[i] = if codon_map[tok as usize] >= 0 { codon_map[tok as usize] } else { gap_out };
+        } else if tok == unobs_in {
+            result[i] = unobs_out;
+        } else {
+            result[i] = gap_out;
+        }
+    }
+    result
+}
+
+// ---- K-mer tokenization ----
+
+/// Result of k-mer tokenization.
+#[derive(Debug, Clone)]
+pub struct KmerResult {
+    pub alignment: Vec<i32>,
+    pub a_kmer: usize,
+    pub n: usize,
+    pub c_k: usize,
+}
+
+pub fn kmer_tokenize(alignment: &[i32], n: usize, c: usize, a: usize, k: usize, gap_mode: &str) -> KmerResult {
+    if c % k != 0 {
+        panic!("Number of columns ({}) not divisible by k ({})", c, k);
+    }
+    let c_k = c / k;
+    let a_k = a.pow(k as u32);
+    let gap_tok = a_k as i32 + 1;
+    let unobs_tok = a_k as i32;
+    let illegal_tok = a_k as i32 + 2;
+
+    let mut result = vec![unobs_tok; n * c_k];
+
+    for row in 0..n {
+        for ck in 0..c_k {
+            let base = row * c + ck * k;
+            let mut all_obs = true;
+            let mut has_gap = false;
+            let mut all_gap = true;
+            let mut kmer_idx: i32 = 0;
+
+            for p in 0..k {
+                let tok = alignment[base + p];
+                let is_obs = tok >= 0 && tok < a as i32;
+                let is_gap = tok < 0 || tok > a as i32;
+                if !is_obs { all_obs = false; }
+                if is_gap { has_gap = true; }
+                if !is_gap { all_gap = false; }
+                if is_obs {
+                    kmer_idx = kmer_idx * a as i32 + tok;
+                } else {
+                    kmer_idx *= a as i32;
+                }
+            }
+
+            let out_idx = row * c_k + ck;
+            if all_obs {
+                result[out_idx] = kmer_idx;
+            } else if gap_mode == "any" && has_gap {
+                result[out_idx] = gap_tok;
+            } else if gap_mode == "all" && all_gap {
+                result[out_idx] = gap_tok;
+            } else if gap_mode == "all" && has_gap {
+                result[out_idx] = illegal_tok;
+            }
+            // else: stays unobs_tok (default)
+        }
+    }
+
+    KmerResult { alignment: result, a_kmer: a_k, n, c_k }
+}
+
 // ---- Tests ----
 
 #[cfg(test)]
@@ -649,5 +801,50 @@ mod tests {
             assert!(result.parent_index[i] >= 0);
             assert!((result.parent_index[i] as usize) < i);
         }
+    }
+}
+
+#[cfg(test)]
+mod genetic_tests {
+    use super::*;
+
+    #[test]
+    fn test_genetic_code_sense_count() {
+        let gc = genetic_code();
+        assert_eq!(gc.sense_indices.len(), 61);
+        assert_eq!(gc.sense_mask.iter().filter(|&&m| m).count(), 61);
+    }
+
+    #[test]
+    fn test_genetic_code_stop_codons() {
+        let gc = genetic_code();
+        // TAA=48, TAG=50, TGA=56
+        assert_eq!(gc.amino_acids[48], '*');
+        assert_eq!(gc.amino_acids[50], '*');
+        assert_eq!(gc.amino_acids[56], '*');
+        assert!(!gc.sense_mask[48]);
+        assert!(!gc.sense_mask[50]);
+        assert!(!gc.sense_mask[56]);
+    }
+
+    #[test]
+    fn test_codon_to_sense_basic() {
+        // Token 0 (AAA) is sense codon index 0
+        let aln = vec![0i32, 1, 48]; // AAA, AAC, TAA(stop)
+        let result = codon_to_sense(&aln, 1, 3, 64);
+        assert_eq!(result[0], 0); // AAA -> sense 0
+        assert_eq!(result[1], 1); // AAC -> sense 1
+        assert_eq!(result[2], 62); // TAA (stop) -> gap (62)
+    }
+
+    #[test]
+    fn test_kmer_tokenize_basic() {
+        // ACG = 0*16 + 1*4 + 2 = 6
+        let aln = vec![0, 1, 2, 3, 0, 0]; // ACG, TAA
+        let result = kmer_tokenize(&aln, 1, 6, 4, 3, "any");
+        assert_eq!(result.c_k, 2);
+        assert_eq!(result.a_kmer, 64);
+        assert_eq!(result.alignment[0], 6); // ACG
+        assert_eq!(result.alignment[1], 48); // TAA = 3*16 + 0*4 + 0
     }
 }

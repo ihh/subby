@@ -236,7 +236,7 @@ PARAM_GRID = {
     "R": [7, 15, 31],
 }
 
-FUNCTIONS = ["LogLike", "Counts", "BranchCounts", "LogLikeGrad", "LogLikeCustomGrad", "ExpectedCounts"]
+FUNCTIONS = ["LogLike", "Counts", "BranchCounts", "LogLikeGrad", "LogLikeCustomGrad", "LogLikeCustomGradPade", "ExpectedCounts"]
 MODEL_TYPES = ["reversible", "irreversible"]
 
 
@@ -353,7 +353,7 @@ def run_benchmarks(backends, n_reps, dry_run=False, timeout=60.0, model_types=No
                                 _grad_fn = _ec_fn
 
                             # For gradient functions, only available with JAX
-                            elif func_name in ("LogLikeGrad", "LogLikeCustomGrad") and backend_name not in ("jax_cpu", "jax_gpu"):
+                            elif func_name in ("LogLikeGrad", "LogLikeCustomGrad", "LogLikeCustomGradPade") and backend_name not in ("jax_cpu", "jax_gpu"):
                                 print(f"  {label} ... SKIPPED (gradient fn requires JAX)")
                                 continue
 
@@ -380,7 +380,20 @@ def run_benchmarks(backends, n_reps, dry_run=False, timeout=60.0, model_types=No
                                 def _grad_fn(alignment=alignment, tree=tree, model=model):
                                     def loss(d):
                                         t = JTree(parentIndex=_parent_idx, distanceToParent=d)
-                                        return jnp.sum(LLCG(alignment, t, model))
+                                        return jnp.sum(LLCG(alignment, t, model, method='eigen'))
+                                    _d = tree.distanceToParent if hasattr(tree, 'distanceToParent') else tree['distanceToParent']
+                                    return jax.grad(loss)(_d)
+                                fn = None  # use _grad_fn below
+                            elif func_name == "LogLikeCustomGradPade":
+                                import jax
+                                import jax.numpy as jnp
+                                from subby.jax import LogLikeCustomGrad as LLCG
+                                from subby.jax.types import Tree as JTree
+                                _parent_idx = tree.parentIndex if hasattr(tree, 'parentIndex') else tree['parentIndex']
+                                def _grad_fn(alignment=alignment, tree=tree, model=model):
+                                    def loss(d):
+                                        t = JTree(parentIndex=_parent_idx, distanceToParent=d)
+                                        return jnp.sum(LLCG(alignment, t, model, method='pade'))
                                     _d = tree.distanceToParent if hasattr(tree, 'distanceToParent') else tree['distanceToParent']
                                     return jax.grad(loss)(_d)
                                 fn = None  # use _grad_fn below

@@ -10,7 +10,7 @@ import pytest
 
 from subby.jax import LogLike, Counts, BranchCounts, RootProb, MixturePosterior, LogLikeCustomGrad, pad_alignment, unpad_columns, InsideOutside, ExpectedCounts, expected_counts_eigen, expected_counts_eigen_irrev
 from subby.jax.types import Tree, RateModel
-from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model, irrev_model_from_rate_matrix
+from subby.jax.models import hky85_diag, jukes_cantor_model, f81_model, gamma_rate_categories, scale_model, irrev_model_from_rate_matrix, gy94_model
 
 
 def _make_medium_tree(n_leaves=10, key=None):
@@ -255,6 +255,141 @@ class TestCustomVJP:
         ll_custom = LogLikeCustomGrad(alignment, tree, model)
 
         np.testing.assert_allclose(ll_custom, ll_auto, atol=1e-10)
+
+
+class TestLogLikeCustomGradPade:
+    """Tests for the Padé-based custom VJP."""
+
+    def test_forward_values_match(self):
+        """Padé forward pass should give same logLike as eigen."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 8
+        alignment = jax.random.randint(jax.random.PRNGKey(50), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        ll_eigen = LogLikeCustomGrad(alignment, tree, model, method='eigen')
+        ll_pade = LogLikeCustomGrad(alignment, tree, model, method='pade')
+
+        np.testing.assert_allclose(ll_pade, ll_eigen, atol=1e-10)
+
+    def test_grad_matches_eigen_jc(self):
+        """Padé gradient matches eigenbasis gradient for JC model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 10
+        alignment = jax.random.randint(jax.random.PRNGKey(51), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        def loss_eigen(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='eigen'))
+
+        def loss_pade(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='pade'))
+
+        grad_eigen = jax.grad(loss_eigen)(tree.distanceToParent)
+        grad_pade = jax.grad(loss_pade)(tree.distanceToParent)
+
+        np.testing.assert_allclose(grad_pade[1:], grad_eigen[1:], atol=1e-6)
+
+    def test_grad_matches_eigen_hky(self):
+        """Padé gradient matches eigenbasis gradient for HKY85 model."""
+        tree = _make_medium_tree(8)
+        R = tree.parentIndex.shape[0]
+        C = 10
+        alignment = jax.random.randint(jax.random.PRNGKey(52), (R, C), 0, 4).astype(jnp.int32)
+        model = hky85_diag(2.0, jnp.array([0.3, 0.2, 0.25, 0.25]))
+
+        def loss_eigen(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='eigen'))
+
+        def loss_pade(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='pade'))
+
+        grad_eigen = jax.grad(loss_eigen)(tree.distanceToParent)
+        grad_pade = jax.grad(loss_pade)(tree.distanceToParent)
+
+        np.testing.assert_allclose(grad_pade[1:], grad_eigen[1:], atol=1e-6)
+
+    def test_grad_matches_eigen_irreversible(self):
+        """Padé gradient matches eigenbasis gradient for irreversible model."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(53), (R, C), 0, 4).astype(jnp.int32)
+
+        A = 4
+        rng = np.random.RandomState(42)
+        rate = rng.uniform(0.01, 1.0, (A, A))
+        np.fill_diagonal(rate, 0.0)
+        np.fill_diagonal(rate, -rate.sum(axis=1))
+        pi = np.ones(A) / A
+        norm = -np.sum(pi * np.diag(rate))
+        rate /= norm
+        model = irrev_model_from_rate_matrix(jnp.array(rate), jnp.array(pi))
+
+        def loss_eigen(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='eigen'))
+
+        def loss_pade(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='pade'))
+
+        grad_eigen = jax.grad(loss_eigen)(tree.distanceToParent)
+        grad_pade = jax.grad(loss_pade)(tree.distanceToParent)
+
+        np.testing.assert_allclose(grad_pade[1:], grad_eigen[1:], atol=1e-5)
+
+    def test_grad_matches_autograd(self):
+        """Padé gradient matches JAX's built-in autograd."""
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 10
+        alignment = jax.random.randint(jax.random.PRNGKey(54), (R, C), 0, 4).astype(jnp.int32)
+        model = jukes_cantor_model(4)
+
+        def loss_auto(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLike(alignment, t, model))
+
+        def loss_pade(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='pade'))
+
+        grad_auto = jax.grad(loss_auto)(tree.distanceToParent)
+        grad_pade = jax.grad(loss_pade)(tree.distanceToParent)
+
+        np.testing.assert_allclose(grad_pade[1:], grad_auto[1:], atol=1e-6)
+
+    def test_large_alphabet_gy94(self):
+        """Padé method works with GY94 model (A=61)."""
+        tree = _make_medium_tree(3)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        alignment = jax.random.randint(jax.random.PRNGKey(55), (R, C), 0, 61).astype(jnp.int32)
+        model = gy94_model(0.5, 2.0)
+
+        ll_eigen = LogLikeCustomGrad(alignment, tree, model, method='eigen')
+        ll_pade = LogLikeCustomGrad(alignment, tree, model, method='pade')
+        np.testing.assert_allclose(ll_pade, ll_eigen, atol=1e-8)
+
+        def loss_eigen(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='eigen'))
+
+        def loss_pade(distances):
+            t = Tree(parentIndex=tree.parentIndex, distanceToParent=distances)
+            return jnp.sum(LogLikeCustomGrad(alignment, t, model, method='pade'))
+
+        grad_eigen = jax.grad(loss_eigen)(tree.distanceToParent)
+        grad_pade = jax.grad(loss_pade)(tree.distanceToParent)
+
+        np.testing.assert_allclose(grad_pade[1:], grad_eigen[1:], atol=1e-5)
 
 
 class TestPerColumnModel:
@@ -1480,3 +1615,131 @@ class TestExpectedCounts:
         ec = ExpectedCounts(rate_model, 0.3)
         assert ec.shape == (A, A, A, A)
         assert jnp.all(jnp.isfinite(ec))
+
+
+# ---- GY94 model tests ----
+
+class TestGY94:
+
+    def test_q_matrix_properties(self):
+        """GY94 Q matrix should be reversible, normalized, zero for multi-nuc changes."""
+        model = gy94_model(1.0, 2.0)
+        A = 61
+        assert model.eigenvalues.shape == (A,)
+        assert model.eigenvectors.shape == (A, A)
+        assert model.pi.shape == (A,)
+
+    def test_eigenvalues(self):
+        """One eigenvalue should be ~0, rest negative."""
+        model = gy94_model(0.5, 4.0)
+        evals = np.array(model.eigenvalues)
+        max_eval = np.max(evals)
+        assert abs(max_eval) < 1e-8, f"Expected zero eigenvalue, got {max_eval}"
+        # All should be <= 0
+        assert np.all(evals <= 1e-8)
+
+    def test_omega_1_neutral(self):
+        """omega=1 should make all single-nuc substitutions proportional to pi only
+        (no distinction between syn and nonsyn)."""
+        model_neutral = gy94_model(1.0, 1.0)
+        model_sel = gy94_model(0.5, 1.0)
+        # Eigenvalues should differ
+        assert not np.allclose(model_neutral.eigenvalues, model_sel.eigenvalues, atol=1e-6)
+
+    def test_omega_0_blocks_nonsyn(self):
+        """omega=0 should have zero rate for nonsynonymous substitutions."""
+        from subby.oracle.oracle import gy94_model as oracle_gy94
+        model = oracle_gy94(0.0, 2.0)
+        # Reconstruct Q from eigendecomposition
+        V = model['eigenvectors']
+        mu = model['eigenvalues']
+        Q = V @ np.diag(mu) @ V.T
+        # All nonsynonymous Q_ij should be ~0
+        from subby.formats import genetic_code
+        gc = genetic_code()
+        sense_aa = gc['sense_amino_acids']
+        for i in range(61):
+            for j in range(61):
+                if i != j and sense_aa[i] != sense_aa[j]:
+                    assert abs(Q[i, j]) < 1e-10, \
+                        f"Nonsynonymous rate Q[{i},{j}] = {Q[i,j]} should be 0"
+
+    def test_cross_tier_consistency(self):
+        """Oracle and JAX GY94 should produce same eigenvalues."""
+        from subby.oracle.oracle import gy94_model as oracle_gy94
+        oracle_model = oracle_gy94(0.3, 3.0)
+        jax_model = gy94_model(0.3, 3.0)
+
+        oracle_evals = np.sort(oracle_model['eigenvalues'])
+        jax_evals = np.sort(np.array(jax_model.eigenvalues))
+        np.testing.assert_allclose(oracle_evals, jax_evals, atol=1e-8)
+
+    def test_integration_loglike(self):
+        """GY94 model should produce valid log-likelihoods on codon data."""
+        from subby.formats import kmer_tokenize, codon_to_sense
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C_codon = 10
+
+        # Random 61-state alignment (sense codons)
+        key = jax.random.PRNGKey(42)
+        alignment = jax.random.randint(key, (R, C_codon), 0, 61).astype(jnp.int32)
+
+        model = gy94_model(0.5, 2.0)
+        ll = LogLike(alignment, tree, model)
+        assert ll.shape == (C_codon,)
+        assert jnp.all(jnp.isfinite(ll))
+        assert jnp.all(ll <= 0)
+
+    def test_custom_pi(self):
+        """GY94 with custom pi should work."""
+        pi = jnp.ones(61, dtype=jnp.float64) / 61
+        model = gy94_model(1.0, 2.0, pi=pi)
+        assert model.pi.shape == (61,)
+        assert jnp.all(jnp.isfinite(model.eigenvalues))
+
+
+# ---- CherryML SiteRM tests ----
+
+class TestCherryMLSiteRM:
+
+    def test_returns_diag_model(self):
+        from subby.jax.presets import cherryml_siteRM
+        model = cherryml_siteRM()
+        assert model.eigenvalues.shape == (400,)
+        assert model.eigenvectors.shape == (400, 400)
+        assert model.pi.shape == (400,)
+
+    def test_reversible(self):
+        """Eigenvalues should be real (reversible model)."""
+        from subby.jax.presets import cherryml_siteRM
+        model = cherryml_siteRM()
+        assert jnp.all(jnp.isfinite(model.eigenvalues))
+        # All eigenvalues should be real (they are, since DiagModel)
+        assert model.eigenvalues.dtype in (jnp.float64, jnp.float32)
+
+    def test_pi_sums_to_one(self):
+        from subby.jax.presets import cherryml_siteRM
+        model = cherryml_siteRM()
+        np.testing.assert_allclose(float(jnp.sum(model.pi)), 1.0, atol=1e-8)
+
+    def test_zero_eigenvalue(self):
+        """Should have one eigenvalue at ~0."""
+        from subby.jax.presets import cherryml_siteRM
+        model = cherryml_siteRM()
+        max_eval = float(jnp.max(model.eigenvalues))
+        assert abs(max_eval) < 1e-6
+
+    def test_integration_loglike(self):
+        """LogLike with 400-state alignment should produce valid results."""
+        from subby.jax.presets import cherryml_siteRM
+        model = cherryml_siteRM()
+        tree = _make_medium_tree(5)
+        R = tree.parentIndex.shape[0]
+        C = 5
+        key = jax.random.PRNGKey(99)
+        alignment = jax.random.randint(key, (R, C), 0, 400).astype(jnp.int32)
+        ll = LogLike(alignment, tree, model)
+        assert ll.shape == (C,)
+        assert jnp.all(jnp.isfinite(ll))
+        assert jnp.all(ll <= 0)

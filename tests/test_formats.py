@@ -13,6 +13,10 @@ from subby.formats import (
     parse_dict,
     combine_tree_alignment,
     kmer_tokenize,
+    genetic_code,
+    codon_to_sense,
+    split_paired_columns,
+    merge_paired_columns,
 )
 
 
@@ -526,6 +530,195 @@ class TestKmerTokenize:
         assert kmer["alignment"].shape == (2, 2)
         assert kmer["A_kmer"] == 64
         assert len(kmer["alphabet"]) == 64
+
+
+# ---- genetic_code ----
+
+class TestGeneticCode:
+    def test_64_codons(self):
+        gc = genetic_code()
+        assert len(gc['codons']) == 64
+        assert len(gc['amino_acids']) == 64
+
+    def test_sense_count(self):
+        gc = genetic_code()
+        assert gc['sense_mask'].sum() == 61
+        assert len(gc['sense_indices']) == 61
+        assert len(gc['sense_codons']) == 61
+        assert len(gc['sense_amino_acids']) == 61
+
+    def test_stop_codons(self):
+        gc = genetic_code()
+        # TAA=48, TAG=50, TGA=56
+        assert gc['amino_acids'][48] == '*'
+        assert gc['amino_acids'][50] == '*'
+        assert gc['amino_acids'][56] == '*'
+        assert not gc['sense_mask'][48]
+        assert not gc['sense_mask'][50]
+        assert not gc['sense_mask'][56]
+
+    def test_codon_to_sense_mapping(self):
+        gc = genetic_code()
+        # Stop codons map to -1
+        assert gc['codon_to_sense'][48] == -1
+        assert gc['codon_to_sense'][50] == -1
+        assert gc['codon_to_sense'][56] == -1
+        # First sense codon (AAA=0) maps to 0
+        assert gc['codon_to_sense'][0] == 0
+        # All sense codons have non-negative mapping
+        for i in gc['sense_indices']:
+            assert gc['codon_to_sense'][i] >= 0
+
+    def test_roundtrip(self):
+        gc = genetic_code()
+        # sense_indices[codon_to_sense[i]] == i for all sense codons
+        for i in range(64):
+            if gc['sense_mask'][i]:
+                si = gc['codon_to_sense'][i]
+                assert gc['sense_indices'][si] == i
+
+    def test_acgt_order(self):
+        gc = genetic_code()
+        assert gc['codons'][0] == 'AAA'
+        assert gc['codons'][63] == 'TTT'
+        assert gc['codons'][1] == 'AAC'
+
+    def test_known_amino_acids(self):
+        gc = genetic_code()
+        # ATG = M (methionine), index = 0*16 + 3*4 + 2 = 14
+        assert gc['codons'][14] == 'ATG'
+        assert gc['amino_acids'][14] == 'M'
+        # TGG = W (tryptophan), index = 3*16 + 2*4 + 2 = 58
+        assert gc['codons'][58] == 'TGG'
+        assert gc['amino_acids'][58] == 'W'
+
+
+# ---- codon_to_sense ----
+
+class TestCodonToSense:
+    def test_basic_remapping(self):
+        gc = genetic_code()
+        # Token 0 (AAA) → sense 0
+        aln = np.array([[0, 1, 2]], dtype=np.int32)
+        result = codon_to_sense(aln, A=64)
+        assert result['A_sense'] == 61
+        assert result['alignment'][0, 0] == 0  # AAA → sense 0
+        assert result['alignment'][0, 1] == 1  # AAC → sense 1
+        assert result['alignment'][0, 2] == 2  # AAG → sense 2
+
+    def test_stop_becomes_gap(self):
+        # TAA=48 is a stop codon
+        aln = np.array([[48]], dtype=np.int32)
+        result = codon_to_sense(aln, A=64)
+        assert result['alignment'][0, 0] == 62  # gap token
+
+    def test_unobserved_remapping(self):
+        aln = np.array([[64]], dtype=np.int32)  # unobserved token
+        result = codon_to_sense(aln, A=64)
+        assert result['alignment'][0, 0] == 61  # new unobserved
+
+    def test_gap_remapping(self):
+        aln = np.array([[65]], dtype=np.int32)  # gap token
+        result = codon_to_sense(aln, A=64)
+        assert result['alignment'][0, 0] == 62  # new gap
+
+    def test_legacy_gap(self):
+        aln = np.array([[-1]], dtype=np.int32)  # legacy gap
+        result = codon_to_sense(aln, A=64)
+        assert result['alignment'][0, 0] == 62  # gap
+
+    def test_empty_alignment(self):
+        aln = np.zeros((0, 0), dtype=np.int32)
+        result = codon_to_sense(aln, A=64)
+        assert result['alignment'].shape == (0, 0)
+        assert result['A_sense'] == 61
+
+    def test_alphabet_returned(self):
+        aln = np.array([[0]], dtype=np.int32)
+        result = codon_to_sense(aln, A=64)
+        assert len(result['alphabet']) == 61
+        assert result['alphabet'][0] == 'AAA'
+
+
+# ---- split_paired_columns / merge_paired_columns ----
+
+class TestSplitMerge:
+    def test_split_basic(self):
+        N, C, A = 3, 6, 20
+        aln = np.random.randint(0, A, (N, C), dtype=np.int32)
+        paired_cols = [(0, 3), (1, 4)]
+        result = split_paired_columns(aln, paired_cols, A=A)
+        assert result['paired_alignment'].shape == (N, 2)
+        assert result['singles_alignment'].shape == (N, 2)  # cols 2 and 5
+        assert result['A_paired'] == 400
+        assert result['A_singles'] == 20
+        assert result['single_columns'] == [2, 5]
+
+    def test_paired_token_encoding(self):
+        A = 20
+        # Two sequences, 4 columns
+        aln = np.array([
+            [5, 10, 3, 7],  # pair (0,1): token = 5*20+10 = 110
+            [0, 19, 1, 2],  # pair (0,1): token = 0*20+19 = 19
+        ], dtype=np.int32)
+        result = split_paired_columns(aln, [(0, 1)], A=A)
+        assert result['paired_alignment'][0, 0] == 110
+        assert result['paired_alignment'][1, 0] == 19
+
+    def test_gap_handling(self):
+        A = 20
+        gap = A + 1
+        aln = np.array([[gap, 5, 3]], dtype=np.int32)
+        result = split_paired_columns(aln, [(0, 1)], A=A)
+        # Column 0 is gap, so paired token should be gap (401)
+        assert result['paired_alignment'][0, 0] == A * A + 1
+
+    def test_unobserved_handling(self):
+        A = 20
+        unobs = A
+        aln = np.array([[unobs, 5, 3]], dtype=np.int32)
+        result = split_paired_columns(aln, [(0, 1)], A=A)
+        # Column 0 is unobserved (no gap), so paired token should be unobserved (400)
+        assert result['paired_alignment'][0, 0] == A * A
+
+    def test_merge_roundtrip(self):
+        A = 20
+        N, C = 3, 6
+        np.random.seed(42)
+        aln = np.random.randint(0, A, (N, C), dtype=np.int32)
+        paired_cols = [(0, 3), (1, 4)]
+        split_info = split_paired_columns(aln, paired_cols, A=A)
+
+        # Create fake posteriors
+        P = len(paired_cols)
+        S = len(split_info['single_columns'])
+        paired_post = np.random.dirichlet(np.ones(A * A), size=P).T  # (400, P)
+        singles_post = np.random.dirichlet(np.ones(A), size=S).T  # (20, S)
+
+        result = merge_paired_columns(paired_post, singles_post, split_info)
+        assert result.shape == (A, C)
+
+        # Each column should sum to ~1 (probability distribution)
+        for c in range(C):
+            np.testing.assert_allclose(result[:, c].sum(), 1.0, atol=1e-10)
+
+    def test_merge_marginalization(self):
+        A = 20
+        # Single pair (0, 1), 2 columns
+        aln = np.array([[5, 10]], dtype=np.int32)
+        split_info = split_paired_columns(aln, [(0, 1)], A=A)
+
+        # Create a paired posterior where state (5, 10) has probability 1
+        paired_post = np.zeros((400, 1), dtype=np.float64)
+        paired_post[5 * 20 + 10, 0] = 1.0
+
+        singles_post = np.zeros((A, 0), dtype=np.float64)
+        result = merge_paired_columns(paired_post, singles_post, split_info)
+
+        # Column 0: all probability on state 5
+        assert result[5, 0] == 1.0
+        # Column 1: all probability on state 10
+        assert result[10, 1] == 1.0
 
 
 # ---- Cross-implementation: Python vs Rust ----

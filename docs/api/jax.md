@@ -390,9 +390,121 @@ Yang (1994) discretized gamma rate categories using quantile medians.
 
 **Returns:** `(rates, weights)` — each `(K,)`. Rates are mean-normalized; weights are uniform $1/K$.
 
+### `gy94_model(omega, kappa, pi=None)`
+
+Goldman-Yang (1994) codon substitution model. Operates on 61 sense codons.
+
+Rate matrix:
+- $Q_{ij} = 0$ if codons differ at more than 1 nucleotide position
+- $Q_{ij} = \pi_j \cdot \kappa^{\mathbb{1}[\text{transition}]} \cdot \omega^{\mathbb{1}[\text{nonsynonymous}]}$
+- Diagonal: $Q_{ii} = -\sum_{j \neq i} Q_{ij}$
+- Normalized so $-\sum_i \pi_i Q_{ii} = 1$
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `omega` | scalar | dN/dS ratio (Ka/Ks) |
+| `kappa` | scalar | Transition/transversion ratio |
+| `pi` | `float (61,)` or `None` | Codon equilibrium frequencies (default: uniform $1/61$) |
+
+**Returns:** `DiagModel` with $A = 61$ states.
+
+```python
+from subby.jax.models import gy94_model
+model = gy94_model(omega=0.5, kappa=2.0)
+# DiagModel with 61 sense codons
+```
+
 ### `scale_model(model, rate_multiplier)`
 
 Scale eigenvalues by a rate multiplier. If `rate_multiplier` is `(K,)`, adds $K$ as a leading batch dimension.
+
+---
+
+## Preset models
+
+### `cherryml_siteRM()`
+
+Load the CherryML 400x400 site-pair coevolution model (Prillo et al., Nature Methods 2023). Returns a `DiagModel` with $A = 400$ states representing pairs of amino acids at structurally contacting sites.
+
+State ordering: pair $(i, j) \to i \cdot 20 + j$ using the ARNDCQEGHILKMFPSTWYV alphabet.
+
+**Returns:** `DiagModel` with $A = 400$ states.
+
+```python
+from subby.jax.presets import cherryml_siteRM
+model_400 = cherryml_siteRM()
+# model_400.pi has shape (400,)
+```
+
+---
+
+## Format utilities
+
+### `genetic_code()`
+
+Return the standard genetic code as a structured dict. Codons are in ACGT lexicographic order (AAA, AAC, AAG, ..., TTT). Stop codons (TAA=48, TAG=50, TGA=56) are marked with `'*'`.
+
+**Returns:** dict with:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `codons` | `list[str]` | 64 codon strings |
+| `amino_acids` | `list[str]` | 64 amino acid letters (stop = `'*'`) |
+| `sense_mask` | `(64,) bool` | True for sense codons |
+| `sense_indices` | `(61,) int` | Indices of sense codons in 0..63 |
+| `codon_to_sense` | `(64,) int` | Maps codon index to sense index (stop -> -1) |
+| `sense_codons` | `list[str]` | 61 sense codon strings |
+| `sense_amino_acids` | `list[str]` | 61 amino acid letters |
+
+```python
+from subby.formats import genetic_code
+gc = genetic_code()
+print(gc['sense_codons'][:5])  # ['AAA', 'AAC', 'AAG', 'AAT', 'ACA']
+```
+
+### `codon_to_sense(alignment, A=64)`
+
+Remap a 64-codon tokenized alignment to 61-sense-codon tokens. Stop codons become the gap token. Unobserved and gap tokens are remapped to the new alphabet size.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `int32 (N, C)` | Tokens 0..63 for codons, 64 for ungapped-unobserved, 65 for gap |
+| `A` | `int` | Input codon alphabet size (default 64) |
+
+**Returns:** dict with `alignment` (`int32 (N, C)` with $A_\text{sense} = 61$), `A_sense` (61), `alphabet` (list of 61 sense codon strings).
+
+### `split_paired_columns(alignment, paired_columns, A=20)`
+
+Split an alignment into paired and single-column alignments. For coevolution models that operate on pairs of columns (e.g., CherryML SiteRM with $A = 400 = 20 \times 20$ amino acid pairs).
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `int32 (N, C)` | Token-encoded alignment with $A$-state tokens |
+| `paired_columns` | `list[(int, int)]` | List of `(col_i, col_j)` tuples |
+| `A` | `int` | Single-column alphabet size (default 20 for amino acids) |
+
+**Returns:** dict with:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `paired_alignment` | `int32 (N, P)` | $A_\text{paired} = A \times A$ states |
+| `singles_alignment` | `int32 (N, S)` | $A_\text{singles} = A$ states |
+| `paired_columns` | `list[(int, int)]` | Echoed back |
+| `single_columns` | `list[int]` | Columns not in any pair |
+| `A_paired` | `int` | $A \times A$ |
+| `A_singles` | `int` | $A$ |
+
+### `merge_paired_columns(paired_posterior, singles_posterior, split_info)`
+
+Reassemble per-column posteriors from paired and single results. Marginalizes the $A_\text{paired} = A \times A$ dimensional paired posteriors into two $A$-dimensional single-column posteriors, then reassembles into the original column order.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `paired_posterior` | `float (A_paired, P)` | Posterior for paired columns |
+| `singles_posterior` | `float (A_singles, S)` | Posterior for single columns |
+| `split_info` | `dict` | Output from `split_paired_columns` |
+
+**Returns:** `(A, C)` array — posterior for all columns in original order.
 
 ---
 
