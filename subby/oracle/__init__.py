@@ -7,6 +7,7 @@ from ..formats import (
     parse_strings,
     parse_dict,
     combine_tree_alignment,
+    kmer_tokenize,
 )
 
 from .oracle import (

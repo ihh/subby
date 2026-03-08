@@ -12,6 +12,7 @@ from subby.formats import (
     parse_strings,
     parse_dict,
     combine_tree_alignment,
+    kmer_tokenize,
 )
 
 
@@ -418,6 +419,113 @@ class TestCombineTreeAlignment:
         result = combine_tree_alignment(tree, aln)
         R = len(tree["parentIndex"])
         assert result["alignment"].shape == (R, 4)
+
+
+# ---- kmer_tokenize ----
+
+class TestKmerTokenize:
+
+    def test_codon_basic(self):
+        """DNA triplets → codon tokens."""
+        # "ACG" "TAA" for one sequence
+        result = parse_strings(["ACGTAA"], alphabet=list("ACGT"))
+        aln = result["alignment"]  # (1, 6) tokens: [0,1,2,3,0,0]
+        kmer = kmer_tokenize(aln, A=4, k=3, alphabet=list("ACGT"))
+        assert kmer["alignment"].shape == (1, 2)
+        assert kmer["A_kmer"] == 64
+        # ACG = 0*16 + 1*4 + 2 = 6
+        assert kmer["alignment"][0, 0] == 6
+        # TAA = 3*16 + 0*4 + 0 = 48
+        assert kmer["alignment"][0, 1] == 48
+
+    def test_kmer_alphabet_labels(self):
+        """K-mer alphabet labels are correct."""
+        kmer = kmer_tokenize(np.zeros((1, 4), dtype=np.int32), A=2, k=2,
+                             alphabet=["0", "1"])
+        assert kmer["alphabet"] == ["00", "01", "10", "11"]
+        assert kmer["A_kmer"] == 4
+
+    def test_k1_identity(self):
+        """k=1 is the identity transform for observed tokens."""
+        aln = np.array([[0, 1, 2, 3]], dtype=np.int32)
+        kmer = kmer_tokenize(aln, A=4, k=1)
+        np.testing.assert_array_equal(kmer["alignment"], aln)
+        assert kmer["A_kmer"] == 4
+
+    def test_gap_any(self):
+        """gap_mode='any': gap in any position → entire k-mer is gap."""
+        A = 4
+        gap = A + 1
+        aln = np.array([[0, gap, 2]], dtype=np.int32)  # one k-mer, middle is gap
+        kmer = kmer_tokenize(aln, A=A, k=3, gap_mode='any')
+        A_k = 64
+        assert kmer["alignment"][0, 0] == A_k + 1  # gap token
+
+    def test_gap_all_full_gap(self):
+        """gap_mode='all': all positions gapped → gap token."""
+        A = 4
+        gap = A + 1
+        aln = np.array([[gap, gap, gap]], dtype=np.int32)
+        kmer = kmer_tokenize(aln, A=A, k=3, gap_mode='all')
+        A_k = 64
+        assert kmer["alignment"][0, 0] == A_k + 1  # gap token
+
+    def test_gap_all_partial_gap(self):
+        """gap_mode='all': partial gap → illegal token."""
+        A = 4
+        gap = A + 1
+        aln = np.array([[0, gap, 2]], dtype=np.int32)
+        kmer = kmer_tokenize(aln, A=A, k=3, gap_mode='all')
+        A_k = 64
+        assert kmer["alignment"][0, 0] == A_k + 2  # illegal token
+
+    def test_unobserved(self):
+        """All-unobserved k-mer → unobserved token."""
+        A = 4
+        unobs = A  # ungapped-unobserved token
+        aln = np.array([[unobs, unobs, unobs]], dtype=np.int32)
+        kmer = kmer_tokenize(aln, A=A, k=3)
+        A_k = 64
+        assert kmer["alignment"][0, 0] == A_k  # ungapped-unobserved
+
+    def test_legacy_gap(self):
+        """Legacy gap token (-1) treated as gap."""
+        A = 4
+        aln = np.array([[0, -1, 2]], dtype=np.int32)
+        kmer = kmer_tokenize(aln, A=A, k=3, gap_mode='any')
+        A_k = 64
+        assert kmer["alignment"][0, 0] == A_k + 1
+
+    def test_c_not_divisible(self):
+        """C not divisible by k raises ValueError."""
+        aln = np.array([[0, 1, 2, 3, 0]], dtype=np.int32)  # C=5
+        with pytest.raises(ValueError, match="not divisible"):
+            kmer_tokenize(aln, A=4, k=3)
+
+    def test_multiple_sequences(self):
+        """Multiple sequences tokenized independently."""
+        aln = np.array([
+            [0, 1, 2, 3, 0, 0],  # ACG TAA
+            [3, 2, 1, 0, 3, 2],  # TGC ATG
+        ], dtype=np.int32)
+        kmer = kmer_tokenize(aln, A=4, k=3)
+        assert kmer["alignment"].shape == (2, 2)
+        # ACG = 6, TAA = 48
+        assert kmer["alignment"][0, 0] == 6
+        assert kmer["alignment"][0, 1] == 48
+        # TGC = 3*16 + 2*4 + 1 = 57, ATG = 0*16 + 3*4 + 2 = 14
+        assert kmer["alignment"][1, 0] == 57
+        assert kmer["alignment"][1, 1] == 14
+
+    def test_fasta_to_codons(self):
+        """End-to-end: FASTA → codon tokenization."""
+        fasta = ">seq1\nACGTAA\n>seq2\nTGCATG\n"
+        result = parse_fasta(fasta)
+        kmer = kmer_tokenize(result["alignment"], A=len(result["alphabet"]),
+                             k=3, alphabet=result["alphabet"])
+        assert kmer["alignment"].shape == (2, 2)
+        assert kmer["A_kmer"] == 64
+        assert len(kmer["alphabet"]) == 64
 
 
 # ---- Cross-implementation: Python vs Rust ----

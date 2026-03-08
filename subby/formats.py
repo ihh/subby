@@ -609,6 +609,92 @@ def parse_dict(sequences, alphabet=None):
 
 
 # ---------------------------------------------------------------------------
+# K-mer tokenization
+# ---------------------------------------------------------------------------
+
+def kmer_tokenize(alignment, A, k, gap_mode='any', alphabet=None):
+    """Convert single-character token alignment to k-mer tokens.
+
+    Groups k consecutive columns into one k-mer column (non-overlapping).
+    C must be divisible by k.
+
+    Token encoding for the output alignment follows the standard convention:
+    0..A^k-1 for observed k-mers, A^k for ungapped-unobserved, A^k+1 for gap.
+    When gap_mode='all', partial gaps produce an illegal token (A^k+2).
+
+    Args:
+        alignment: (N, C) int32 tokens (0..A-1 observed, A ungapped-unobserved,
+                   A+1 or -1 gap)
+        A: single-character alphabet size
+        k: k-mer size (e.g. 3 for codons)
+        gap_mode: 'any' — gap in any of the k positions gaps the entire k-mer
+                  'all' — only all-gap k-mers become gaps; partial gaps become
+                          an illegal token (A^k+2)
+        alphabet: optional list of A single-character labels for building
+                  k-mer labels (e.g. ['A','C','G','T'])
+
+    Returns:
+        dict with:
+            alignment: (N, C//k) int32 k-mer tokens
+            A_kmer: int, k-mer alphabet size (A^k)
+            alphabet: list of A^k k-mer label strings (only if alphabet given)
+    """
+    alignment = np.asarray(alignment, dtype=np.int32)
+    N, C = alignment.shape
+    if C % k != 0:
+        raise ValueError(f"Number of columns ({C}) not divisible by k ({k})")
+
+    C_k = C // k
+    A_k = A ** k
+
+    # Reshape to (N, C_k, k)
+    blocks = alignment.reshape(N, C_k, k)
+
+    # Classify each position
+    is_observed = (blocks >= 0) & (blocks < A)
+    is_gap = (blocks < 0) | (blocks > A)  # -1, A+1, etc.
+
+    all_observed = is_observed.all(axis=2)
+    all_unobs = (blocks == A).all(axis=2)
+    has_gap = is_gap.any(axis=2)
+    all_gap = is_gap.all(axis=2)
+
+    # K-mer indices (only valid where all_observed)
+    powers = A ** np.arange(k - 1, -1, -1)
+    kmer_idx = np.sum(np.where(is_observed, blocks, 0) * powers, axis=2)
+
+    # Build result
+    gap_tok = A_k + 1
+    unobs_tok = A_k
+    illegal_tok = A_k + 2
+
+    result = np.full((N, C_k), unobs_tok, dtype=np.int32)
+    result[all_observed] = kmer_idx[all_observed]
+
+    if gap_mode == 'any':
+        result[has_gap] = gap_tok
+    elif gap_mode == 'all':
+        result[all_gap] = gap_tok
+        partial_gap = has_gap & ~all_gap
+        result[partial_gap] = illegal_tok
+    else:
+        raise ValueError(f"Unknown gap_mode: {gap_mode!r}")
+
+    # K-mer alphabet labels
+    kmer_alphabet = None
+    if alphabet is not None:
+        from itertools import product as itertools_product
+        kmer_alphabet = [
+            ''.join(combo) for combo in itertools_product(alphabet, repeat=k)
+        ]
+
+    out = {'alignment': result, 'A_kmer': A_k}
+    if kmer_alphabet is not None:
+        out['alphabet'] = kmer_alphabet
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Combine tree + alignment
 # ---------------------------------------------------------------------------
 
