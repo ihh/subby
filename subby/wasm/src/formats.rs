@@ -611,6 +611,160 @@ pub fn codon_to_sense(alignment: &[i32], n: usize, c: usize, a: usize) -> Vec<i3
     result
 }
 
+// ---- K-mer column indexing ----
+
+/// Maps between column tuples and output alignment indices.
+///
+/// Provides O(1) lookup from column tuple to output index and vice versa.
+#[derive(Debug, Clone)]
+pub struct KmerIndex {
+    /// T tuples, each of length k.
+    pub tuples: Vec<Vec<i64>>,
+    lookup: std::collections::HashMap<Vec<i64>, usize>,
+}
+
+impl KmerIndex {
+    /// Create a new KmerIndex from a list of column tuples.
+    pub fn new(tuples: Vec<Vec<i64>>) -> Self {
+        let mut lookup = std::collections::HashMap::with_capacity(tuples.len());
+        for (i, t) in tuples.iter().enumerate() {
+            lookup.insert(t.clone(), i);
+        }
+        KmerIndex { tuples, lookup }
+    }
+
+    /// Column tuple to index in the output alignment. Returns -1 if absent.
+    pub fn tuple_to_idx(&self, t: &[i64]) -> i64 {
+        match self.lookup.get(t) {
+            Some(&idx) => idx as i64,
+            None => -1,
+        }
+    }
+
+    /// Index in the output alignment to column tuple.
+    pub fn idx_to_tuple(&self, idx: usize) -> &[i64] {
+        &self.tuples[idx]
+    }
+
+    /// Number of tuples.
+    pub fn len(&self) -> usize {
+        self.tuples.len()
+    }
+
+    /// Whether the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.tuples.is_empty()
+    }
+}
+
+/// Generate column index tuples for sliding-window k-mer tokenization.
+///
+/// Args:
+///   c: number of columns in the alignment
+///   k: window size (k-mer length)
+///   stride: step between window starts. None means k (non-overlapping).
+///   offset: starting column index
+///   edge: handling of incomplete trailing window:
+///         "truncate" -- drop incomplete trailing window (default)
+///         "pad" -- include partial window, using -1 for out-of-bounds columns
+///
+/// Returns list of column index tuples. -1 for out-of-bounds with edge="pad".
+pub fn sliding_windows(c: usize, k: usize, stride: Option<usize>, offset: usize, edge: &str) -> Vec<Vec<i64>> {
+    let stride = stride.unwrap_or(k);
+    let mut tuples = Vec::new();
+
+    match edge {
+        "truncate" => {
+            if k > c {
+                return tuples;
+            }
+            let mut start = offset;
+            while start + k <= c {
+                let tuple: Vec<i64> = (start..start + k).map(|i| i as i64).collect();
+                tuples.push(tuple);
+                start += stride;
+            }
+        }
+        "pad" => {
+            let mut start = offset;
+            while start < c {
+                let tuple: Vec<i64> = (0..k)
+                    .map(|j| {
+                        let col = start + j;
+                        if col < c { col as i64 } else { -1 }
+                    })
+                    .collect();
+                tuples.push(tuple);
+                start += stride;
+            }
+        }
+        _ => panic!("Unknown edge mode: {}", edge),
+    }
+
+    tuples
+}
+
+/// Generate all k-tuples of column indices.
+///
+/// WARNING: produces O(C^k) tuples. Use with caution for large C or k > 2.
+///
+/// Args:
+///   c: number of columns
+///   k: tuple size
+///   ordered: if true, permutations (C * (C-1) for k=2);
+///            if false, combinations (C choose k)
+pub fn all_column_ktuples(c: usize, k: usize, ordered: bool) -> Vec<Vec<i64>> {
+    if k == 0 {
+        return vec![vec![]];
+    }
+    if c == 0 || k > c {
+        return Vec::new();
+    }
+
+    let mut result = Vec::new();
+
+    if ordered {
+        // Generate permutations of size k from 0..c
+        fn permutations(items: &[i64], k: usize, current: &mut Vec<i64>, used: &mut Vec<bool>, result: &mut Vec<Vec<i64>>) {
+            if current.len() == k {
+                result.push(current.clone());
+                return;
+            }
+            for i in 0..items.len() {
+                if !used[i] {
+                    used[i] = true;
+                    current.push(items[i]);
+                    permutations(items, k, current, used, result);
+                    current.pop();
+                    used[i] = false;
+                }
+            }
+        }
+        let items: Vec<i64> = (0..c as i64).collect();
+        let mut current = Vec::with_capacity(k);
+        let mut used = vec![false; c];
+        permutations(&items, k, &mut current, &mut used, &mut result);
+    } else {
+        // Generate combinations of size k from 0..c
+        fn combinations(c: usize, k: usize, start: usize, current: &mut Vec<i64>, result: &mut Vec<Vec<i64>>) {
+            if current.len() == k {
+                result.push(current.clone());
+                return;
+            }
+            let remaining = k - current.len();
+            for i in start..=(c - remaining) {
+                current.push(i as i64);
+                combinations(c, k, i + 1, current, result);
+                current.pop();
+            }
+        }
+        let mut current = Vec::with_capacity(k);
+        combinations(c, k, 0, &mut current, &mut result);
+    }
+
+    result
+}
+
 // ---- K-mer tokenization ----
 
 /// Result of k-mer tokenization.
@@ -620,35 +774,68 @@ pub struct KmerResult {
     pub a_kmer: usize,
     pub n: usize,
     pub c_k: usize,
+    pub index: KmerIndex,
 }
 
-pub fn kmer_tokenize(alignment: &[i32], n: usize, c: usize, a: usize, k: usize, gap_mode: &str) -> KmerResult {
-    if c % k != 0 {
-        panic!("Number of columns ({}) not divisible by k ({})", c, k);
+/// Tokenize alignment columns specified by arbitrary column tuples.
+///
+/// When column_tuples contain -1, those positions are treated as unobserved
+/// (token = a).
+///
+/// Token encoding for the output alignment:
+/// 0..A^k-1 for observed k-mers, A^k for ungapped-unobserved, A^k+1 for gap.
+/// When gap_mode="all", partial gaps produce an illegal token (A^k+2).
+pub fn kmer_tokenize_tuples(
+    alignment: &[i32],
+    n: usize,
+    c: usize,
+    a: usize,
+    column_tuples: &[Vec<i64>],
+    gap_mode: &str,
+) -> KmerResult {
+    let t = column_tuples.len();
+    if t == 0 {
+        return KmerResult {
+            alignment: Vec::new(),
+            a_kmer: 1, // a^0 = 1 if k=0, but we handle empty tuples
+            n,
+            c_k: 0,
+            index: KmerIndex::new(Vec::new()),
+        };
     }
-    let c_k = c / k;
+
+    let k = column_tuples[0].len();
     let a_k = a.pow(k as u32);
     let gap_tok = a_k as i32 + 1;
     let unobs_tok = a_k as i32;
     let illegal_tok = a_k as i32 + 2;
 
-    let mut result = vec![unobs_tok; n * c_k];
+    let mut result = vec![unobs_tok; n * t];
 
     for row in 0..n {
-        for ck in 0..c_k {
-            let base = row * c + ck * k;
+        for (ti, tuple) in column_tuples.iter().enumerate() {
             let mut all_obs = true;
             let mut has_gap = false;
             let mut all_gap = true;
             let mut kmer_idx: i32 = 0;
 
-            for p in 0..k {
-                let tok = alignment[base + p];
+            for &col_idx in tuple.iter() {
+                let tok = if col_idx < 0 {
+                    // -1 sentinel: treat as unobserved
+                    a as i32
+                } else {
+                    let ci = col_idx as usize;
+                    if ci >= c {
+                        panic!("Column index {} out of range (C={})", ci, c);
+                    }
+                    alignment[row * c + ci]
+                };
+
                 let is_obs = tok >= 0 && tok < a as i32;
-                let is_gap = tok < 0 || tok > a as i32;
+                let is_gap_pos = tok < 0 || tok > a as i32;
                 if !is_obs { all_obs = false; }
-                if is_gap { has_gap = true; }
-                if !is_gap { all_gap = false; }
+                if is_gap_pos { has_gap = true; }
+                if !is_gap_pos { all_gap = false; }
                 if is_obs {
                     kmer_idx = kmer_idx * a as i32 + tok;
                 } else {
@@ -656,7 +843,7 @@ pub fn kmer_tokenize(alignment: &[i32], n: usize, c: usize, a: usize, k: usize, 
                 }
             }
 
-            let out_idx = row * c_k + ck;
+            let out_idx = row * t + ti;
             if all_obs {
                 result[out_idx] = kmer_idx;
             } else if gap_mode == "any" && has_gap {
@@ -670,7 +857,25 @@ pub fn kmer_tokenize(alignment: &[i32], n: usize, c: usize, a: usize, k: usize, 
         }
     }
 
-    KmerResult { alignment: result, a_kmer: a_k, n, c_k }
+    KmerResult {
+        alignment: result,
+        a_kmer: a_k,
+        n,
+        c_k: t,
+        index: KmerIndex::new(column_tuples.to_vec()),
+    }
+}
+
+/// Backward-compatible k-mer tokenization using contiguous non-overlapping windows.
+///
+/// C must be divisible by k. Internally calls kmer_tokenize_tuples with
+/// contiguous windows generated by sliding_windows.
+pub fn kmer_tokenize(alignment: &[i32], n: usize, c: usize, a: usize, k: usize, gap_mode: &str) -> KmerResult {
+    if c % k != 0 {
+        panic!("Number of columns ({}) not divisible by k ({})", c, k);
+    }
+    let tuples = sliding_windows(c, k, Some(k), 0, "truncate");
+    kmer_tokenize_tuples(alignment, n, c, a, &tuples, gap_mode)
 }
 
 // ---- Tests ----
@@ -846,5 +1051,364 @@ mod genetic_tests {
         assert_eq!(result.a_kmer, 64);
         assert_eq!(result.alignment[0], 6); // ACG
         assert_eq!(result.alignment[1], 48); // TAA = 3*16 + 0*4 + 0
+        // Verify index
+        assert_eq!(result.index.len(), 2);
+        assert_eq!(result.index.idx_to_tuple(0), &[0, 1, 2]);
+        assert_eq!(result.index.idx_to_tuple(1), &[3, 4, 5]);
+    }
+}
+
+#[cfg(test)]
+mod kmer_index_tests {
+    use super::*;
+
+    #[test]
+    fn test_kmer_index_new() {
+        let tuples = vec![vec![0i64, 1], vec![2, 3], vec![4, 5]];
+        let index = KmerIndex::new(tuples);
+        assert_eq!(index.len(), 3);
+        assert!(!index.is_empty());
+    }
+
+    #[test]
+    fn test_kmer_index_empty() {
+        let index = KmerIndex::new(Vec::new());
+        assert_eq!(index.len(), 0);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_kmer_index_tuple_to_idx() {
+        let tuples = vec![vec![0i64, 1], vec![2, 3], vec![4, 5]];
+        let index = KmerIndex::new(tuples);
+        assert_eq!(index.tuple_to_idx(&[0, 1]), 0);
+        assert_eq!(index.tuple_to_idx(&[2, 3]), 1);
+        assert_eq!(index.tuple_to_idx(&[4, 5]), 2);
+        assert_eq!(index.tuple_to_idx(&[1, 0]), -1); // absent
+        assert_eq!(index.tuple_to_idx(&[6, 7]), -1); // absent
+    }
+
+    #[test]
+    fn test_kmer_index_idx_to_tuple() {
+        let tuples = vec![vec![0i64, 1], vec![2, 3]];
+        let index = KmerIndex::new(tuples);
+        assert_eq!(index.idx_to_tuple(0), &[0, 1]);
+        assert_eq!(index.idx_to_tuple(1), &[2, 3]);
+    }
+
+    #[test]
+    fn test_kmer_index_with_sentinels() {
+        let tuples = vec![vec![0i64, 1], vec![2, -1]];
+        let index = KmerIndex::new(tuples);
+        assert_eq!(index.tuple_to_idx(&[2, -1]), 1);
+        assert_eq!(index.idx_to_tuple(1), &[2, -1]);
+    }
+}
+
+#[cfg(test)]
+mod sliding_windows_tests {
+    use super::*;
+
+    #[test]
+    fn test_sliding_windows_nonoverlapping() {
+        let result = sliding_windows(6, 3, None, 0, "truncate");
+        assert_eq!(result, vec![vec![0i64, 1, 2], vec![3, 4, 5]]);
+    }
+
+    #[test]
+    fn test_sliding_windows_overlapping() {
+        let result = sliding_windows(5, 3, Some(1), 0, "truncate");
+        assert_eq!(result, vec![
+            vec![0i64, 1, 2],
+            vec![1, 2, 3],
+            vec![2, 3, 4],
+        ]);
+    }
+
+    #[test]
+    fn test_sliding_windows_truncate_drops_partial() {
+        // c=7, k=3, stride=3 -> windows at 0,3 (6 would need cols 6,7,8 -> dropped)
+        let result = sliding_windows(7, 3, Some(3), 0, "truncate");
+        assert_eq!(result, vec![vec![0i64, 1, 2], vec![3, 4, 5]]);
+    }
+
+    #[test]
+    fn test_sliding_windows_pad_includes_partial() {
+        // c=7, k=3, stride=3 -> windows at 0,3,6 (6 pads with -1)
+        let result = sliding_windows(7, 3, Some(3), 0, "pad");
+        assert_eq!(result, vec![
+            vec![0i64, 1, 2],
+            vec![3, 4, 5],
+            vec![6, -1, -1],
+        ]);
+    }
+
+    #[test]
+    fn test_sliding_windows_offset() {
+        let result = sliding_windows(6, 2, Some(2), 1, "truncate");
+        assert_eq!(result, vec![vec![1i64, 2], vec![3, 4]]);
+    }
+
+    #[test]
+    fn test_sliding_windows_k_larger_than_c_truncate() {
+        let result = sliding_windows(2, 3, None, 0, "truncate");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_sliding_windows_k_larger_than_c_pad() {
+        let result = sliding_windows(2, 3, None, 0, "pad");
+        assert_eq!(result, vec![vec![0i64, 1, -1]]);
+    }
+
+    #[test]
+    fn test_sliding_windows_stride_1() {
+        let result = sliding_windows(4, 2, Some(1), 0, "truncate");
+        assert_eq!(result, vec![
+            vec![0i64, 1],
+            vec![1, 2],
+            vec![2, 3],
+        ]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unknown edge mode")]
+    fn test_sliding_windows_bad_edge() {
+        sliding_windows(6, 3, None, 0, "invalid");
+    }
+}
+
+#[cfg(test)]
+mod all_column_ktuples_tests {
+    use super::*;
+
+    #[test]
+    fn test_all_column_ktuples_ordered_k2() {
+        let result = all_column_ktuples(3, 2, true);
+        // 3 * 2 = 6 permutations
+        assert_eq!(result.len(), 6);
+        assert!(result.contains(&vec![0i64, 1]));
+        assert!(result.contains(&vec![1i64, 0]));
+        assert!(result.contains(&vec![0i64, 2]));
+        assert!(result.contains(&vec![2i64, 0]));
+        assert!(result.contains(&vec![1i64, 2]));
+        assert!(result.contains(&vec![2i64, 1]));
+    }
+
+    #[test]
+    fn test_all_column_ktuples_unordered_k2() {
+        let result = all_column_ktuples(3, 2, false);
+        // C(3,2) = 3 combinations
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&vec![0i64, 1]));
+        assert!(result.contains(&vec![0i64, 2]));
+        assert!(result.contains(&vec![1i64, 2]));
+        // Should not contain reversed pairs
+        assert!(!result.contains(&vec![1i64, 0]));
+    }
+
+    #[test]
+    fn test_all_column_ktuples_ordered_k1() {
+        let result = all_column_ktuples(4, 1, true);
+        assert_eq!(result.len(), 4);
+        for i in 0..4 {
+            assert!(result.contains(&vec![i as i64]));
+        }
+    }
+
+    #[test]
+    fn test_all_column_ktuples_unordered_k1() {
+        let result = all_column_ktuples(4, 1, false);
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn test_all_column_ktuples_k_larger_than_c() {
+        let result = all_column_ktuples(2, 3, true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_all_column_ktuples_c_zero() {
+        let result = all_column_ktuples(0, 2, true);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_all_column_ktuples_k3_ordered() {
+        let result = all_column_ktuples(3, 3, true);
+        // 3! = 6 permutations
+        assert_eq!(result.len(), 6);
+    }
+
+    #[test]
+    fn test_all_column_ktuples_k3_unordered() {
+        let result = all_column_ktuples(3, 3, false);
+        // C(3,3) = 1 combination
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], vec![0i64, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod kmer_tokenize_tuples_tests {
+    use super::*;
+
+    #[test]
+    fn test_kmer_tokenize_tuples_contiguous() {
+        // Same as kmer_tokenize with k=3, c=6
+        let aln = vec![0, 1, 2, 3, 0, 0]; // ACG, TAA
+        let tuples = vec![vec![0i64, 1, 2], vec![3, 4, 5]];
+        let result = kmer_tokenize_tuples(&aln, 1, 6, 4, &tuples, "any");
+        assert_eq!(result.c_k, 2);
+        assert_eq!(result.a_kmer, 64);
+        assert_eq!(result.alignment[0], 6); // ACG = 0*16+1*4+2
+        assert_eq!(result.alignment[1], 48); // TAA = 3*16+0*4+0
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_noncontiguous() {
+        // Columns (0,2) and (1,3) from a 4-column alignment
+        // Row: A=0, C=1, G=2, T=3
+        let aln = vec![0, 1, 2, 3]; // A, C, G, T
+        let tuples = vec![vec![0i64, 2], vec![1, 3]];
+        let result = kmer_tokenize_tuples(&aln, 1, 4, 4, &tuples, "any");
+        assert_eq!(result.c_k, 2);
+        assert_eq!(result.a_kmer, 16); // 4^2
+        // (A,G) = 0*4+2 = 2
+        assert_eq!(result.alignment[0], 2);
+        // (C,T) = 1*4+3 = 7
+        assert_eq!(result.alignment[1], 7);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_sentinel_minus_one() {
+        // Column tuple with -1 sentinel
+        // aln: [0, 1, 2, 3] (A=0, C=1, G=2, T=3), c=4, a=4
+        let aln = vec![0, 1, 2, 3];
+        // Tuple (0, -1): column 0 is observed (A=0), column -1 is unobserved
+        let tuples = vec![vec![0i64, -1]];
+        let result = kmer_tokenize_tuples(&aln, 1, 4, 4, &tuples, "any");
+        // unobserved token for a=4 is 4. So position -1 maps to tok=4.
+        // tok=4 is not observed (not in 0..3), not a gap (not <0, not >4).
+        // It is the unobserved token (==a).
+        // So all_obs=false, is_gap_pos for tok=4: tok < 0? no. tok > a(=4)? no.
+        // So is_gap_pos=false, all_gap=false, has_gap=false.
+        // => stays unobs_tok (default)
+        let unobs_tok = 16i32; // 4^2 = 16
+        assert_eq!(result.alignment[0], unobs_tok);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_sentinel_all_sentinel() {
+        // All -1 sentinels
+        let aln = vec![0, 1];
+        let tuples = vec![vec![-1i64, -1]];
+        let result = kmer_tokenize_tuples(&aln, 1, 2, 4, &tuples, "any");
+        let unobs_tok = 16i32; // 4^2
+        assert_eq!(result.alignment[0], unobs_tok);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_gap_handling_any() {
+        // Test gap_mode="any"
+        // a=4, gap token = a+1 = 5
+        let aln = vec![0, 5]; // observed A, gap
+        let tuples = vec![vec![0i64, 1]];
+        let result = kmer_tokenize_tuples(&aln, 1, 2, 4, &tuples, "any");
+        let gap_tok = 17i32; // 4^2 + 1
+        assert_eq!(result.alignment[0], gap_tok);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_gap_handling_all() {
+        // Test gap_mode="all"
+        // a=4, gap token = a+1 = 5
+        let aln = vec![0, 5, 5, 5]; // observed A, gap, gap, gap
+        let tuples = vec![vec![0i64, 1], vec![2, 3]];
+
+        let result = kmer_tokenize_tuples(&aln, 1, 4, 4, &tuples, "all");
+        let gap_tok = 17i32;     // 4^2 + 1
+        let illegal_tok = 18i32; // 4^2 + 2
+        // (0,1) = (obs, gap) -> partial gap -> illegal
+        assert_eq!(result.alignment[0], illegal_tok);
+        // (2,3) = (gap, gap) -> all gap -> gap
+        assert_eq!(result.alignment[1], gap_tok);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_empty() {
+        let aln = vec![0, 1, 2, 3];
+        let tuples: Vec<Vec<i64>> = Vec::new();
+        let result = kmer_tokenize_tuples(&aln, 1, 4, 4, &tuples, "any");
+        assert_eq!(result.c_k, 0);
+        assert!(result.alignment.is_empty());
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_multiple_rows() {
+        // 2 rows, 4 columns, a=4
+        let aln = vec![
+            0, 1, 2, 3, // row 0: A C G T
+            3, 2, 1, 0, // row 1: T G C A
+        ];
+        let tuples = vec![vec![0i64, 1], vec![2, 3]];
+        let result = kmer_tokenize_tuples(&aln, 2, 4, 4, &tuples, "any");
+        assert_eq!(result.n, 2);
+        assert_eq!(result.c_k, 2);
+        // Row 0: (A,C) = 0*4+1 = 1, (G,T) = 2*4+3 = 11
+        assert_eq!(result.alignment[0], 1);
+        assert_eq!(result.alignment[1], 11);
+        // Row 1: (T,G) = 3*4+2 = 14, (C,A) = 1*4+0 = 4
+        assert_eq!(result.alignment[2], 14);
+        assert_eq!(result.alignment[3], 4);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_matches_kmer_tokenize_tuples() {
+        // Verify that kmer_tokenize produces same results as kmer_tokenize_tuples
+        // with contiguous windows
+        let aln = vec![
+            0, 1, 2, 3, 0, 1, // row 0
+            3, 2, 1, 0, 3, 2, // row 1
+        ];
+        let old_result = kmer_tokenize(&aln, 2, 6, 4, 2, "any");
+        let tuples = sliding_windows(6, 2, None, 0, "truncate");
+        let new_result = kmer_tokenize_tuples(&aln, 2, 6, 4, &tuples, "any");
+        assert_eq!(old_result.alignment, new_result.alignment);
+        assert_eq!(old_result.a_kmer, new_result.a_kmer);
+        assert_eq!(old_result.c_k, new_result.c_k);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_index() {
+        let aln = vec![0, 1, 2, 3];
+        let tuples = vec![vec![0i64, 2], vec![1, 3]];
+        let result = kmer_tokenize_tuples(&aln, 1, 4, 4, &tuples, "any");
+        assert_eq!(result.index.len(), 2);
+        assert_eq!(result.index.tuple_to_idx(&[0, 2]), 0);
+        assert_eq!(result.index.tuple_to_idx(&[1, 3]), 1);
+        assert_eq!(result.index.tuple_to_idx(&[0, 1]), -1);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_reversed_columns() {
+        // Test non-standard column ordering: (2, 0) instead of (0, 2)
+        let aln = vec![0, 1, 2, 3]; // A=0, C=1, G=2, T=3
+        let tuples = vec![vec![2i64, 0]]; // (G, A) = 2*4+0 = 8
+        let result = kmer_tokenize_tuples(&aln, 1, 4, 4, &tuples, "any");
+        assert_eq!(result.alignment[0], 8);
+    }
+
+    #[test]
+    fn test_kmer_tokenize_tuples_k1() {
+        // k=1 tuples should just rearrange columns
+        let aln = vec![0, 1, 2, 3]; // A=0, C=1, G=2, T=3
+        let tuples = vec![vec![3i64], vec![1], vec![0]]; // T, C, A
+        let result = kmer_tokenize_tuples(&aln, 1, 4, 4, &tuples, "any");
+        assert_eq!(result.a_kmer, 4);
+        assert_eq!(result.alignment[0], 3); // T
+        assert_eq!(result.alignment[1], 1); // C
+        assert_eq!(result.alignment[2], 0); // A
     }
 }

@@ -196,9 +196,48 @@ Remap a 64-codon tokenized flat alignment to 61-sense-codon tokens. Stop codons 
 
 **Returns:** `{ alignment: Int32Array, A_sense: 61, alphabet: string[] }`.
 
-### `kmerTokenize(alignment, N, C, A, k, gapMode?, alphabet?) -> object`
+### `KmerIndex`
 
-Convert a single-character token alignment to k-mer tokens. Groups `k` consecutive columns into one k-mer column (non-overlapping). `C` must be divisible by `k`.
+Maps between column tuples and output alignment indices. Provides O(1) lookup in both directions.
+
+```javascript
+import { KmerIndex } from './subby/webgpu/index.js';
+
+const index = new KmerIndex([[0, 1], [2, 3], [4, 5]]);
+index.tupleToIdx([2, 3]);  // → 1
+index.idxToTuple(0);       // → [0, 1]
+index.length;              // → 3
+```
+
+### `slidingWindows(C, k, stride?, offset?, edge?) -> number[][]`
+
+Generate column index tuples for sliding-window k-mer tokenization.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `C` | `number` | Number of columns |
+| `k` | `number` | Window size |
+| `stride` | `number` or `null` | Step between window starts (default: `k`) |
+| `offset` | `number` | Starting column (default: `0`) |
+| `edge` | `string` | `'truncate'` (default) or `'pad'` |
+
+**Returns:** `(M, k)` array of column indices. `-1` for out-of-bounds (with `edge='pad'`).
+
+### `allColumnKtuples(C, k, ordered?) -> number[][]`
+
+Generate all k-tuples of column indices. **WARNING:** $O(C^k)$.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `C` | `number` | Number of columns |
+| `k` | `number` | Tuple size |
+| `ordered` | `boolean` | `true` (default): permutations; `false`: combinations |
+
+**Returns:** `(T, k)` array of column index tuples.
+
+### `kmerTokenize(alignment, N, C, A, kOrTuples, gapMode?, alphabet?) -> object`
+
+Convert a single-character token alignment to k-mer tokens. Accepts either an integer `k` (backward compatible, non-overlapping windows where `C` must be divisible by `k`) or a `(T, k)` array of column index tuples.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -206,16 +245,22 @@ Convert a single-character token alignment to k-mer tokens. Groups `k` consecuti
 | `N` | `number` | Number of sequences |
 | `C` | `number` | Number of columns |
 | `A` | `number` | Single-character alphabet size |
-| `k` | `number` | k-mer size (e.g., 3 for codons) |
-| `gapMode` | `string` | `'any'` (default): gap in any position gaps the k-mer; `'all'`: only all-gap k-mers become gaps |
+| `kOrTuples` | `number` or `number[][]` | Integer `k` or column tuples |
+| `gapMode` | `string` | `'any'` (default) or `'all'` |
 | `alphabet` | `string[]` or `null` | Single-character labels for building k-mer labels |
 
-**Returns:** `{ alignment: Int32Array, Ak: number, N: number, Ck: number, alphabet?: string[] }`. Token encoding: 0..$A^k - 1$ for observed k-mers, $A^k$ for ungapped-unobserved, $A^k + 1$ for gap.
+**Returns:** `{ alignment: Int32Array, Ak: number, N: number, Ck: number, index: KmerIndex, alphabet?: string[] }`. Token encoding: 0..$A^k - 1$ for observed k-mers, $A^k$ for ungapped-unobserved, $A^k + 1$ for gap.
 
 ```javascript
-import { kmerTokenize } from './subby/webgpu/index.js';
+import { kmerTokenize, slidingWindows } from './subby/webgpu/index.js';
+
+// Non-overlapping codons (backward compatible)
 const kmer = kmerTokenize(dnaAlignment, 3, 9, 4, 3, 'any', ['A','C','G','T']);
-// kmer.alignment has Ak=64, Ck=3
+
+// Overlapping stride-1 windows
+const windows = slidingWindows(100, 3, 1);
+const result = kmerTokenize(dnaAlignment, 3, 100, 4, windows);
+result.index.tupleToIdx([5, 6, 7]);  // → 5
 ```
 
 ---

@@ -475,7 +475,7 @@ Remap a 64-codon tokenized alignment to 61-sense-codon tokens. Stop codons becom
 
 ### `split_paired_columns(alignment, paired_columns, A=20)`
 
-Split an alignment into paired and single-column alignments. For coevolution models that operate on pairs of columns (e.g., CherryML SiteRM with $A = 400 = 20 \times 20$ amino acid pairs).
+Split an alignment into paired and single-column alignments. For coevolution models that operate on pairs of columns (e.g., CherryML SiteRM with $A = 400 = 20 \times 20$ amino acid pairs). Internally uses `kmer_tokenize` with k=2 column tuples for pairs and k=1 for singles.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -493,6 +493,8 @@ Split an alignment into paired and single-column alignments. For coevolution mod
 | `single_columns` | `list[int]` | Columns not in any pair |
 | `A_paired` | `int` | $A \times A$ |
 | `A_singles` | `int` | $A$ |
+| `paired_index` | `KmerIndex` | Tuple ↔ index mapping for paired columns |
+| `singles_index` | `KmerIndex` | Tuple ↔ index mapping for single columns |
 
 ### `merge_paired_columns(paired_posterior, singles_posterior, split_info)`
 
@@ -505,6 +507,14 @@ Reassemble per-column posteriors from paired and single results. Marginalizes th
 | `split_info` | `dict` | Output from `split_paired_columns` |
 
 **Returns:** `(A, C)` array — posterior for all columns in original order.
+
+### K-mer tokenization
+
+See the [Oracle API reference](oracle.md#k-mer-tokenization) for full documentation of `KmerIndex`, `sliding_windows`, `all_column_ktuples`, and `kmer_tokenize`. These functions are implemented in `subby.formats` and re-exported from both `subby.jax` and `subby.oracle`.
+
+```python
+from subby.formats import kmer_tokenize, sliding_windows, all_column_ktuples, KmerIndex
+```
 
 ---
 

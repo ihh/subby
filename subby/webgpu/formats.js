@@ -676,12 +676,259 @@ export function codonToSense(alignment, A = 64) {
   return { alignment: result, A_sense: ASense, alphabet: gc.senseCodons };
 }
 
+// ---- K-mer index ----
+
+/**
+ * Maps between column tuples and output alignment indices.
+ * Provides O(1) lookup from column tuple to output index and vice versa.
+ */
+export class KmerIndex {
+  /**
+   * @param {Int32Array|number[][]} tuples - (T, k) row-major column index tuples.
+   *   If Int32Array, interpreted as flat T*k row-major. Must also pass k.
+   *   If array of arrays, k is inferred from inner length.
+   * @param {number} [k] - required when tuples is a flat Int32Array
+   */
+  constructor(tuples, k) {
+    if (tuples instanceof Int32Array ||
+        (typeof BigInt64Array !== 'undefined' && tuples instanceof BigInt64Array) ||
+        (ArrayBuffer.isView(tuples) && !Array.isArray(tuples))) {
+      // Flat typed array: need k
+      if (k == null) throw new Error('k is required when tuples is a flat typed array');
+      this._k = k;
+      this._flat = new Int32Array(tuples);
+      this._T = this._flat.length / k;
+      if (this._flat.length % k !== 0) {
+        throw new Error(`Flat tuples length (${this._flat.length}) not divisible by k (${k})`);
+      }
+    } else if (Array.isArray(tuples)) {
+      // Array of arrays
+      this._T = tuples.length;
+      if (this._T === 0) {
+        this._k = k || 0;
+        this._flat = new Int32Array(0);
+      } else {
+        this._k = tuples[0].length;
+        this._flat = new Int32Array(this._T * this._k);
+        for (let i = 0; i < this._T; i++) {
+          for (let j = 0; j < this._k; j++) {
+            this._flat[i * this._k + j] = tuples[i][j];
+          }
+        }
+      }
+    } else {
+      throw new Error('tuples must be Int32Array or array of arrays');
+    }
+
+    // Build lookup: tuple string → index
+    this._lookup = new Map();
+    for (let i = 0; i < this._T; i++) {
+      const key = this._tupleKey(i);
+      this._lookup.set(key, i);
+    }
+  }
+
+  /** @private */
+  _tupleKey(idx) {
+    const offset = idx * this._k;
+    let key = '';
+    for (let j = 0; j < this._k; j++) {
+      if (j > 0) key += ',';
+      key += this._flat[offset + j];
+    }
+    return key;
+  }
+
+  /** @private */
+  _arrayToKey(arr) {
+    let key = '';
+    for (let j = 0; j < arr.length; j++) {
+      if (j > 0) key += ',';
+      key += arr[j];
+    }
+    return key;
+  }
+
+  /**
+   * Column tuple to index in the output alignment.
+   * @param {number[]} t - column tuple
+   * @returns {number} index, or -1 if absent
+   */
+  tupleToIdx(t) {
+    const key = this._arrayToKey(t);
+    const idx = this._lookup.get(key);
+    return idx !== undefined ? idx : -1;
+  }
+
+  /**
+   * Index in the output alignment to column tuple.
+   * @param {number} idx
+   * @returns {number[]} column indices
+   */
+  idxToTuple(idx) {
+    const offset = idx * this._k;
+    const result = new Array(this._k);
+    for (let j = 0; j < this._k; j++) {
+      result[j] = this._flat[offset + j];
+    }
+    return result;
+  }
+
+  /** Number of tuples */
+  get length() { return this._T; }
+
+  /** k-mer size */
+  get k() { return this._k; }
+}
+
+// ---- Sliding windows ----
+
+/**
+ * Generate column index tuples for sliding-window k-mer tokenization.
+ *
+ * @param {number} C - number of columns in the alignment
+ * @param {number} k - window size (k-mer length)
+ * @param {number|null} [stride=null] - step between window starts. Default null -> k (non-overlapping).
+ * @param {number} [offset=0] - starting column index
+ * @param {string} [edge='truncate'] - handling of incomplete trailing window:
+ *   'truncate' - drop incomplete trailing window (default)
+ *   'pad' - include partial window, using -1 for out-of-bounds columns
+ * @returns {{tuples: Int32Array, T: number, k: number}}
+ *   tuples is flat T*k row-major Int32Array of column indices.
+ *   Entries of -1 indicate out-of-bounds positions (only with edge='pad').
+ */
+export function slidingWindows(C, k, stride = null, offset = 0, edge = 'truncate') {
+  if (stride === null) stride = k;
+
+  let starts;
+  if (edge === 'truncate') {
+    // starts from offset up to C - k (inclusive), stepping by stride
+    starts = [];
+    for (let s = offset; s <= C - k; s += stride) {
+      starts.push(s);
+    }
+  } else if (edge === 'pad') {
+    starts = [];
+    for (let s = offset; s < C; s += stride) {
+      starts.push(s);
+    }
+  } else {
+    throw new Error(`Unknown edge mode: '${edge}'`);
+  }
+
+  const T = starts.length;
+  const tuples = new Int32Array(T * k);
+
+  for (let i = 0; i < T; i++) {
+    const base = starts[i];
+    for (let j = 0; j < k; j++) {
+      const col = base + j;
+      tuples[i * k + j] = (col < C) ? col : -1;
+    }
+  }
+
+  return { tuples, T, k };
+}
+
+// ---- All column k-tuples ----
+
+/**
+ * Generate all k-tuples of column indices.
+ *
+ * WARNING: produces O(C^k) tuples. Use with caution for large C or k > 2.
+ *
+ * @param {number} C - number of columns
+ * @param {number} k - tuple size
+ * @param {boolean} [ordered=true] - if true, permutations (C*(C-1) for k=2);
+ *   if false, combinations (C choose k)
+ * @returns {{tuples: Int32Array, T: number, k: number}}
+ *   tuples is flat T*k row-major Int32Array of column index tuples.
+ */
+export function allColumnKtuples(C, k, ordered = true) {
+  const result = [];
+
+  if (ordered) {
+    // Generate permutations of k elements from 0..C-1
+    _permutations(C, k, [], result);
+  } else {
+    // Generate combinations of k elements from 0..C-1
+    _combinations(C, k, 0, [], result);
+  }
+
+  const T = result.length;
+  const tuples = new Int32Array(T * k);
+  for (let i = 0; i < T; i++) {
+    for (let j = 0; j < k; j++) {
+      tuples[i * k + j] = result[i][j];
+    }
+  }
+
+  return { tuples, T, k };
+}
+
+/** @private Generate permutations of k elements from 0..n-1 (no repeats) */
+function _permutations(n, k, current, result) {
+  if (current.length === k) {
+    result.push([...current]);
+    return;
+  }
+  for (let i = 0; i < n; i++) {
+    if (current.includes(i)) continue;
+    current.push(i);
+    _permutations(n, k, current, result);
+    current.pop();
+  }
+}
+
+/** @private Generate combinations of k elements from start..n-1 */
+function _combinations(n, k, start, current, result) {
+  if (current.length === k) {
+    result.push([...current]);
+    return;
+  }
+  for (let i = start; i < n; i++) {
+    current.push(i);
+    _combinations(n, k, i + 1, current, result);
+    current.pop();
+  }
+}
+
+// ---- Build k-mer alphabet helper ----
+
+/**
+ * Build k-mer label list from single-character alphabet, or return null.
+ * @private
+ */
+function _buildKmerAlphabet(alphabet, A, k) {
+  if (alphabet === null) return null;
+  const Ak = Math.pow(A, k);
+  const labels = [];
+  const indices = new Array(k).fill(0);
+  for (let i = 0; i < Ak; i++) {
+    let label = '';
+    let val = i;
+    for (let p = k - 1; p >= 0; p--) {
+      indices[p] = val % A;
+      val = Math.floor(val / A);
+    }
+    for (let p = 0; p < k; p++) label += alphabet[indices[p]];
+    labels.push(label);
+  }
+  return labels;
+}
+
 // ---- K-mer tokenization ----
 
 /**
  * Convert single-character token alignment to k-mer tokens.
- * Groups k consecutive columns into one k-mer column (non-overlapping).
- * C must be divisible by k.
+ *
+ * Accepts either:
+ *   - A number k: generates non-overlapping contiguous windows of size k.
+ *     C must be divisible by k (backward compatible).
+ *   - An Int32Array (flat T*k row-major) or array of arrays: column tuples,
+ *     each of length k. Use slidingWindows() or allColumnKtuples() to generate
+ *     tuples, or pass custom tuples directly. Entries of -1 in tuples are
+ *     treated as unobserved positions.
  *
  * Token encoding: 0..A^k-1 observed, A^k ungapped-unobserved, A^k+1 gap.
  * When gapMode='all', partial gaps produce illegal token (A^k+2).
@@ -690,41 +937,117 @@ export function codonToSense(alignment, A = 64) {
  * @param {number} N - number of sequences
  * @param {number} C - number of columns
  * @param {number} A - single-character alphabet size
- * @param {number} k - k-mer size (e.g. 3 for codons)
+ * @param {number|Int32Array|number[][]} kOrTuples - either an int k or column tuples
  * @param {string} [gapMode='any'] - 'any' or 'all'
  * @param {string[]|null} [alphabet=null] - single-char labels for k-mer labels
  * @returns {{alignment: Int32Array, A_kmer: number, N: number, C_k: number,
- *            alphabet: string[]|null}}
+ *            index: KmerIndex, alphabet: string[]|null}}
  */
-export function kmerTokenize(alignment, N, C, A, k, gapMode = 'any', alphabet = null) {
-  if (C % k !== 0) throw new Error(`Number of columns (${C}) not divisible by k (${k})`);
-  const Ck = C / k;
+export function kmerTokenize(alignment, N, C, A, kOrTuples, gapMode = 'any', alphabet = null) {
+  let k, T, columnTuples;
+
+  if (typeof kOrTuples === 'number') {
+    // Backward-compatible: integer k → non-overlapping contiguous windows
+    k = kOrTuples;
+    if (C % k !== 0) throw new Error(`Number of columns (${C}) not divisible by k (${k})`);
+    const sw = slidingWindows(C, k);
+    columnTuples = sw.tuples;
+    T = sw.T;
+  } else if (kOrTuples instanceof Int32Array || (ArrayBuffer.isView(kOrTuples) && !(kOrTuples instanceof Array))) {
+    // Flat typed array: need to infer k from context
+    // User must ensure it's T*k row-major. We need k to interpret it.
+    // Convention: when passing flat Int32Array, the caller should also set
+    // .k on the array or we infer from the shape. Since JS typed arrays
+    // don't carry shape, we require array of arrays or the slidingWindows
+    // result. For flat Int32Array, we look for a .k property or require
+    // it to have been generated by slidingWindows/allColumnKtuples.
+    // Fallback: we cannot infer k from a flat array alone. Require array of arrays.
+    throw new Error(
+      'Flat typed array passed to kOrTuples without shape info. ' +
+      'Use slidingWindows() or allColumnKtuples() which return {tuples, T, k}, ' +
+      'then pass the result object or use array-of-arrays format.'
+    );
+  } else if (Array.isArray(kOrTuples)) {
+    // Array of arrays
+    if (kOrTuples.length === 0) {
+      throw new Error('Empty column tuples array');
+    }
+    k = kOrTuples[0].length;
+    T = kOrTuples.length;
+    columnTuples = new Int32Array(T * k);
+    for (let i = 0; i < T; i++) {
+      if (kOrTuples[i].length !== k) {
+        throw new Error(`Inconsistent tuple length at index ${i}: expected ${k}, got ${kOrTuples[i].length}`);
+      }
+      for (let j = 0; j < k; j++) {
+        columnTuples[i * k + j] = kOrTuples[i][j];
+      }
+    }
+  } else if (typeof kOrTuples === 'object' && kOrTuples !== null &&
+             'tuples' in kOrTuples && 'T' in kOrTuples && 'k' in kOrTuples) {
+    // Result object from slidingWindows or allColumnKtuples
+    columnTuples = kOrTuples.tuples;
+    T = kOrTuples.T;
+    k = kOrTuples.k;
+  } else {
+    throw new Error('kOrTuples must be a number, array of arrays, or {tuples, T, k} object');
+  }
+
   const Ak = Math.pow(A, k);
   const gapTok = Ak + 1;
   const unobsTok = Ak;
   const illegalTok = Ak + 2;
 
-  const result = new Int32Array(N * Ck);
+  const index = new KmerIndex(columnTuples, k);
+
+  if (T === 0) {
+    const kmerAlphabet = _buildKmerAlphabet(alphabet, A, k);
+    return {
+      alignment: new Int32Array(0),
+      A_kmer: Ak,
+      N,
+      C_k: 0,
+      index,
+      alphabet: kmerAlphabet,
+    };
+  }
+
+  // Check for -1 sentinels in column tuples
+  let hasSentinel = false;
+  for (let i = 0; i < columnTuples.length; i++) {
+    if (columnTuples[i] < 0) { hasSentinel = true; break; }
+  }
+
+  const result = new Int32Array(N * T);
 
   for (let n = 0; n < N; n++) {
-    for (let ck = 0; ck < Ck; ck++) {
-      const base = n * C + ck * k;
-      let allObs = true, allUnobs = true, hasGap = false, allGap = true;
+    for (let t = 0; t < T; t++) {
+      const tupleOffset = t * k;
+      let allObs = true, hasGap = false, allGap = true;
       let kmerIdx = 0;
+
       for (let p = 0; p < k; p++) {
-        const tok = alignment[base + p];
+        const col = columnTuples[tupleOffset + p];
+        let tok;
+        if (col < 0) {
+          // Sentinel: treat as unobserved
+          tok = A;
+        } else {
+          tok = alignment[n * C + col];
+        }
+
         const isObs = tok >= 0 && tok < A;
-        const isUnobs = tok === A;
         const isGap = tok < 0 || tok > A;
+
         if (!isObs) allObs = false;
-        if (!isUnobs) allUnobs = false;
         if (isGap) hasGap = true;
         if (!isGap) allGap = false;
+
         if (isObs) kmerIdx = kmerIdx * A + tok;
         else kmerIdx = kmerIdx * A;
       }
 
-      const outIdx = n * Ck + ck;
+      const outIdx = n * T + t;
       if (allObs) {
         result[outIdx] = kmerIdx;
       } else if (gapMode === 'any' && hasGap) {
@@ -739,21 +1062,7 @@ export function kmerTokenize(alignment, N, C, A, k, gapMode = 'any', alphabet = 
     }
   }
 
-  let kmerAlphabet = null;
-  if (alphabet !== null) {
-    kmerAlphabet = [];
-    const indices = new Array(k).fill(0);
-    for (let i = 0; i < Ak; i++) {
-      let label = '';
-      let val = i;
-      for (let p = k - 1; p >= 0; p--) {
-        indices[p] = val % A;
-        val = Math.floor(val / A);
-      }
-      for (let p = 0; p < k; p++) label += alphabet[indices[p]];
-      kmerAlphabet.push(label);
-    }
-  }
+  const kmerAlphabet = _buildKmerAlphabet(alphabet, A, k);
 
-  return { alignment: result, A_kmer: Ak, N, C_k: Ck, alphabet: kmerAlphabet };
+  return { alignment: result, A_kmer: Ak, N, C_k: T, index, alphabet: kmerAlphabet };
 }

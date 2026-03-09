@@ -161,6 +161,23 @@ Remap a 64-codon tokenized flat alignment to 61-sense-codon tokens. Stop codons 
 
 **Returns:** `Vec<i32>` of length `n*c` with $A_\text{sense} = 61$ tokens.
 
+### `KmerIndex`
+
+```rust
+pub struct KmerIndex {
+    pub tuples: Vec<Vec<i64>>,  // (T, k) column tuples
+}
+```
+
+Maps between column tuples and output alignment indices. Provides O(1) lookup in both directions.
+
+| Method | Description |
+|--------|-------------|
+| `new(tuples)` | Create from `Vec<Vec<i64>>` |
+| `tuple_to_idx(&self, t)` | Column tuple → output index. Returns `-1` if absent. |
+| `idx_to_tuple(&self, idx)` | Output index → column tuple. |
+| `len(&self)` | Number of tuples. |
+
 ### `KmerResult`
 
 ```rust
@@ -168,13 +185,40 @@ pub struct KmerResult {
     pub alignment: Vec<i32>,  // flat (n * c_k) tokens
     pub a_kmer: usize,        // A^k
     pub n: usize,             // number of sequences
-    pub c_k: usize,           // C / k columns
+    pub c_k: usize,           // number of output columns
+    pub index: KmerIndex,     // tuple ↔ index mapping
 }
 ```
 
+### `sliding_windows(c: usize, k: usize, stride: Option<usize>, offset: usize, edge: &str) -> Vec<Vec<i64>>`
+
+Generate column index tuples for sliding-window k-mer tokenization.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `c` | `usize` | Number of columns |
+| `k` | `usize` | Window size |
+| `stride` | `Option<usize>` | Step between starts (`None` → `k`) |
+| `offset` | `usize` | Starting column (default `0`) |
+| `edge` | `&str` | `"truncate"` or `"pad"` |
+
+**Returns:** `Vec<Vec<i64>>` — `(M, k)` column indices. `-1` for out-of-bounds (with `"pad"`).
+
+### `all_column_ktuples(c: usize, k: usize, ordered: bool) -> Vec<Vec<i64>>`
+
+Generate all k-tuples of column indices. **WARNING:** $O(C^k)$.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `c` | `usize` | Number of columns |
+| `k` | `usize` | Tuple size |
+| `ordered` | `bool` | `true`: permutations; `false`: combinations |
+
+**Returns:** `Vec<Vec<i64>>`.
+
 ### `kmer_tokenize(alignment: &[i32], n: usize, c: usize, a: usize, k: usize, gap_mode: &str) -> KmerResult`
 
-Convert single-character tokens to k-mer tokens. Groups `k` consecutive columns into one k-mer column (non-overlapping). `c` must be divisible by `k`.
+Convert single-character tokens to k-mer tokens using non-overlapping windows. `c` must be divisible by `k`. Backward-compatible API that delegates to `kmer_tokenize_tuples`.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -183,7 +227,22 @@ Convert single-character tokens to k-mer tokens. Groups `k` consecutive columns 
 | `c` | `usize` | Number of columns |
 | `a` | `usize` | Single-character alphabet size |
 | `k` | `usize` | k-mer size (e.g., 3 for codons) |
-| `gap_mode` | `&str` | `"any"`: gap in any position gaps the k-mer; `"all"`: only all-gap k-mers become gaps |
+| `gap_mode` | `&str` | `"any"` or `"all"` |
+
+**Returns:** `KmerResult`.
+
+### `kmer_tokenize_tuples(alignment: &[i32], n: usize, c: usize, a: usize, column_tuples: &[Vec<i64>], gap_mode: &str) -> KmerResult`
+
+Core tokenizer accepting arbitrary column tuples. Entries of `-1` in tuples are treated as unobserved positions.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `&[i32]` | Flat `(n*c)` row-major tokens |
+| `n` | `usize` | Number of sequences |
+| `c` | `usize` | Number of columns |
+| `a` | `usize` | Single-character alphabet size |
+| `column_tuples` | `&[Vec<i64>]` | Column index tuples |
+| `gap_mode` | `&str` | `"any"` or `"all"` |
 
 **Returns:** `KmerResult`. Token encoding: 0..$A^k - 1$ for observed k-mers, $A^k$ for ungapped-unobserved, $A^k + 1$ for gap.
 
@@ -203,7 +262,7 @@ Convert single-character tokens to k-mer tokens. Groups `k` consecutive columns 
 | `f81_fast` | `f81_counts` |
 | `mixture` | `mixture_posterior` |
 | `branch_mask` | `compute_branch_mask` |
-| `formats` | `parse_newick`, `parse_fasta`, `parse_strings`, `combine_tree_alignment`, `detect_alphabet`, `genetic_code`, `codon_to_sense`, `kmer_tokenize` |
+| `formats` | `parse_newick`, `parse_fasta`, `parse_strings`, `combine_tree_alignment`, `detect_alphabet`, `genetic_code`, `codon_to_sense`, `kmer_tokenize`, `kmer_tokenize_tuples`, `sliding_windows`, `all_column_ktuples`, `KmerIndex` |
 
 ---
 
