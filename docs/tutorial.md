@@ -40,27 +40,30 @@ Tree:         0 (root)
           2   3   5
 ```
 
-Under the hood, subby represents trees as two arrays. `parentIndex` encodes the topology (each node's parent has a smaller index), and `distanceToParent` gives branch lengths:
+Under the hood, subby represents trees as two arrays in a `Tree` NamedTuple. `parentIndex` encodes the topology (each node's parent has a smaller index), and `distanceToParent` gives branch lengths:
 
 ```python
-tree = {
-    'parentIndex': tree_result['parentIndex'],
-    'distanceToParent': tree_result['distanceToParent'],
-}
+from subby.formats import Tree
+
+tree = Tree(
+    parentIndex=tree_result['parentIndex'],
+    distanceToParent=tree_result['distanceToParent'],
+)
 ```
 
 You can also construct these arrays directly:
 
 ```python
-parentIndex = np.array([-1, 0, 0, 1, 1], dtype=np.int32)
-distanceToParent = np.array([0.0, 0.1, 0.3, 0.05, 0.15])
-tree = {'parentIndex': parentIndex, 'distanceToParent': distanceToParent}
+tree = Tree(
+    parentIndex=np.array([-1, 0, 0, 1, 1], dtype=np.int32),
+    distanceToParent=np.array([0.0, 0.1, 0.3, 0.05, 0.15]),
+)
 ```
 
 We can inspect the tree structure:
 
 ```python
-left_child, right_child, sibling = children_of(tree['parentIndex'])
+left_child, right_child, sibling = children_of(tree.parentIndex)
 # left_child:  [1, 3, -1, -1, -1]  (node 0's left child is 1, etc.)
 # right_child: [2, 4, -1, -1, -1]
 # sibling:     [-1, 2, 1, 4, 3]    (node 1's sibling is 2, etc.)
@@ -89,9 +92,8 @@ To combine a tree and alignment (mapping leaves by name), use `combine_tree_alig
 ```python
 tree_result = parse_newick("((leaf2:0.05,leaf3:0.15):0.1,leaf4:0.3);")
 combined = combine_tree_alignment(tree_result, aln_result)
-alignment = combined['alignment']  # (R, C) int32 — full tree, internal nodes filled
-tree = {'parentIndex': combined['parentIndex'],
-        'distanceToParent': combined['distanceToParent']}
+alignment = combined.alignment  # (R, C) int32 — full tree, internal nodes filled
+tree = combined.tree            # Tree NamedTuple with parentIndex and distanceToParent
 ```
 
 Internal nodes are automatically filled with the ungapped-unobserved token (`A = len(alphabet)`).
@@ -233,7 +235,7 @@ Fast-evolving columns will have higher posterior weight on larger rate categorie
 Not all branches are informative for every column. The Steiner tree mask identifies which branches connect ungapped leaves:
 
 ```python
-mask = compute_branch_mask(alignment, tree['parentIndex'], A=4)
+mask = compute_branch_mask(alignment, tree.parentIndex, A=4)
 # Shape: (5, 6) — boolean per branch per column
 
 # Column 5 has a gap at root and unobserved at node 1:
@@ -384,7 +386,6 @@ from subby.formats import (
 )
 from subby.jax.models import gy94_model
 from subby.jax import LogLike, Counts
-from subby.jax.types import Tree
 
 # Parse a DNA alignment (9 nucleotides = 3 codons per sequence)
 dna_aln = parse_fasta(">seq1\nATGGCCAAA\n>seq2\nATGGCTAAG\n>seq3\nATGGCAAAA\n")
@@ -392,7 +393,7 @@ print(f"DNA alignment: {dna_aln['alignment'].shape}")
 # DNA alignment: (3, 9) — 3 sequences, 9 columns
 
 # Tokenize into codons (k=3, A=4 for DNA)
-codon_aln = kmer_tokenize(dna_aln['alignment'], A=4, k=3, alphabet=list("ACGT"))
+codon_aln = kmer_tokenize(dna_aln['alignment'], A=4, k_or_tuples=3, alphabet=list("ACGT"))
 print(f"Codon alignment: {codon_aln['alignment'].shape}, A_kmer={codon_aln['A_kmer']}")
 # Codon alignment: (3, 3), A_kmer=64 — 3 sequences, 3 codon columns
 
@@ -409,21 +410,16 @@ combined = combine_tree_alignment(tree_result, {
     'alphabet': sense_aln['alphabet'],
 })
 
-tree = Tree(
-    parentIndex=combined['parentIndex'],
-    distanceToParent=combined['distanceToParent'],
-)
-
 # Build GY94 model (omega < 1 = purifying selection, kappa > 1 = transition bias)
 model = gy94_model(omega=0.5, kappa=2.0)
 
 # Compute per-codon log-likelihoods
-ll = LogLike(combined['alignment'], tree, model)
+ll = LogLike(combined.alignment, combined.tree, model)
 print(f"Log-likelihoods: {ll}")
 # 3 values, one per codon column
 
 # Compute expected substitution counts (61 x 61 x 3 tensor)
-counts = Counts(combined['alignment'], tree, model)
+counts = Counts(combined.alignment, combined.tree, model)
 print(f"Counts shape: {counts.shape}")
 # (61, 61, 3) — substitution counts and dwell times per codon column
 ```
@@ -457,7 +453,6 @@ from subby.formats import (
     split_paired_columns, merge_paired_columns,
 )
 from subby.jax import RootProb
-from subby.jax.types import Tree
 from subby.jax.models import jukes_cantor_model
 from subby.jax.presets import cherryml_siteRM
 
@@ -466,11 +461,8 @@ aln = parse_fasta(">seq1\nMKAIL\n>seq2\nMRAVL\n>seq3\nMKAVL\n")
 tree_result = parse_newick("((seq1:0.1,seq2:0.2):0.05,seq3:0.3);")
 combined = combine_tree_alignment(tree_result, aln)
 
-alignment = combined['alignment']   # (R, 5) int32
-tree = Tree(
-    parentIndex=combined['parentIndex'],
-    distanceToParent=combined['distanceToParent'],
-)
+alignment = combined.alignment   # (R, 5) int32
+tree = combined.tree
 
 # Contact map: columns 1-3 and columns 2-4 are in contact
 paired_columns = [(1, 3), (2, 4)]

@@ -5,6 +5,7 @@ import numpy as np
 
 from .oracle import oracle
 from .formats import (
+    Tree,
     detect_alphabet,
     parse_newick,
     parse_fasta,
@@ -137,10 +138,10 @@ def load_input(data):
 
     # Parse tree
     tree_spec = data["tree"]
-    tree = {
-        "parentIndex": np.array(tree_spec["parentIndex"], dtype=np.intp),
-        "distanceToParent": np.array(tree_spec["distanceToParent"], dtype=np.float64),
-    }
+    tree = Tree(
+        parentIndex=np.array(tree_spec["parentIndex"], dtype=np.intp),
+        distanceToParent=np.array(tree_spec["distanceToParent"], dtype=np.float64),
+    )
 
     # Parse alignment
     alignment = _parse_alignment(data["alignment"], alphabet)

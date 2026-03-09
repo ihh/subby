@@ -69,7 +69,7 @@ aln = parse_dict({"human": "ACGT", "mouse": "TGCA"})
 # Combine with a tree (maps leaves by name, fills internal nodes)
 tree = parse_newick("(human:0.1,mouse:0.2);")
 combined = combine_tree_alignment(tree, aln)
-alignment = combined['alignment']  # (R, C) int32, ready for LogLike/Counts/etc.
+alignment = combined.alignment  # (R, C) int32, ready for LogLike/Counts/etc.
 ```
 
 #### Alphabet detection

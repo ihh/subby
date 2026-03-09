@@ -9,6 +9,19 @@ Pure Python + NumPy, no external dependencies.
 
 import re
 import numpy as np
+from typing import NamedTuple
+
+
+class Tree(NamedTuple):
+    parentIndex: np.ndarray       # (R,) int32, preorder: parentIndex[i] < i, parentIndex[0] = -1
+    distanceToParent: np.ndarray  # (R,) float64
+
+
+class CombinedResult(NamedTuple):
+    alignment: np.ndarray  # (R, C) int32
+    tree: Tree
+    alphabet: list
+    leaf_names: list
 
 
 # ---------------------------------------------------------------------------
@@ -612,22 +625,123 @@ def parse_dict(sequences, alphabet=None):
 # K-mer tokenization
 # ---------------------------------------------------------------------------
 
-def kmer_tokenize(alignment, A, k, gap_mode='any', alphabet=None):
+class KmerIndex:
+    """Maps between column tuples and output alignment indices.
+
+    Provides O(1) lookup from column tuple to output index and vice versa.
+    """
+
+    def __init__(self, column_tuples):
+        """
+        Args:
+            column_tuples: (T, k) array-like of column indices.
+        """
+        self.tuples = np.asarray(column_tuples, dtype=np.int64)
+        self._lookup = {}
+        for i in range(len(self.tuples)):
+            self._lookup[tuple(self.tuples[i])] = i
+
+    def tuple_to_idx(self, t):
+        """Column tuple → index in the output alignment. Returns -1 if absent."""
+        return self._lookup.get(tuple(t), -1)
+
+    def idx_to_tuple(self, idx):
+        """Index in the output alignment → column tuple."""
+        return tuple(self.tuples[idx])
+
+    def __len__(self):
+        return len(self.tuples)
+
+    def __repr__(self):
+        return f"KmerIndex({len(self)} tuples, k={self.tuples.shape[1] if len(self) > 0 else 0})"
+
+
+def sliding_windows(C, k, stride=None, offset=0, edge='truncate'):
+    """Generate column index tuples for sliding-window k-mer tokenization.
+
+    Args:
+        C: number of columns in the alignment
+        k: window size (k-mer length)
+        stride: step between window starts. Default None → k (non-overlapping).
+        offset: starting column index. Default 0.
+        edge: handling of incomplete trailing window:
+              'truncate' — drop incomplete trailing window (default)
+              'pad' — include partial window, using -1 for out-of-bounds columns
+
+    Returns:
+        (M, k) int64 array of column indices. Entries of -1 indicate
+        out-of-bounds positions (only with edge='pad').
+    """
+    if stride is None:
+        stride = k
+
+    if edge == 'truncate':
+        starts = np.arange(offset, C - k + 1, stride)
+    elif edge == 'pad':
+        starts = np.arange(offset, C, stride)
+    else:
+        raise ValueError(f"Unknown edge mode: {edge!r}")
+
+    if len(starts) == 0:
+        return np.zeros((0, k), dtype=np.int64)
+
+    # (M, k) array
+    col_indices = starts[:, None] + np.arange(k)
+    if edge == 'pad':
+        col_indices = np.where(col_indices < C, col_indices, -1)
+
+    return col_indices.astype(np.int64)
+
+
+def all_column_ktuples(C, k, ordered=True):
+    """Generate all k-tuples of column indices.
+
+    WARNING: produces O(C^k) tuples. Use with caution for large C or k > 2.
+
+    Args:
+        C: number of columns
+        k: tuple size
+        ordered: if True, permutations (C * (C-1) for k=2);
+                 if False, combinations (C choose k)
+
+    Returns:
+        (T, k) int64 array of column index tuples
+    """
+    if ordered:
+        from itertools import permutations
+        tuples = list(permutations(range(C), k))
+    else:
+        from itertools import combinations
+        tuples = list(combinations(range(C), k))
+
+    if len(tuples) == 0:
+        return np.zeros((0, k), dtype=np.int64)
+
+    return np.array(tuples, dtype=np.int64)
+
+
+def kmer_tokenize(alignment, A, k_or_tuples, gap_mode='any', alphabet=None):
     """Convert single-character token alignment to k-mer tokens.
 
-    Groups k consecutive columns into one k-mer column (non-overlapping).
-    C must be divisible by k.
+    Accepts either:
+      - An integer k: generates non-overlapping contiguous windows of size k.
+        C must be divisible by k (backward compatible with original API).
+      - A (T, k) array-like of column index tuples: tokenizes arbitrary column
+        groupings. Use sliding_windows() or all_column_ktuples() to generate
+        tuples, or pass custom tuples directly. Entries of -1 in tuples are
+        treated as unobserved positions.
 
-    Token encoding for the output alignment follows the standard convention:
+    Token encoding for the output alignment:
     0..A^k-1 for observed k-mers, A^k for ungapped-unobserved, A^k+1 for gap.
     When gap_mode='all', partial gaps produce an illegal token (A^k+2).
 
     Args:
-        alignment: (N, C) int32 tokens (0..A-1 observed, A ungapped-unobserved,
+        alignment: (R, C) int32 tokens (0..A-1 observed, A ungapped-unobserved,
                    A+1 or -1 gap)
         A: single-character alphabet size
-        k: k-mer size (e.g. 3 for codons)
-        gap_mode: 'any' — gap in any of the k positions gaps the entire k-mer
+        k_or_tuples: either an int k (non-overlapping windows, C must be
+                     divisible by k) or a (T, k) array-like of column tuples
+        gap_mode: 'any' — gap in any position gaps the entire k-mer
                   'all' — only all-gap k-mers become gaps; partial gaps become
                           an illegal token (A^k+2)
         alphabet: optional list of A single-character labels for building
@@ -635,27 +749,62 @@ def kmer_tokenize(alignment, A, k, gap_mode='any', alphabet=None):
 
     Returns:
         dict with:
-            alignment: (N, C//k) int32 k-mer tokens
+            alignment: (R, T) int32 k-mer tokens
             A_kmer: int, k-mer alphabet size (A^k)
+            index: KmerIndex mapping tuples ↔ output positions
             alphabet: list of A^k k-mer label strings (only if alphabet given)
     """
     alignment = np.asarray(alignment, dtype=np.int32)
-    N, C = alignment.shape
-    if C % k != 0:
-        raise ValueError(f"Number of columns ({C}) not divisible by k ({k})")
+    R, C = alignment.shape
 
-    C_k = C // k
+    # Determine column_tuples
+    if isinstance(k_or_tuples, (int, np.integer)):
+        k = int(k_or_tuples)
+        if C % k != 0:
+            raise ValueError(
+                f"Number of columns ({C}) not divisible by k ({k})")
+        column_tuples = sliding_windows(C, k)
+    else:
+        column_tuples = np.asarray(k_or_tuples, dtype=np.int64)
+        if column_tuples.ndim != 2:
+            raise ValueError(
+                f"column_tuples must be 2D (T, k), got shape {column_tuples.shape}")
+        k = column_tuples.shape[1]
+
+    T = len(column_tuples)
     A_k = A ** k
+    index = KmerIndex(column_tuples)
 
-    # Reshape to (N, C_k, k)
-    blocks = alignment.reshape(N, C_k, k)
+    if T == 0:
+        kmer_alphabet = _build_kmer_alphabet(alphabet, A, k)
+        out = {
+            'alignment': np.zeros((R, 0), dtype=np.int32),
+            'A_kmer': A_k,
+            'index': index,
+        }
+        if kmer_alphabet is not None:
+            out['alphabet'] = kmer_alphabet
+        return out
+
+    # Build blocks: (R, T, k)
+    # Handle -1 sentinel (out-of-bounds / padding → unobserved)
+    has_sentinel = np.any(column_tuples < 0)
+    if has_sentinel:
+        # Replace -1 with 0 for indexing, then overwrite those positions
+        safe_indices = np.where(column_tuples >= 0, column_tuples, 0)
+        blocks = alignment[:, safe_indices]  # (R, T, k)
+        # Set sentinel positions to unobserved token
+        sentinel_mask = np.broadcast_to(
+            column_tuples[None, :, :] < 0, blocks.shape)
+        blocks = np.where(sentinel_mask, A, blocks)
+    else:
+        blocks = alignment[:, column_tuples]  # (R, T, k)
 
     # Classify each position
     is_observed = (blocks >= 0) & (blocks < A)
     is_gap = (blocks < 0) | (blocks > A)  # -1, A+1, etc.
 
     all_observed = is_observed.all(axis=2)
-    all_unobs = (blocks == A).all(axis=2)
     has_gap = is_gap.any(axis=2)
     all_gap = is_gap.all(axis=2)
 
@@ -668,7 +817,7 @@ def kmer_tokenize(alignment, A, k, gap_mode='any', alphabet=None):
     unobs_tok = A_k
     illegal_tok = A_k + 2
 
-    result = np.full((N, C_k), unobs_tok, dtype=np.int32)
+    result = np.full((R, T), unobs_tok, dtype=np.int32)
     result[all_observed] = kmer_idx[all_observed]
 
     if gap_mode == 'any':
@@ -681,17 +830,24 @@ def kmer_tokenize(alignment, A, k, gap_mode='any', alphabet=None):
         raise ValueError(f"Unknown gap_mode: {gap_mode!r}")
 
     # K-mer alphabet labels
-    kmer_alphabet = None
-    if alphabet is not None:
-        from itertools import product as itertools_product
-        kmer_alphabet = [
-            ''.join(combo) for combo in itertools_product(alphabet, repeat=k)
-        ]
+    kmer_alphabet = _build_kmer_alphabet(alphabet, A, k)
 
-    out = {'alignment': result, 'A_kmer': A_k}
+    out = {
+        'alignment': result,
+        'A_kmer': A_k,
+        'index': index,
+    }
     if kmer_alphabet is not None:
         out['alphabet'] = kmer_alphabet
     return out
+
+
+def _build_kmer_alphabet(alphabet, A, k):
+    """Build k-mer label list from single-character alphabet, or return None."""
+    if alphabet is None:
+        return None
+    from itertools import product as itertools_product
+    return [''.join(combo) for combo in itertools_product(alphabet, repeat=k)]
 
 
 # ---------------------------------------------------------------------------
@@ -833,15 +989,13 @@ def split_paired_columns(alignment, paired_columns, A=20):
             single_columns: list of int — columns not in any pair
             A_paired: A*A
             A_singles: A
+            paired_index: KmerIndex for paired columns
+            singles_index: KmerIndex for single columns
     """
     alignment = np.asarray(alignment, dtype=np.int32)
     N, C = alignment.shape
 
-    unobs = A
-    gap = A + 1
     A_paired = A * A
-    unobs_paired = A_paired
-    gap_paired = A_paired + 1
 
     # Determine which columns are in pairs
     paired_set = set()
@@ -853,33 +1007,25 @@ def split_paired_columns(alignment, paired_columns, A=20):
     P = len(paired_columns)
     S = len(single_columns)
 
-    # Build paired alignment
-    paired_aln = np.full((N, P), unobs_paired, dtype=np.int32)
-    for p, (ci, cj) in enumerate(paired_columns):
-        ti = alignment[:, ci]
-        tj = alignment[:, cj]
+    # Build paired alignment via kmer_tokenize with k=2 tuples
+    if P > 0:
+        paired_tuples = np.array(paired_columns, dtype=np.int64)
+        pt = kmer_tokenize(alignment, A, paired_tuples, gap_mode='any')
+        paired_aln = pt['alignment']
+        paired_index = pt['index']
+    else:
+        paired_aln = np.zeros((N, 0), dtype=np.int32)
+        paired_index = KmerIndex(np.zeros((0, 2), dtype=np.int64))
 
-        obs_i = (ti >= 0) & (ti < A)
-        obs_j = (tj >= 0) & (tj < A)
-        unobs_i = ti == unobs
-        unobs_j = tj == unobs
-        gap_i = (ti == gap) | (ti < 0)
-        gap_j = (tj == gap) | (tj < 0)
-
-        # Both observed → paired token
-        both_obs = obs_i & obs_j
-        paired_aln[both_obs, p] = ti[both_obs] * A + tj[both_obs]
-
-        # Either is gap → paired gap
-        any_gap = gap_i | gap_j
-        paired_aln[any_gap, p] = gap_paired
-
-        # Either is unobserved (but no gap) → paired unobserved
-        any_unobs = (unobs_i | unobs_j) & ~any_gap
-        paired_aln[any_unobs, p] = unobs_paired
-
-    # Build singles alignment
-    singles_aln = alignment[:, single_columns].copy() if S > 0 else np.zeros((N, 0), dtype=np.int32)
+    # Build singles alignment via kmer_tokenize with k=1 tuples
+    if S > 0:
+        singles_tuples = np.array(single_columns, dtype=np.int64).reshape(-1, 1)
+        st = kmer_tokenize(alignment, A, singles_tuples, gap_mode='any')
+        singles_aln = st['alignment']
+        singles_index = st['index']
+    else:
+        singles_aln = np.zeros((N, 0), dtype=np.int32)
+        singles_index = KmerIndex(np.zeros((0, 1), dtype=np.int64))
 
     return {
         'paired_alignment': paired_aln,
@@ -888,6 +1034,8 @@ def split_paired_columns(alignment, paired_columns, A=20):
         'single_columns': single_columns,
         'A_paired': A_paired,
         'A_singles': A,
+        'paired_index': paired_index,
+        'singles_index': singles_index,
     }
 
 
@@ -1010,10 +1158,12 @@ def combine_tree_alignment(tree_result, alignment_result):
             full_aln[n] = aln_data[aln_row]
             leaf_idx += 1
 
-    return {
-        "alignment": full_aln,
-        "parentIndex": tree_result["parentIndex"],
-        "distanceToParent": tree_result["distanceToParent"],
-        "alphabet": alphabet,
-        "leaf_names": tree_leaves,
-    }
+    return CombinedResult(
+        alignment=full_aln,
+        tree=Tree(
+            parentIndex=tree_result["parentIndex"],
+            distanceToParent=tree_result["distanceToParent"],
+        ),
+        alphabet=alphabet,
+        leaf_names=tree_leaves,
+    )

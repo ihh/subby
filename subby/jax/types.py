@@ -2,10 +2,7 @@ from __future__ import annotations
 from typing import NamedTuple, Union
 import jax.numpy as jnp
 
-
-class Tree(NamedTuple):
-    parentIndex: jnp.ndarray       # (R,) int32, preorder: parentIndex[i] < i, parentIndex[0] = -1
-    distanceToParent: jnp.ndarray  # (R,) float
+from ..formats import Tree
 
 
 class DiagModel(NamedTuple):

@@ -44,11 +44,9 @@ combined = combine_tree_alignment(tree, aln)
 model = jukes_cantor_model(4)
 
 # Compute per-column statistics
-tree_dict = {'parentIndex': combined['parentIndex'],
-             'distanceToParent': combined['distanceToParent']}
-log_likelihoods = LogLike(combined['alignment'], tree_dict, model)   # (4,)
-counts = Counts(combined['alignment'], tree_dict, model)              # (4, 4, 4)
-root_posterior = RootProb(combined['alignment'], tree_dict, model)     # (4, 4)
+log_likelihoods = LogLike(combined.alignment, combined.tree, model)   # (4,)
+counts = Counts(combined.alignment, combined.tree, model)              # (4, 4, 4)
+root_posterior = RootProb(combined.alignment, combined.tree, model)     # (4, 4)
 ```
 
 ## Documentation

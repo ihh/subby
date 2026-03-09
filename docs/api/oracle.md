@@ -11,18 +11,20 @@ The oracle is a pure NumPy reference implementation using explicit for-loops. It
 From a Newick string:
 
 ```python
+from subby.formats import Tree
+
 tree_result = parse_newick("((A:0.1,B:0.2):0.05,C:0.3);")
-tree = {'parentIndex': tree_result['parentIndex'],
-        'distanceToParent': tree_result['distanceToParent']}
+tree = Tree(parentIndex=tree_result['parentIndex'],
+            distanceToParent=tree_result['distanceToParent'])
 ```
 
-Or as a plain dict with numpy arrays:
+Or construct directly with numpy arrays:
 
 ```python
-tree = {
-    'parentIndex': np.array([-1, 0, 0, 1, 1], dtype=np.int32),
-    'distanceToParent': np.array([0.0, 0.1, 0.2, 0.15, 0.25]),
-}
+tree = Tree(
+    parentIndex=np.array([-1, 0, 0, 1, 1], dtype=np.int32),
+    distanceToParent=np.array([0.0, 0.1, 0.2, 0.15, 0.25]),
+)
 ```
 
 ### Model
@@ -71,7 +73,7 @@ Compute per-column log-likelihoods.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
-| `tree` | `dict` | `{'parentIndex': ..., 'distanceToParent': ...}` |
+| `tree` | `Tree` | `Tree(parentIndex=..., distanceToParent=...)` |
 | `model` | `dict` | `{'eigenvalues': ..., 'eigenvectors': ..., 'pi': ...}` |
 
 **Returns:** `(C,)` float64 array.
@@ -83,7 +85,7 @@ Compute expected substitution counts and dwell times.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
-| `tree` | `dict` | Tree dict |
+| `tree` | `Tree` | Tree NamedTuple |
 | `model` | `dict` | Model dict |
 | `f81_fast` | `bool` | Use $O(CRA^2)$ fast path (F81/JC only) |
 
@@ -102,7 +104,7 @@ Compute posterior over mixture components per column.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `alignment` | `int32 (R, C)` | Token-encoded alignment |
-| `tree` | `dict` | Tree dict |
+| `tree` | `Tree` | Tree NamedTuple |
 | `models` | `list[dict]` | $K$ model dicts |
 | `log_weights` | `(K,)` | Log prior weights |
 
@@ -251,20 +253,17 @@ Parse a `{name: sequence}` dictionary into an alignment tensor.
 aln = parse_dict({"human": "ACGT", "mouse": "TGCA", "dog": "GGGG"})
 ```
 
-### `combine_tree_alignment(tree_result, alignment_result) -> dict`
+### `combine_tree_alignment(tree_result, alignment_result) -> CombinedResult`
 
 Map leaf sequences to tree positions by name. Creates full `(R, C)` alignment with internal nodes filled with the ungapped-unobserved token.
 
-**Returns:** dict with `alignment` (int32 `(R, C)`), `parentIndex`, `distanceToParent`, `alphabet`, `leaf_names`.
+**Returns:** `CombinedResult` NamedTuple with `alignment` (int32 `(R, C)`), `tree` (`Tree`), `alphabet`, `leaf_names`.
 
 ```python
 tree = parse_newick("((A:0.1,B:0.2):0.05,C:0.3);")
 aln = parse_fasta(">A\nACGT\n>B\nTGCA\n>C\nGGGG\n")
 combined = combine_tree_alignment(tree, aln)
-ll = LogLike(combined['alignment'],
-             {'parentIndex': combined['parentIndex'],
-              'distanceToParent': combined['distanceToParent']},
-             jukes_cantor_model(4))
+ll = LogLike(combined.alignment, combined.tree, jukes_cantor_model(4))
 ```
 
 ### `genetic_code() -> dict`
@@ -289,6 +288,110 @@ Remap a 64-codon tokenized alignment to 61-sense-codon tokens. Stop codons becom
 | `A` | `int` | Input codon alphabet size (default 64) |
 
 **Returns:** dict with `alignment` (int32 `(N, C)` with $A_\text{sense} = 61$), `A_sense`, `alphabet`.
+
+---
+
+## K-mer tokenization
+
+K-mer tokenization converts single-character token alignments into multi-column tokens (e.g., codons = 3-mers). The API cleanly separates column indexing from tokenization:
+
+1. **Column indexing**: `sliding_windows` and `all_column_ktuples` produce `(T, k)` arrays of column indices.
+2. **Tokenization**: `kmer_tokenize` converts alignment columns into k-mer tokens given column tuples.
+3. **Index mapping**: `KmerIndex` provides O(1) lookup between column tuples and output positions.
+
+### `KmerIndex`
+
+Maps between column tuples and output alignment indices. Provides O(1) lookup in both directions.
+
+```python
+from subby.oracle import KmerIndex
+
+index = KmerIndex([(0, 1), (2, 3), (4, 5)])
+index.tuple_to_idx((2, 3))  # → 1
+index.idx_to_tuple(0)       # → (0, 1)
+len(index)                  # → 3
+```
+
+| Method | Description |
+|--------|-------------|
+| `tuple_to_idx(t)` | Column tuple → output index. Returns `-1` if absent. |
+| `idx_to_tuple(idx)` | Output index → column tuple. |
+| `__len__()` | Number of tuples. |
+
+### `sliding_windows(C, k, stride=None, offset=0, edge='truncate')`
+
+Generate column index tuples for sliding-window k-mer tokenization.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `C` | `int` | Number of columns in the alignment |
+| `k` | `int` | Window size (k-mer length) |
+| `stride` | `int` or `None` | Step between window starts. Default `None` → `k` (non-overlapping). |
+| `offset` | `int` | Starting column index. Default `0`. |
+| `edge` | `str` | `'truncate'` (default): drop incomplete trailing window; `'pad'`: include partial window, using `-1` for out-of-bounds columns |
+
+**Returns:** `(M, k)` int64 array. Entries of `-1` indicate out-of-bounds positions (only with `edge='pad'`).
+
+```python
+from subby.oracle import sliding_windows
+
+# Non-overlapping codons
+sliding_windows(9, 3)                # → [[0,1,2],[3,4,5],[6,7,8]]
+
+# Overlapping stride-1 windows
+sliding_windows(5, 3, stride=1)      # → [[0,1,2],[1,2,3],[2,3,4]]
+
+# Three reading frames
+for frame in range(3):
+    windows = sliding_windows(9, 3, stride=3, offset=frame)
+```
+
+### `all_column_ktuples(C, k, ordered=True)`
+
+Generate all k-tuples of column indices. **WARNING:** produces $O(C^k)$ tuples.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `C` | `int` | Number of columns |
+| `k` | `int` | Tuple size |
+| `ordered` | `bool` | `True`: permutations ($C \cdot (C-1)$ for $k=2$); `False`: combinations ($\binom{C}{k}$) |
+
+**Returns:** `(T, k)` int64 array.
+
+### `kmer_tokenize(alignment, A, k_or_tuples, gap_mode='any', alphabet=None)`
+
+Core tokenizer. Accepts either an integer `k` (backward compatible, non-overlapping windows) or a `(T, k)` array of column index tuples.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `alignment` | `int32 (R, C)` | Token-encoded alignment |
+| `A` | `int` | Single-character alphabet size |
+| `k_or_tuples` | `int` or `(T, k)` array | Integer `k` for non-overlapping windows (`C` must be divisible by `k`), or column tuples from `sliding_windows()` / `all_column_ktuples()` / custom |
+| `gap_mode` | `str` | `'any'`: gap in any position gaps the k-mer; `'all'`: only all-gap k-mers become gaps |
+| `alphabet` | `list[str]` or `None` | Single-character labels for building k-mer labels |
+
+**Returns:** dict with:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `alignment` | `int32 (R, T)` | K-mer tokens |
+| `A_kmer` | `int` | $A^k$ |
+| `index` | `KmerIndex` | Bidirectional tuple ↔ index mapping |
+| `alphabet` | `list[str]` | K-mer labels (only if `alphabet` given) |
+
+Token encoding: `0..A^k-1` observed, `A^k` ungapped-unobserved, `A^k+1` gap, `A^k+2` illegal (partial gap with `gap_mode='all'`). Entries of `-1` in column tuples are treated as unobserved positions.
+
+```python
+from subby.oracle import kmer_tokenize, sliding_windows
+
+# Non-overlapping codons (backward compatible)
+result = kmer_tokenize(dna_alignment, A=4, k_or_tuples=3)
+
+# Overlapping codon windows
+windows = sliding_windows(C=100, k=3, stride=1)
+result = kmer_tokenize(dna_alignment, A=4, k_or_tuples=windows)
+result['index'].tuple_to_idx((5, 6, 7))  # → 5
+```
 
 ---
 

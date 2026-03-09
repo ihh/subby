@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 from subby.formats import (
+    Tree,
+    CombinedResult,
     detect_alphabet,
     parse_newick,
     parse_fasta,
@@ -12,6 +14,9 @@ from subby.formats import (
     parse_strings,
     parse_dict,
     combine_tree_alignment,
+    KmerIndex,
+    sliding_windows,
+    all_column_ktuples,
     kmer_tokenize,
     genetic_code,
     codon_to_sense,
@@ -214,9 +219,9 @@ seq2  TGCA
 //"""
         result = parse_stockholm(text)
         # Should be combined: tree + alignment
-        assert "parentIndex" in result
+        assert isinstance(result, CombinedResult)
         # R = 3 (root + 2 leaves), C = 4
-        assert result["alignment"].shape == (3, 4)
+        assert result.alignment.shape == (3, 4)
 
     def test_name_matching(self):
         text = """# STOCKHOLM 1.0
@@ -227,12 +232,11 @@ B  TGCA
         result = parse_stockholm(text)
         # Tree leaves are [B, A], alignment names are [A, B]
         # The combine should match by name
-        pi = result["parentIndex"]
+        pi = result.tree.parentIndex
         R = len(pi)
         assert R == 3
         # Verify the leaf rows have correct sequences
-        names = result.get("leaf_names", [])
-        assert set(names) == {"A", "B"}
+        assert set(result.leaf_names) == {"A", "B"}
 
     def test_multiline_nh(self):
         text = """# STOCKHOLM 1.0
@@ -242,7 +246,7 @@ seq1  ACGT
 seq2  TGCA
 //"""
         result = parse_stockholm(text)
-        assert "parentIndex" in result
+        assert isinstance(result, CombinedResult)
 
 
 # ---- parse_maf ----
@@ -354,7 +358,7 @@ class TestParseDict:
         aln = parse_dict({"human": "ACGT", "mouse": "TGCA", "dog": "GGGG"})
         result = combine_tree_alignment(tree, aln)
         R = len(tree["parentIndex"])
-        assert result["alignment"].shape == (R, 4)
+        assert result.alignment.shape == (R, 4)
 
     def test_pipeline_integration(self):
         from subby.oracle import LogLike, jukes_cantor_model
@@ -363,11 +367,7 @@ class TestParseDict:
         aln = parse_dict({"A": "ACGT", "B": "ACGT", "C": "ACGT"})
         combined = combine_tree_alignment(tree, aln)
         model = jukes_cantor_model(4)
-        tree_dict = {
-            "parentIndex": combined["parentIndex"],
-            "distanceToParent": combined["distanceToParent"],
-        }
-        ll = LogLike(combined["alignment"], tree_dict, model)
+        ll = LogLike(combined.alignment, combined.tree, model)
         assert ll.shape == (4,)
         assert np.all(np.isfinite(ll))
 
@@ -380,17 +380,17 @@ class TestCombineTreeAlignment:
         aln = parse_fasta(">A\nACGT\n>B\nTGCA\n>C\nGGGG\n")
         result = combine_tree_alignment(tree, aln)
         R = len(tree["parentIndex"])
-        assert result["alignment"].shape == (R, 4)
+        assert result.alignment.shape == (R, 4)
         # Internal nodes should have token A (ungapped-unobserved)
-        A = len(result["alphabet"])
-        pi = result["parentIndex"]
+        A = len(result.alphabet)
+        pi = result.tree.parentIndex
         # Count children to find internal nodes
         child_count = np.zeros(R, dtype=np.int32)
         for n in range(1, R):
             child_count[pi[n]] += 1
         for n in range(R):
             if child_count[n] > 0:  # internal
-                assert np.all(result["alignment"][n] == A)
+                assert np.all(result.alignment[n] == A)
 
     def test_name_mismatch_error(self):
         tree = parse_newick("((A:0.1,B:0.2):0.3,C:0.4);")
@@ -407,11 +407,7 @@ class TestCombineTreeAlignment:
         combined = combine_tree_alignment(tree, aln)
 
         model = jukes_cantor_model(4)
-        tree_dict = {
-            "parentIndex": combined["parentIndex"],
-            "distanceToParent": combined["distanceToParent"],
-        }
-        ll = LogLike(combined["alignment"], tree_dict, model)
+        ll = LogLike(combined.alignment, combined.tree, model)
         assert ll.shape == (4,)
         assert np.all(np.isfinite(ll))
         assert np.all(ll <= 0)
@@ -422,7 +418,7 @@ class TestCombineTreeAlignment:
         aln = parse_fasta(">A\nACGT\n>B\nTGCA\n>C\nGGGG\n")
         result = combine_tree_alignment(tree, aln)
         R = len(tree["parentIndex"])
-        assert result["alignment"].shape == (R, 4)
+        assert result.alignment.shape == (R, 4)
 
 
 # ---- kmer_tokenize ----
@@ -434,7 +430,7 @@ class TestKmerTokenize:
         # "ACG" "TAA" for one sequence
         result = parse_strings(["ACGTAA"], alphabet=list("ACGT"))
         aln = result["alignment"]  # (1, 6) tokens: [0,1,2,3,0,0]
-        kmer = kmer_tokenize(aln, A=4, k=3, alphabet=list("ACGT"))
+        kmer = kmer_tokenize(aln, A=4, k_or_tuples=3, alphabet=list("ACGT"))
         assert kmer["alignment"].shape == (1, 2)
         assert kmer["A_kmer"] == 64
         # ACG = 0*16 + 1*4 + 2 = 6
@@ -444,7 +440,7 @@ class TestKmerTokenize:
 
     def test_kmer_alphabet_labels(self):
         """K-mer alphabet labels are correct."""
-        kmer = kmer_tokenize(np.zeros((1, 4), dtype=np.int32), A=2, k=2,
+        kmer = kmer_tokenize(np.zeros((1, 4), dtype=np.int32), A=2, k_or_tuples=2,
                              alphabet=["0", "1"])
         assert kmer["alphabet"] == ["00", "01", "10", "11"]
         assert kmer["A_kmer"] == 4
@@ -452,7 +448,7 @@ class TestKmerTokenize:
     def test_k1_identity(self):
         """k=1 is the identity transform for observed tokens."""
         aln = np.array([[0, 1, 2, 3]], dtype=np.int32)
-        kmer = kmer_tokenize(aln, A=4, k=1)
+        kmer = kmer_tokenize(aln, A=4, k_or_tuples=1)
         np.testing.assert_array_equal(kmer["alignment"], aln)
         assert kmer["A_kmer"] == 4
 
@@ -461,7 +457,7 @@ class TestKmerTokenize:
         A = 4
         gap = A + 1
         aln = np.array([[0, gap, 2]], dtype=np.int32)  # one k-mer, middle is gap
-        kmer = kmer_tokenize(aln, A=A, k=3, gap_mode='any')
+        kmer = kmer_tokenize(aln, A=A, k_or_tuples=3, gap_mode='any')
         A_k = 64
         assert kmer["alignment"][0, 0] == A_k + 1  # gap token
 
@@ -470,7 +466,7 @@ class TestKmerTokenize:
         A = 4
         gap = A + 1
         aln = np.array([[gap, gap, gap]], dtype=np.int32)
-        kmer = kmer_tokenize(aln, A=A, k=3, gap_mode='all')
+        kmer = kmer_tokenize(aln, A=A, k_or_tuples=3, gap_mode='all')
         A_k = 64
         assert kmer["alignment"][0, 0] == A_k + 1  # gap token
 
@@ -479,7 +475,7 @@ class TestKmerTokenize:
         A = 4
         gap = A + 1
         aln = np.array([[0, gap, 2]], dtype=np.int32)
-        kmer = kmer_tokenize(aln, A=A, k=3, gap_mode='all')
+        kmer = kmer_tokenize(aln, A=A, k_or_tuples=3, gap_mode='all')
         A_k = 64
         assert kmer["alignment"][0, 0] == A_k + 2  # illegal token
 
@@ -488,7 +484,7 @@ class TestKmerTokenize:
         A = 4
         unobs = A  # ungapped-unobserved token
         aln = np.array([[unobs, unobs, unobs]], dtype=np.int32)
-        kmer = kmer_tokenize(aln, A=A, k=3)
+        kmer = kmer_tokenize(aln, A=A, k_or_tuples=3)
         A_k = 64
         assert kmer["alignment"][0, 0] == A_k  # ungapped-unobserved
 
@@ -496,7 +492,7 @@ class TestKmerTokenize:
         """Legacy gap token (-1) treated as gap."""
         A = 4
         aln = np.array([[0, -1, 2]], dtype=np.int32)
-        kmer = kmer_tokenize(aln, A=A, k=3, gap_mode='any')
+        kmer = kmer_tokenize(aln, A=A, k_or_tuples=3, gap_mode='any')
         A_k = 64
         assert kmer["alignment"][0, 0] == A_k + 1
 
@@ -504,7 +500,7 @@ class TestKmerTokenize:
         """C not divisible by k raises ValueError."""
         aln = np.array([[0, 1, 2, 3, 0]], dtype=np.int32)  # C=5
         with pytest.raises(ValueError, match="not divisible"):
-            kmer_tokenize(aln, A=4, k=3)
+            kmer_tokenize(aln, A=4, k_or_tuples=3)
 
     def test_multiple_sequences(self):
         """Multiple sequences tokenized independently."""
@@ -512,7 +508,7 @@ class TestKmerTokenize:
             [0, 1, 2, 3, 0, 0],  # ACG TAA
             [3, 2, 1, 0, 3, 2],  # TGC ATG
         ], dtype=np.int32)
-        kmer = kmer_tokenize(aln, A=4, k=3)
+        kmer = kmer_tokenize(aln, A=4, k_or_tuples=3)
         assert kmer["alignment"].shape == (2, 2)
         # ACG = 6, TAA = 48
         assert kmer["alignment"][0, 0] == 6
@@ -526,7 +522,7 @@ class TestKmerTokenize:
         fasta = ">seq1\nACGTAA\n>seq2\nTGCATG\n"
         result = parse_fasta(fasta)
         kmer = kmer_tokenize(result["alignment"], A=len(result["alphabet"]),
-                             k=3, alphabet=result["alphabet"])
+                             k_or_tuples=3, alphabet=result["alphabet"])
         assert kmer["alignment"].shape == (2, 2)
         assert kmer["A_kmer"] == 64
         assert len(kmer["alphabet"]) == 64
@@ -721,6 +717,264 @@ class TestSplitMerge:
         assert result[10, 1] == 1.0
 
 
+# ---- sliding_windows ----
+
+class TestSlidingWindows:
+
+    def test_basic_nonoverlapping(self):
+        """Default stride=k gives non-overlapping windows."""
+        windows = sliding_windows(6, k=3)
+        np.testing.assert_array_equal(windows, [[0, 1, 2], [3, 4, 5]])
+
+    def test_stride1(self):
+        """Stride=1 gives fully overlapping windows."""
+        windows = sliding_windows(5, k=3, stride=1)
+        np.testing.assert_array_equal(windows, [[0, 1, 2], [1, 2, 3], [2, 3, 4]])
+
+    def test_offset(self):
+        """offset shifts the starting position."""
+        windows = sliding_windows(9, k=3, stride=3, offset=1)
+        np.testing.assert_array_equal(windows, [[1, 2, 3], [4, 5, 6]])
+
+    def test_truncate_drops_partial(self):
+        """edge='truncate' drops incomplete trailing window."""
+        windows = sliding_windows(5, k=3, stride=3)
+        # Only [0,1,2] fits completely
+        np.testing.assert_array_equal(windows, [[0, 1, 2]])
+
+    def test_pad_includes_partial(self):
+        """edge='pad' includes partial window with -1 sentinels."""
+        windows = sliding_windows(5, k=3, stride=3, edge='pad')
+        assert windows.shape == (2, 3)
+        np.testing.assert_array_equal(windows[0], [0, 1, 2])
+        np.testing.assert_array_equal(windows[1], [3, 4, -1])
+
+    def test_empty_result(self):
+        """No complete windows gives empty (0, k) array."""
+        windows = sliding_windows(2, k=3)
+        assert windows.shape == (0, 3)
+
+    def test_three_reading_frames(self):
+        """Three reading frames via offset=0,1,2."""
+        for offset in range(3):
+            windows = sliding_windows(9, k=3, stride=3, offset=offset)
+            expected = np.arange(offset, 9 - 3 + 1, 3)
+            np.testing.assert_array_equal(windows[:, 0], expected)
+
+
+# ---- all_column_ktuples ----
+
+class TestAllColumnKtuples:
+
+    def test_ordered_k2(self):
+        """Ordered k=2: C*(C-1) permutations."""
+        tuples = all_column_ktuples(4, k=2, ordered=True)
+        assert tuples.shape == (12, 2)  # 4*3
+
+    def test_unordered_k2(self):
+        """Unordered k=2: C choose 2 combinations."""
+        tuples = all_column_ktuples(4, k=2, ordered=False)
+        assert tuples.shape == (6, 2)  # 4 choose 2
+
+    def test_k1(self):
+        """k=1 gives C single-column tuples."""
+        tuples = all_column_ktuples(3, k=1, ordered=True)
+        assert tuples.shape == (3, 1)
+        np.testing.assert_array_equal(tuples.flatten(), [0, 1, 2])
+
+    def test_empty_when_k_gt_c(self):
+        """k > C gives empty result."""
+        tuples = all_column_ktuples(1, k=2, ordered=True)
+        assert tuples.shape == (0, 2)
+
+
+# ---- KmerIndex ----
+
+class TestKmerIndex:
+
+    def test_tuple_to_idx(self):
+        """Lookup column tuple → index."""
+        idx = KmerIndex([(0, 1), (2, 3), (0, 3)])
+        assert idx.tuple_to_idx((0, 1)) == 0
+        assert idx.tuple_to_idx((2, 3)) == 1
+        assert idx.tuple_to_idx((0, 3)) == 2
+
+    def test_tuple_to_idx_missing(self):
+        """Missing tuple returns -1."""
+        idx = KmerIndex([(0, 1)])
+        assert idx.tuple_to_idx((9, 9)) == -1
+
+    def test_idx_to_tuple(self):
+        """Index → column tuple."""
+        idx = KmerIndex([(0, 1), (2, 3)])
+        assert idx.idx_to_tuple(0) == (0, 1)
+        assert idx.idx_to_tuple(1) == (2, 3)
+
+    def test_len(self):
+        """Length matches number of tuples."""
+        idx = KmerIndex([(0, 1), (2, 3), (4, 5)])
+        assert len(idx) == 3
+
+
+# ---- kmer_tokenize with tuples ----
+
+class TestKmerTokenizeTuples:
+
+    def test_basic_pairs(self):
+        """Tokenize non-contiguous column pairs."""
+        aln = np.array([[0, 1, 2, 3]], dtype=np.int32)
+        result = kmer_tokenize(aln, A=4, k_or_tuples=[(0, 2), (1, 3)])
+        assert result['alignment'].shape == (1, 2)
+        assert result['A_kmer'] == 16
+        assert result['alignment'][0, 0] == 0*4 + 2  # (A,G) = 2
+        assert result['alignment'][0, 1] == 1*4 + 3  # (C,T) = 7
+
+    def test_contiguous_tuples_match_int_k(self):
+        """Contiguous tuples give same result as int k."""
+        aln = np.array([[0, 1, 2, 3, 0, 1]], dtype=np.int32)
+        result_k = kmer_tokenize(aln, A=4, k_or_tuples=3)
+        result_t = kmer_tokenize(aln, A=4, k_or_tuples=[(0, 1, 2), (3, 4, 5)])
+        np.testing.assert_array_equal(
+            result_k['alignment'], result_t['alignment'])
+
+    def test_k1_identity(self):
+        """k=1 tuples are identity for observed tokens."""
+        aln = np.array([[0, 1, 2, 3]], dtype=np.int32)
+        result = kmer_tokenize(aln, A=4, k_or_tuples=[(0,), (1,), (2,), (3,)])
+        np.testing.assert_array_equal(result['alignment'], aln)
+
+    def test_sliding_window_integration(self):
+        """sliding_windows() output feeds directly to kmer_tokenize()."""
+        aln = np.array([[0, 1, 2, 3, 0]], dtype=np.int32)
+        windows = sliding_windows(5, k=3, stride=1)
+        result = kmer_tokenize(aln, A=4, k_or_tuples=windows)
+        assert result['alignment'].shape == (1, 3)
+        assert result['alignment'][0, 0] == 0*16 + 1*4 + 2  # ACG = 6
+        assert result['alignment'][0, 1] == 1*16 + 2*4 + 3  # CGT = 27
+        assert result['alignment'][0, 2] == 2*16 + 3*4 + 0  # GTA = 44
+
+    def test_sentinel_padding(self):
+        """Sentinel -1 in tuples → unobserved token."""
+        aln = np.array([[0, 1, 2, 3, 0]], dtype=np.int32)
+        windows = sliding_windows(5, k=3, stride=3, edge='pad')
+        result = kmer_tokenize(aln, A=4, k_or_tuples=windows)
+        assert result['alignment'].shape == (1, 2)
+        assert result['alignment'][0, 0] == 0*16 + 1*4 + 2  # ACG = 6
+        assert result['alignment'][0, 1] == 64  # unobserved (has -1)
+
+    def test_gap_any(self):
+        """gap_mode='any': gap in any position → gap token."""
+        A = 4
+        gap = A + 1
+        aln = np.array([[0, gap, 2, gap]], dtype=np.int32)
+        result = kmer_tokenize(aln, A, [(0, 1)], gap_mode='any')
+        assert result['alignment'][0, 0] == A**2 + 1
+
+    def test_gap_all(self):
+        """gap_mode='all': partial gap → illegal; all gap → gap."""
+        A = 4
+        gap = A + 1
+        aln = np.array([[0, gap, gap, gap]], dtype=np.int32)
+        # Partial gap (0 observed, 1 gap)
+        r1 = kmer_tokenize(aln, A, [(0, 1)], gap_mode='all')
+        assert r1['alignment'][0, 0] == A**2 + 2  # illegal
+        # All gap
+        r2 = kmer_tokenize(aln, A, [(1, 2)], gap_mode='all')
+        assert r2['alignment'][0, 0] == A**2 + 1  # gap
+
+    def test_index_returned(self):
+        """KmerIndex is in return dict and works correctly."""
+        aln = np.array([[0, 1, 2]], dtype=np.int32)
+        result = kmer_tokenize(aln, A=4, k_or_tuples=[(0, 2), (1, 2)])
+        idx = result['index']
+        assert isinstance(idx, KmerIndex)
+        assert idx.tuple_to_idx((0, 2)) == 0
+        assert idx.tuple_to_idx((1, 2)) == 1
+        assert idx.idx_to_tuple(0) == (0, 2)
+
+    def test_alphabet_labels(self):
+        """Alphabet labels generated correctly for tuples."""
+        result = kmer_tokenize(
+            np.array([[0, 1]], dtype=np.int32), A=2,
+            k_or_tuples=[(0, 1)], alphabet=["A", "B"])
+        assert result['alphabet'] == ["AA", "AB", "BA", "BB"]
+
+    def test_all_column_ktuples_integration(self):
+        """all_column_ktuples() feeds to kmer_tokenize()."""
+        aln = np.array([[0, 1, 2, 3]], dtype=np.int32)
+        tuples = all_column_ktuples(4, k=2, ordered=False)
+        result = kmer_tokenize(aln, A=4, k_or_tuples=tuples)
+        assert result['alignment'].shape == (1, 6)  # 4 choose 2
+
+
+# ---- kmer_tokenize backward compat ----
+
+class TestKmerBackwardCompat:
+
+    def test_int_k_basic(self):
+        """Int k produces same tokens as original API."""
+        aln = np.array([[0, 1, 2, 3, 0, 0]], dtype=np.int32)
+        result = kmer_tokenize(aln, A=4, k_or_tuples=3, alphabet=list("ACGT"))
+        assert result['alignment'].shape == (1, 2)
+        assert result['A_kmer'] == 64
+        assert result['alignment'][0, 0] == 6   # ACG
+        assert result['alignment'][0, 1] == 48  # TAA
+
+    def test_not_divisible_raises(self):
+        """C not divisible by k raises ValueError."""
+        aln = np.array([[0, 1, 2, 3, 0]], dtype=np.int32)  # C=5
+        with pytest.raises(ValueError, match="not divisible"):
+            kmer_tokenize(aln, A=4, k_or_tuples=3)
+
+    def test_index_for_int_k(self):
+        """Int k also returns KmerIndex."""
+        aln = np.array([[0, 1, 2, 3, 0, 1]], dtype=np.int32)
+        result = kmer_tokenize(aln, A=4, k_or_tuples=3)
+        idx = result['index']
+        assert isinstance(idx, KmerIndex)
+        assert len(idx) == 2
+        assert idx.idx_to_tuple(0) == (0, 1, 2)
+        assert idx.idx_to_tuple(1) == (3, 4, 5)
+        assert idx.tuple_to_idx((0, 1, 2)) == 0
+
+
+# ---- split_paired_columns with KmerIndex ----
+
+class TestSplitPairedKmerIndex:
+
+    def test_kmer_index_returned(self):
+        """split_paired_columns returns paired_index and singles_index."""
+        N, C, A = 3, 6, 20
+        aln = np.random.randint(0, A, (N, C), dtype=np.int32)
+        result = split_paired_columns(aln, [(0, 3), (1, 4)], A=A)
+        assert isinstance(result['paired_index'], KmerIndex)
+        assert isinstance(result['singles_index'], KmerIndex)
+        assert len(result['paired_index']) == 2
+        assert len(result['singles_index']) == 2  # cols 2, 5
+
+    def test_paired_index_mapping(self):
+        """paired_index maps pair tuples to output positions."""
+        A = 20
+        aln = np.array([[5, 10, 3, 7]], dtype=np.int32)
+        result = split_paired_columns(aln, [(0, 1), (2, 3)], A=A)
+        idx = result['paired_index']
+        assert idx.tuple_to_idx((0, 1)) == 0
+        assert idx.tuple_to_idx((2, 3)) == 1
+        assert idx.tuple_to_idx((9, 9)) == -1
+
+    def test_singles_index_mapping(self):
+        """singles_index maps single columns to output positions."""
+        A = 20
+        aln = np.random.randint(0, A, (2, 6), dtype=np.int32)
+        result = split_paired_columns(aln, [(0, 3)], A=A)
+        idx = result['singles_index']
+        # Single columns are [1, 2, 4, 5]
+        assert idx.tuple_to_idx((1,)) == 0
+        assert idx.tuple_to_idx((2,)) == 1
+        assert idx.tuple_to_idx((4,)) == 2
+        assert idx.tuple_to_idx((5,)) == 3
+
+
 # ---- Cross-implementation: Python vs Rust ----
 
 class TestCrossImplementation:
@@ -747,9 +1001,9 @@ class TestCrossImplementation:
         tree = parse_newick(newick_str)
         aln = parse_fasta(fasta_str)
         result = combine_tree_alignment(tree, aln)
-        assert result["alignment"].dtype == np.int32
-        assert result["parentIndex"].dtype == np.int32
-        assert result["distanceToParent"].dtype == np.float64
+        assert result.alignment.dtype == np.int32
+        assert result.tree.parentIndex.dtype == np.int32
+        assert result.tree.distanceToParent.dtype == np.float64
 
     def test_rust_loglike_agreement(self, newick_str, fasta_str):
         """If Rust backend is available, verify Python-parsed inputs
@@ -760,10 +1014,6 @@ class TestCrossImplementation:
         aln = parse_fasta(fasta_str)
         combined = combine_tree_alignment(tree, aln)
         model = jukes_cantor_model(4)
-        tree_dict = {
-            "parentIndex": combined["parentIndex"],
-            "distanceToParent": combined["distanceToParent"],
-        }
-        ll = LogLike(combined["alignment"], tree_dict, model)
+        ll = LogLike(combined.alignment, combined.tree, model)
         assert np.all(np.isfinite(ll))
         assert ll.shape == (4,)

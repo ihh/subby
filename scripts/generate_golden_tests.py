@@ -48,7 +48,8 @@ def _make_balanced_tree(R, seed=0):
 
 def _run_full_pipeline(alignment, parentIndex, distances, model, f81_fast=False):
     """Run all oracle functions and return inputs + outputs as a dict."""
-    tree = {'parentIndex': parentIndex, 'distanceToParent': distances}
+    from subby.formats import Tree
+    tree = Tree(parentIndex=parentIndex, distanceToParent=distances)
     A = len(model['pi'])
 
     # Intermediates
@@ -174,7 +175,8 @@ def generate_mixture_case():
     parentIndex, distances = _make_balanced_tree(R, seed=1006)
     rng = np.random.RandomState(2006)
     alignment = rng.randint(0, 4, size=(R, 8)).astype(np.int32)
-    tree = {'parentIndex': parentIndex, 'distanceToParent': distances}
+    from subby.formats import Tree
+    tree = Tree(parentIndex=parentIndex, distanceToParent=distances)
 
     base_model = oracle.jukes_cantor_model(4)
     rates = [0.5, 1.0, 2.0]

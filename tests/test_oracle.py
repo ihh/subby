@@ -79,10 +79,11 @@ def _jax_tree(parentIndex, distances):
 
 
 def _oracle_tree(parentIndex, distances):
-    return {
-        'parentIndex': parentIndex,
-        'distanceToParent': distances,
-    }
+    from subby.formats import Tree
+    return Tree(
+        parentIndex=parentIndex,
+        distanceToParent=distances,
+    )
 
 
 def _oracle_model_from_jax(jax_model):

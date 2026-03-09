@@ -1162,10 +1162,10 @@ class TestInsideOutside:
 
         # Convert to oracle format
         alignment_np = np.array(alignment_jax)
-        tree_np = {
-            'parentIndex': np.array(tree_jax.parentIndex),
-            'distanceToParent': np.array(tree_jax.distanceToParent),
-        }
+        tree_np = Tree(
+            parentIndex=np.array(tree_jax.parentIndex),
+            distanceToParent=np.array(tree_jax.distanceToParent),
+        )
         model_np = oracle_jc(4)
         io_oracle = OracleIO(alignment_np, tree_np, model_np)
 
@@ -1210,10 +1210,10 @@ class TestInsideOutside:
         io_jax = InsideOutside(alignment_jax, tree_jax, model_jax)
 
         alignment_np = np.array(alignment_jax)
-        tree_np = {
-            'parentIndex': np.array(tree_jax.parentIndex),
-            'distanceToParent': np.array(tree_jax.distanceToParent),
-        }
+        tree_np = Tree(
+            parentIndex=np.array(tree_jax.parentIndex),
+            distanceToParent=np.array(tree_jax.distanceToParent),
+        )
         model_np = oracle_jc(4)
         io_oracle = OracleIO(alignment_np, tree_np, model_np)
 
@@ -1360,10 +1360,10 @@ class TestBranchCounts:
         bc_jax = np.array(BranchCounts(alignment_jax, tree_jax, model_jax))
 
         alignment_np = np.array(alignment_jax)
-        tree_np = {
-            'parentIndex': np.array(tree_jax.parentIndex),
-            'distanceToParent': np.array(tree_jax.distanceToParent),
-        }
+        tree_np = Tree(
+            parentIndex=np.array(tree_jax.parentIndex),
+            distanceToParent=np.array(tree_jax.distanceToParent),
+        )
         model_np = oracle_jc(4)
         bc_oracle = OracleBranchCounts(alignment_np, tree_np, model_np)
 
@@ -1394,10 +1394,10 @@ class TestBranchCounts:
         bc_jax = np.array(BranchCounts(alignment_jax, tree_jax, model_jax))
 
         alignment_np = np.array(alignment_jax)
-        tree_np = {
-            'parentIndex': np.array(tree_jax.parentIndex),
-            'distanceToParent': np.array(tree_jax.distanceToParent),
-        }
+        tree_np = Tree(
+            parentIndex=np.array(tree_jax.parentIndex),
+            distanceToParent=np.array(tree_jax.distanceToParent),
+        )
         model_np = oracle_irrev(rate, pi)
         bc_oracle = OracleBranchCounts(alignment_np, tree_np, model_np)
 

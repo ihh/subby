@@ -1,4 +1,6 @@
 from ..formats import (
+    Tree,
+    CombinedResult,
     detect_alphabet,
     parse_newick,
     parse_fasta,
@@ -7,6 +9,9 @@ from ..formats import (
     parse_strings,
     parse_dict,
     combine_tree_alignment,
+    KmerIndex,
+    sliding_windows,
+    all_column_ktuples,
     kmer_tokenize,
     genetic_code,
     codon_to_sense,

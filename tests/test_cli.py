@@ -205,11 +205,12 @@ class TestRun:
         result = run(jc4_input)
 
         # Build oracle inputs directly
+        from subby.formats import Tree
         model = oracle.jukes_cantor_model(4)
-        tree = {
-            "parentIndex": np.array([-1, 0, 0, 1, 1], dtype=np.intp),
-            "distanceToParent": np.array([0.0, 0.1, 0.2, 0.15, 0.25]),
-        }
+        tree = Tree(
+            parentIndex=np.array([-1, 0, 0, 1, 1], dtype=np.intp),
+            distanceToParent=np.array([0.0, 0.1, 0.2, 0.15, 0.25]),
+        )
         alignment = np.array([[0, 1], [2, 3], [1, 0], [3, 2], [0, 1]], dtype=np.int32)
 
         ll = oracle.LogLike(alignment, tree, model)

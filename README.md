@@ -38,18 +38,14 @@ aln = parse_dict({"human": "ACGT", "mouse": "TGCA", "dog": "GGGG"})
 combined = combine_tree_alignment(tree, aln)
 
 model = jukes_cantor_model(4)
-tree_dict = {'parentIndex': combined['parentIndex'],
-             'distanceToParent': combined['distanceToParent']}
-log_likelihoods = LogLike(combined['alignment'], tree_dict, model)
-counts = Counts(combined['alignment'], tree_dict, model)
+log_likelihoods = LogLike(combined.alignment, combined.tree, model)
+counts = Counts(combined.alignment, combined.tree, model)
 ```
 
 ### Python (JAX)
 
 ```python
-import jax.numpy as jnp
 from subby.jax import LogLike, Counts
-from subby.jax.types import Tree
 from subby.jax.models import jukes_cantor_model
 from subby.formats import parse_newick, parse_dict, combine_tree_alignment
 
@@ -57,15 +53,9 @@ tree_parsed = parse_newick("((human:0.1,mouse:0.2):0.05,dog:0.3);")
 aln = parse_dict({"human": "ACGT", "mouse": "TGCA", "dog": "GGGG"})
 combined = combine_tree_alignment(tree_parsed, aln)
 
-tree = Tree(
-    parentIndex=jnp.array(combined['parentIndex']),
-    distanceToParent=jnp.array(combined['distanceToParent']),
-)
-alignment = jnp.array(combined['alignment'])
 model = jukes_cantor_model(4)
-
-log_likelihoods = LogLike(alignment, tree, model)
-counts = Counts(alignment, tree, model)
+log_likelihoods = LogLike(combined.alignment, combined.tree, model)
+counts = Counts(combined.alignment, combined.tree, model)
 ```
 
 ### JavaScript (browser)

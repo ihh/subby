@@ -795,7 +795,7 @@ def upward_pass(alignment, tree, subMatrices, rootProb):
         logNormU: (R, C) per-node subtree log-normalizers
         logLike: (C,) log-likelihoods
     """
-    parentIndex = tree['parentIndex']
+    parentIndex = tree.parentIndex
     R, C = alignment.shape
     A = subMatrices.shape[-1]
 
@@ -857,7 +857,7 @@ def downward_pass(U, logNormU, tree, subMatrices, rootProb, alignment):
         D: (R, C, A) outside vectors (rescaled)
         logNormD: (R, C) per-node outside log-normalizers
     """
-    parentIndex = tree['parentIndex']
+    parentIndex = tree.parentIndex
     R, C, A = U.shape
 
     _, _, sibling = children_of(parentIndex)
@@ -1462,7 +1462,7 @@ def LogLike(alignment, tree, model):
     Returns:
         (C,) log-likelihoods
     """
-    subMats = _get_sub_matrices(model, tree['distanceToParent'])
+    subMats = _get_sub_matrices(model, tree.distanceToParent)
     _, _, logLike = upward_pass(alignment, tree, subMats, model['pi'])
     return logLike
 
@@ -1485,31 +1485,31 @@ def Counts(alignment, tree, model, f81_fast=False, branch_mask="auto"):
 
     if isinstance(branch_mask, str) and branch_mask == "auto":
         A = len(model['pi'])
-        branch_mask = compute_branch_mask(alignment, tree['parentIndex'], A)
+        branch_mask = compute_branch_mask(alignment, tree.parentIndex, A)
 
     if is_irrev:
         assert not f81_fast, "F81 fast path is reversible-only"
 
-    subMats = _get_sub_matrices(model, tree['distanceToParent'])
+    subMats = _get_sub_matrices(model, tree.distanceToParent)
     U, logNormU, logLike = upward_pass(alignment, tree, subMats, model['pi'])
     D, logNormD = downward_pass(U, logNormU, tree, subMats, model['pi'], alignment)
 
     if f81_fast:
         return f81_counts(
             U, D, logNormU, logNormD, logLike,
-            tree['distanceToParent'], model['pi'], tree['parentIndex'],
+            tree.distanceToParent, model['pi'], tree.parentIndex,
             branch_mask=branch_mask,
         )
     elif is_irrev:
-        J = compute_J_complex(model['eigenvalues'], tree['distanceToParent'])
+        J = compute_J_complex(model['eigenvalues'], tree.distanceToParent)
         U_tilde, D_tilde = eigenbasis_project_irrev(U, D, model)
         C = accumulate_C_complex(D_tilde, U_tilde, J, logNormU, logNormD, logLike,
-                                 tree['parentIndex'], branch_mask=branch_mask)
+                                 tree.parentIndex, branch_mask=branch_mask)
         return back_transform_irrev(C, model)
     else:
-        J = compute_J(model['eigenvalues'], tree['distanceToParent'])
+        J = compute_J(model['eigenvalues'], tree.distanceToParent)
         U_tilde, D_tilde = eigenbasis_project(U, D, model)
-        C = accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree['parentIndex'],
+        C = accumulate_C(D_tilde, U_tilde, J, logNormU, logNormD, logLike, tree.parentIndex,
                          branch_mask=branch_mask)
         return back_transform(C, model)
 
@@ -1535,35 +1535,35 @@ def BranchCounts(alignment, tree, model, f81_fast=False, branch_mask="auto"):
 
     if isinstance(branch_mask, str) and branch_mask == "auto":
         A = len(model['pi'])
-        branch_mask = compute_branch_mask(alignment, tree['parentIndex'], A)
+        branch_mask = compute_branch_mask(alignment, tree.parentIndex, A)
 
     if is_irrev:
         assert not f81_fast, "F81 fast path is reversible-only"
 
-    subMats = _get_sub_matrices(model, tree['distanceToParent'])
+    subMats = _get_sub_matrices(model, tree.distanceToParent)
     U, logNormU, logLike = upward_pass(alignment, tree, subMats, model['pi'])
     D, logNormD = downward_pass(U, logNormU, tree, subMats, model['pi'], alignment)
 
     if f81_fast:
         return f81_counts_per_branch(
             U, D, logNormU, logNormD, logLike,
-            tree['distanceToParent'], model['pi'], tree['parentIndex'],
+            tree.distanceToParent, model['pi'], tree.parentIndex,
             branch_mask=branch_mask,
         )
     elif is_irrev:
-        J = compute_J_complex(model['eigenvalues'], tree['distanceToParent'])
+        J = compute_J_complex(model['eigenvalues'], tree.distanceToParent)
         U_tilde, D_tilde = eigenbasis_project_irrev(U, D, model)
         C = accumulate_C_complex_per_branch(
             D_tilde, U_tilde, J, logNormU, logNormD, logLike,
-            tree['parentIndex'], branch_mask=branch_mask,
+            tree.parentIndex, branch_mask=branch_mask,
         )
         return back_transform_irrev_per_branch(C, model)
     else:
-        J = compute_J(model['eigenvalues'], tree['distanceToParent'])
+        J = compute_J(model['eigenvalues'], tree.distanceToParent)
         U_tilde, D_tilde = eigenbasis_project(U, D, model)
         C = accumulate_C_per_branch(
             D_tilde, U_tilde, J, logNormU, logNormD, logLike,
-            tree['parentIndex'], branch_mask=branch_mask,
+            tree.parentIndex, branch_mask=branch_mask,
         )
         return back_transform_per_branch(C, model)
 
@@ -1579,7 +1579,7 @@ def RootProb(alignment, tree, model):
     Returns:
         (A, C) posterior root distribution
     """
-    subMats = _get_sub_matrices(model, tree['distanceToParent'])
+    subMats = _get_sub_matrices(model, tree.distanceToParent)
     U, logNormU, logLike = upward_pass(alignment, tree, subMats, model['pi'])
 
     A = len(model['pi'])
@@ -1635,7 +1635,7 @@ class InsideOutside:
         self._model = model
         self._is_irrev = _is_irrev(model)
 
-        subMats = _get_sub_matrices(model, tree['distanceToParent'])
+        subMats = _get_sub_matrices(model, tree.distanceToParent)
         self._subMatrices = subMats
 
         U, logNormU, logLike = upward_pass(alignment, tree, subMats, model['pi'])
@@ -1682,29 +1682,29 @@ class InsideOutside:
         if isinstance(branch_mask, str) and branch_mask == "auto":
             A = len(model['pi'])
             branch_mask = compute_branch_mask(
-                self._alignment, self._tree['parentIndex'], A
+                self._alignment, self._tree.parentIndex, A
             )
 
         if f81_fast:
             return f81_counts(
                 self._U, self._D, self._logNormU, self._logNormD,
-                self._logLike, self._tree['distanceToParent'], model['pi'],
-                self._tree['parentIndex'], branch_mask=branch_mask,
+                self._logLike, self._tree.distanceToParent, model['pi'],
+                self._tree.parentIndex, branch_mask=branch_mask,
             )
         elif self._is_irrev:
-            J = compute_J_complex(model['eigenvalues'], self._tree['distanceToParent'])
+            J = compute_J_complex(model['eigenvalues'], self._tree.distanceToParent)
             U_tilde, D_tilde = eigenbasis_project_irrev(self._U, self._D, model)
             C = accumulate_C_complex(
                 D_tilde, U_tilde, J, self._logNormU, self._logNormD,
-                self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
+                self._logLike, self._tree.parentIndex, branch_mask=branch_mask,
             )
             return back_transform_irrev(C, model)
         else:
-            J = compute_J(model['eigenvalues'], self._tree['distanceToParent'])
+            J = compute_J(model['eigenvalues'], self._tree.distanceToParent)
             U_tilde, D_tilde = eigenbasis_project(self._U, self._D, model)
             C = accumulate_C(
                 D_tilde, U_tilde, J, self._logNormU, self._logNormD,
-                self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
+                self._logLike, self._tree.parentIndex, branch_mask=branch_mask,
             )
             return back_transform(C, model)
 
@@ -1726,29 +1726,29 @@ class InsideOutside:
         if isinstance(branch_mask, str) and branch_mask == "auto":
             A = len(model['pi'])
             branch_mask = compute_branch_mask(
-                self._alignment, self._tree['parentIndex'], A
+                self._alignment, self._tree.parentIndex, A
             )
 
         if f81_fast:
             return f81_counts_per_branch(
                 self._U, self._D, self._logNormU, self._logNormD,
-                self._logLike, self._tree['distanceToParent'], model['pi'],
-                self._tree['parentIndex'], branch_mask=branch_mask,
+                self._logLike, self._tree.distanceToParent, model['pi'],
+                self._tree.parentIndex, branch_mask=branch_mask,
             )
         elif self._is_irrev:
-            J = compute_J_complex(model['eigenvalues'], self._tree['distanceToParent'])
+            J = compute_J_complex(model['eigenvalues'], self._tree.distanceToParent)
             U_tilde, D_tilde = eigenbasis_project_irrev(self._U, self._D, model)
             C = accumulate_C_complex_per_branch(
                 D_tilde, U_tilde, J, self._logNormU, self._logNormD,
-                self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
+                self._logLike, self._tree.parentIndex, branch_mask=branch_mask,
             )
             return back_transform_irrev_per_branch(C, model)
         else:
-            J = compute_J(model['eigenvalues'], self._tree['distanceToParent'])
+            J = compute_J(model['eigenvalues'], self._tree.distanceToParent)
             U_tilde, D_tilde = eigenbasis_project(self._U, self._D, model)
             C = accumulate_C_per_branch(
                 D_tilde, U_tilde, J, self._logNormU, self._logNormD,
-                self._logLike, self._tree['parentIndex'], branch_mask=branch_mask,
+                self._logLike, self._tree.parentIndex, branch_mask=branch_mask,
             )
             return back_transform_per_branch(C, model)
 
