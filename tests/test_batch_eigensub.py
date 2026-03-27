@@ -5,6 +5,7 @@ Verifies that:
 2. Column concatenation within species groups matches per-block
 3. Species exclusion works correctly
 4. Validation diagnostics produce reasonable values
+5. Tree pruning works correctly
 
 All tests run on CPU (no GPU required).
 """
@@ -26,14 +27,14 @@ _subby_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _subby_root not in sys.path:
     sys.path.insert(0, _subby_root)
 
-from subby.formats import Tree
+from subby.formats import Tree, parse_newick
 from subby.jax import Counts, pad_alignment
 from subby.jax.models import hky85_diag
 
 from scripts.batch_eigensub_maf import (
     iter_maf_blocks,
     _seqs_to_subby_alignment,
-    build_star_tree,
+    prune_tree,
     _expand_alignment_to_tree,
     _counts_to_features,
     validate_block,
@@ -41,6 +42,23 @@ from scripts.batch_eigensub_maf import (
     FEATURE_DIM,
     COL_BIN,
 )
+
+
+# ---------------------------------------------------------------------------
+# Newick guide tree for tests
+# ---------------------------------------------------------------------------
+
+# A small tree containing all species used in test blocks:
+# mm10, rn6, canFam3, bosTau8, equCab2, hg38, panTro4
+GUIDE_TREE_NEWICK = (
+    "((hg38:0.01,panTro4:0.015):0.05,"
+    "((mm10:0.1,rn6:0.1):0.15,"
+    "(canFam3:0.2,(bosTau8:0.18,equCab2:0.18):0.02):0.1):0.05);"
+)
+
+@pytest.fixture(scope="module")
+def guide_tree():
+    return parse_newick(GUIDE_TREE_NEWICK)
 
 
 # ---------------------------------------------------------------------------
@@ -162,25 +180,55 @@ class TestEncoding:
         # N = 4 (A for A=4)
         assert aln[2, 1] == 4
 
-    def test_star_tree_structure(self):
-        tree = build_star_tree(['mm10', 'rn6', 'canFam3'])
-        R = 3
-        assert tree.parentIndex.shape == (2 * R - 1,)
-        assert tree.parentIndex[0] == -1  # root
+    def test_prune_tree_basic(self, guide_tree):
+        """Pruning to 3 leaves gives a valid tree."""
+        pruned = prune_tree(guide_tree, {'mm10', 'rn6', 'canFam3'})
+        assert pruned is not None
+        assert set(pruned['leaf_names']) == {'mm10', 'rn6', 'canFam3'}
+        n_nodes = len(pruned['parentIndex'])
+        assert pruned['parentIndex'][0] == -1  # root
         # All non-root nodes have valid parents
-        for i in range(1, 2 * R - 1):
-            assert 0 <= tree.parentIndex[i] < i
+        for i in range(1, n_nodes):
+            assert 0 <= pruned['parentIndex'][i] < i
 
-    def test_expand_alignment(self):
+    def test_prune_tree_collapses_single_child(self, guide_tree):
+        """Pruning to 2 sibling leaves should collapse intermediate nodes."""
+        pruned = prune_tree(guide_tree, {'mm10', 'rn6'})
+        assert pruned is not None
+        assert set(pruned['leaf_names']) == {'mm10', 'rn6'}
+        # mm10 and rn6 are siblings, so after collapsing we get 3 nodes:
+        # root, mm10, rn6
+        assert len(pruned['parentIndex']) == 3
+
+    def test_prune_tree_returns_none_for_single_leaf(self, guide_tree):
+        """Pruning to <2 leaves returns None."""
+        assert prune_tree(guide_tree, {'mm10'}) is None
+        assert prune_tree(guide_tree, set()) is None
+
+    def test_expand_alignment_to_tree(self, guide_tree):
+        """Expand alignment maps rows to correct leaf positions by name."""
+        species = ['mm10', 'rn6', 'canFam3']
+        pruned = prune_tree(guide_tree, set(species))
         aln = np.array([[0, 1, 2], [3, 0, 1], [2, 3, 0]], dtype=np.int32)
-        expanded = _expand_alignment_to_tree(aln, R=3)
-        assert expanded.shape == (5, 3)  # 2*3-1 = 5
-        np.testing.assert_array_equal(expanded[1], aln[0])
-        np.testing.assert_array_equal(expanded[3], aln[1])
-        np.testing.assert_array_equal(expanded[4], aln[2])
-        # Internal nodes filled with gap token (5)
-        assert expanded[0, 0] == 5
-        assert expanded[2, 0] == 5
+        expanded = _expand_alignment_to_tree(aln, species, pruned)
+
+        n_nodes = len(pruned['parentIndex'])
+        assert expanded.shape == (n_nodes, 3)
+
+        # Each species should appear at its leaf position
+        node_names = pruned['node_names']
+        for sp_idx, sp in enumerate(species):
+            tree_idx = node_names.index(sp)
+            np.testing.assert_array_equal(expanded[tree_idx], aln[sp_idx])
+
+        # Internal nodes should be gap (5)
+        parent_index = pruned['parentIndex']
+        children_count = np.zeros(n_nodes, dtype=int)
+        for i in range(1, n_nodes):
+            children_count[parent_index[i]] += 1
+        for i in range(n_nodes):
+            if children_count[i] > 0:  # internal
+                assert expanded[i, 0] == 5
 
 
 # ---------------------------------------------------------------------------
@@ -191,21 +239,20 @@ class TestVmapMatchesPerBlock:
     """Verify that the vmap batch approach gives identical results to
     calling Counts() on each block individually."""
 
-    def _compute_single_block(self, block, model):
+    def _compute_single_block(self, block, model, guide_tree):
         """Compute eigensub features for one block using plain Counts()."""
         species = block['species']
         seqs = block['seqs']
-        R = len(species)
         L = len(seqs[0])
 
-        tree_np = build_star_tree(species)
+        pruned = prune_tree(guide_tree, set(species))
         tree = Tree(
-            parentIndex=jnp.array(tree_np.parentIndex),
-            distanceToParent=jnp.array(tree_np.distanceToParent),
+            parentIndex=jnp.array(pruned['parentIndex']),
+            distanceToParent=jnp.array(pruned['distanceToParent']),
         )
 
         alignment = _seqs_to_subby_alignment(seqs)
-        expanded = _expand_alignment_to_tree(alignment, R)
+        expanded = _expand_alignment_to_tree(alignment, species, pruned)
 
         # Pad columns
         expanded_jnp = jnp.array(expanded, dtype=jnp.int32)
@@ -220,27 +267,26 @@ class TestVmapMatchesPerBlock:
         counts_np = np.array(counts[:, :, :C_orig], dtype=np.float32)
         return _counts_to_features(counts_np, L)
 
-    def test_single_block_features_shape(self, hky_model):
-        features = self._compute_single_block(BLOCK_A, hky_model)
+    def test_single_block_features_shape(self, hky_model, guide_tree):
+        features = self._compute_single_block(BLOCK_A, hky_model, guide_tree)
         assert features.shape == (14, FEATURE_DIM)
 
-    def test_vmap_matches_individual(self, hky_model):
+    def test_vmap_matches_individual(self, hky_model, guide_tree):
         """Two blocks with same species set: vmap batch must match individual."""
         # Both BLOCK_A and BLOCK_B have the same species set
-        feat_a = self._compute_single_block(BLOCK_A, hky_model)
-        feat_b = self._compute_single_block(BLOCK_B, hky_model)
+        feat_a = self._compute_single_block(BLOCK_A, hky_model, guide_tree)
+        feat_b = self._compute_single_block(BLOCK_B, hky_model, guide_tree)
 
         # Now do the vmap approach: stack both blocks
         species = BLOCK_A['species']
-        R = len(species)
-        n_nodes = 2 * R - 1
 
-        tree_np = build_star_tree(species)
+        pruned = prune_tree(guide_tree, set(species))
+        n_nodes = len(pruned['parentIndex'])
 
         aln_a = _seqs_to_subby_alignment(BLOCK_A['seqs'])
-        exp_a = _expand_alignment_to_tree(aln_a, R)
+        exp_a = _expand_alignment_to_tree(aln_a, species, pruned)
         aln_b = _seqs_to_subby_alignment(BLOCK_B['seqs'])
-        exp_b = _expand_alignment_to_tree(aln_b, R)
+        exp_b = _expand_alignment_to_tree(aln_b, species, pruned)
 
         # Pad to same size
         max_cols = max(exp_a.shape[1], exp_b.shape[1])
@@ -250,8 +296,8 @@ class TestVmapMatchesPerBlock:
         stack[0, :, :exp_a.shape[1]] = exp_a
         stack[1, :, :exp_b.shape[1]] = exp_b
 
-        parent_stack = np.stack([tree_np.parentIndex, tree_np.parentIndex])
-        dist_stack = np.stack([tree_np.distanceToParent, tree_np.distanceToParent])
+        parent_stack = np.stack([pruned['parentIndex'], pruned['parentIndex']])
+        dist_stack = np.stack([pruned['distanceToParent'], pruned['distanceToParent']])
 
         def _counts_one(alignment, parent_index, dist_to_parent):
             tree = Tree(parentIndex=parent_index, distanceToParent=dist_to_parent)
@@ -279,22 +325,21 @@ class TestColumnConcatenation:
     """Verify that concatenating columns from same-species blocks and
     computing one Counts() call matches per-block computation."""
 
-    def test_concat_matches_per_block(self, hky_model):
+    def test_concat_matches_per_block(self, hky_model, guide_tree):
         species = BLOCK_A['species']
-        R = len(species)
-        n_nodes = 2 * R - 1
 
-        tree_np = build_star_tree(species)
+        pruned = prune_tree(guide_tree, set(species))
+        n_nodes = len(pruned['parentIndex'])
         tree = Tree(
-            parentIndex=jnp.array(tree_np.parentIndex),
-            distanceToParent=jnp.array(tree_np.distanceToParent),
+            parentIndex=jnp.array(pruned['parentIndex']),
+            distanceToParent=jnp.array(pruned['distanceToParent']),
         )
 
         # Per-block
         aln_a = _seqs_to_subby_alignment(BLOCK_A['seqs'])
-        exp_a = _expand_alignment_to_tree(aln_a, R)
+        exp_a = _expand_alignment_to_tree(aln_a, species, pruned)
         aln_b = _seqs_to_subby_alignment(BLOCK_B['seqs'])
-        exp_b = _expand_alignment_to_tree(aln_b, R)
+        exp_b = _expand_alignment_to_tree(aln_b, species, pruned)
 
         L_a, L_b = exp_a.shape[1], exp_b.shape[1]
 
@@ -328,7 +373,7 @@ class TestColumnConcatenation:
 
 class TestSpeciesExclusion:
 
-    def test_exclude_removes_species(self):
+    def test_exclude_removes_species(self, guide_tree):
         path = _write_maf_file([BLOCK_D])
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -338,6 +383,7 @@ class TestSpeciesExclusion:
                 # Exclude hg38 and panTro4 — leaves mm10, rn6 (2 species)
                 manifest = precompute_maf_gpu(
                     path, tmpdir, model,
+                    guide_tree=guide_tree,
                     exclude_species={'hg38', 'panTro4'},
                     min_species=2,
                 )
@@ -359,7 +405,7 @@ class TestSpeciesExclusion:
         finally:
             os.unlink(path)
 
-    def test_exclude_filters_below_min_species(self):
+    def test_exclude_filters_below_min_species(self, guide_tree):
         """If exclusion drops below min_species, block is skipped."""
         path = _write_maf_file([BLOCK_A])
         try:
@@ -370,6 +416,7 @@ class TestSpeciesExclusion:
                 # Exclude 2 of 3 species — only 1 remains, below min_species=2
                 manifest = precompute_maf_gpu(
                     path, tmpdir, model,
+                    guide_tree=guide_tree,
                     exclude_species={'mm10', 'rn6'},
                     min_species=2,
                 )
@@ -386,19 +433,19 @@ class TestSpeciesExclusion:
 
 class TestValidationDiagnostics:
 
-    def test_diagnostics_shape_and_ranges(self, hky_model):
+    def test_diagnostics_shape_and_ranges(self, hky_model, guide_tree):
         """Check that diagnostics produce reasonable values on synthetic data."""
         species = BLOCK_C['species']
         R = len(species)
 
-        tree_np = build_star_tree(species)
+        pruned = prune_tree(guide_tree, set(species))
         tree = Tree(
-            parentIndex=jnp.array(tree_np.parentIndex),
-            distanceToParent=jnp.array(tree_np.distanceToParent),
+            parentIndex=jnp.array(pruned['parentIndex']),
+            distanceToParent=jnp.array(pruned['distanceToParent']),
         )
 
         alignment = _seqs_to_subby_alignment(BLOCK_C['seqs'])
-        expanded = _expand_alignment_to_tree(alignment, R)
+        expanded = _expand_alignment_to_tree(alignment, species, pruned)
 
         expanded_padded, C_orig = pad_alignment(jnp.array(expanded), bin_size=COL_BIN)
         counts = Counts(expanded_padded, tree, hky_model,
@@ -434,7 +481,7 @@ class TestValidationDiagnostics:
         for i in range(4):
             assert mat[i, i] >= 0
 
-    def test_conserved_block_has_high_dominant_frac(self, hky_model):
+    def test_conserved_block_has_high_dominant_frac(self, hky_model, guide_tree):
         """A perfectly conserved block should have high dominant base fraction."""
         # All species have identical sequence
         conserved_block = {
@@ -448,14 +495,14 @@ class TestValidationDiagnostics:
 
         species = conserved_block['species']
         R = len(species)
-        tree_np = build_star_tree(species)
+        pruned = prune_tree(guide_tree, set(species))
         tree = Tree(
-            parentIndex=jnp.array(tree_np.parentIndex),
-            distanceToParent=jnp.array(tree_np.distanceToParent),
+            parentIndex=jnp.array(pruned['parentIndex']),
+            distanceToParent=jnp.array(pruned['distanceToParent']),
         )
 
         alignment = _seqs_to_subby_alignment(conserved_block['seqs'])
-        expanded = _expand_alignment_to_tree(alignment, R)
+        expanded = _expand_alignment_to_tree(alignment, species, pruned)
         expanded_padded, C_orig = pad_alignment(jnp.array(expanded), bin_size=COL_BIN)
         counts = Counts(expanded_padded, tree, hky_model,
                         maxChunkSize=256, branch_mask="auto")
@@ -475,13 +522,14 @@ class TestValidationDiagnostics:
 
 class TestEndToEnd:
 
-    def test_full_pipeline(self, hky_model):
+    def test_full_pipeline(self, hky_model, guide_tree):
         """Run the full pipeline on a small synthetic MAF and check outputs."""
         path = _write_maf_file([BLOCK_A, BLOCK_B, BLOCK_C])
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 manifest = precompute_maf_gpu(
                     path, tmpdir, hky_model,
+                    guide_tree=guide_tree,
                     min_species=3,
                     min_cols=5,
                     validate_n=2,

@@ -1,23 +1,27 @@
 #!/usr/bin/env python
 """Batch eigensub computation from MAF files with GPU acceleration via jax.vmap.
 
+Uses an actual Newick guide tree (pruned per-block to present species) instead
+of a star tree with hardcoded distances.
+
 Two-pass approach:
-1. Scan MAF file, filter/exclude species, bucket blocks by tree node count
+1. Scan MAF file, filter/exclude species, prune guide tree per species set,
+   bucket blocks by pruned tree node count
 2. For each bucket: concatenate columns within species groups, then vmap
    Counts() across groups with same tree size for efficient GPU batching
 
 Produces per-block .npz files + manifest.json.
 
 Usage:
-    # Basic:
-    python scripts/batch_eigensub_maf.py input.maf output_dir/
+    # Basic (requires a Newick guide tree):
+    python scripts/batch_eigensub_maf.py input.maf output_dir/ --tree hg38.100way.nh
 
     # Exclude primates (for leakage prevention):
-    python scripts/batch_eigensub_maf.py input.maf output_dir/ \
+    python scripts/batch_eigensub_maf.py input.maf output_dir/ --tree hg38.100way.nh \
         --exclude-species hg38,panTro4,gorGor3,ponAbe2,rheMac3
 
     # With validation:
-    python scripts/batch_eigensub_maf.py input.maf output_dir/ --validate 10
+    python scripts/batch_eigensub_maf.py input.maf output_dir/ --tree hg38.100way.nh --validate 10
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from subby.formats import Tree
+from subby.formats import Tree, parse_newick
 from subby.jax import Counts, pad_alignment, unpad_columns
 from subby.jax.models import hky85_diag
 
@@ -54,55 +58,6 @@ FEATURE_DIM = 20  # 16 (4x4 transition) + 4 (dwell)
 
 DEFAULT_KAPPA = 4.0
 DEFAULT_PI = [0.295, 0.205, 0.205, 0.295]  # A, C, G, T
-
-# Approximate pairwise evolutionary distances (subs/site) from UCSC neutral
-# branch lengths — root-to-leaf distances for common MultiZ species.
-_SPECIES_DISTANCES = {
-    # Great apes
-    'hg38': 0.01, 'panTro4': 0.015, 'gorGor3': 0.02, 'ponAbe2': 0.04,
-    # Old World monkeys
-    'rheMac3': 0.08, 'macFas5': 0.08, 'papAnu2': 0.08,
-    'chlSab2': 0.08, 'nasLar1': 0.09, 'nomLeu3': 0.06,
-    # New World monkeys
-    'calJac3': 0.15, 'saiBol1': 0.15,
-    # Prosimians
-    'otoGar3': 0.25, 'micMur1': 0.25, 'tarSyr2': 0.20,
-    # Rodents
-    'mm10': 0.35, 'rn6': 0.35, 'speTri2': 0.30,
-    'cavPor3': 0.35, 'hetGla2': 0.33, 'criGri1': 0.35,
-    'mesAur1': 0.35, 'micOch1': 0.35, 'jacJac1': 0.30,
-    # Rabbits
-    'oryCun2': 0.30, 'ochPri3': 0.32,
-    # Treeshrew
-    'tupChi1': 0.28,
-    # Carnivores
-    'canFam3': 0.30, 'felCat8': 0.30, 'musFur1': 0.30, 'ailMel1': 0.30,
-    # Ungulates
-    'bosTau8': 0.30, 'oviAri3': 0.30, 'equCab2': 0.30,
-    'susScr3': 0.32, 'turTru2': 0.32, 'vicPac2': 0.32,
-    # Bats
-    'myoLuc2': 0.32, 'pteAle1': 0.32, 'pteVam1': 0.32,
-    # Other mammals
-    'loxAfr3': 0.40, 'triMan1': 0.40, 'echTel2': 0.45,
-    'dasNov3': 0.42, 'choHof1': 0.42,
-    'eriEur2': 0.38, 'sorAra2': 0.38, 'conCri1': 0.38,
-    'chrAsi1': 0.40,
-    # Marsupials / monotremes
-    'monDom5': 0.55, 'sarHar1': 0.55, 'macEug2': 0.55,
-    'ornAna1': 0.65,
-    # Birds
-    'galGal4': 0.80, 'taeGut2': 0.80, 'melGal1': 0.80,
-    'anaPla1': 0.80,
-    # Reptiles
-    'anoCar2': 0.85, 'cheMyd1': 0.85, 'chrPic2': 0.85,
-    'pelSin1': 0.85, 'apaSpi1': 0.85,
-    # Amphibians
-    'xenTro7': 0.95,
-    # Fish
-    'latCha1': 1.0, 'lepOcu1': 1.0, 'danRer10': 1.1,
-    'gasAcu1': 1.1, 'oryLat2': 1.1, 'oreNil2': 1.1,
-    'petMar2': 1.2,
-}
 
 
 # ---------------------------------------------------------------------------
@@ -200,69 +155,137 @@ def _seqs_to_subby_alignment(seqs: list[str], alphabet_size: int = 4) -> np.ndar
 
 
 # ---------------------------------------------------------------------------
-# Star tree builder
+# Tree pruning and alignment expansion
 # ---------------------------------------------------------------------------
 
-def build_star_tree(species_list: list[str], default_distance: float = 0.5) -> Tree:
-    """Build a caterpillar (ladder) tree for the given species.
+def prune_tree(tree_data: dict, keep_leaves: set[str]) -> dict | None:
+    """Prune a parsed Newick tree to a subset of leaves.
 
-    Each species becomes a leaf. Branch lengths come from _SPECIES_DISTANCES
-    (approximate root-to-leaf neutral distances). Unknown species get
-    default_distance.
+    Removes absent leaves, collapses single-child internal nodes
+    (summing branch lengths through them), and returns a valid
+    preorder tree.
 
-    Returns:
-        Tree(parentIndex, distanceToParent) with 2R-1 nodes
-    """
-    R = len(species_list)
-    if R < 2:
-        raise ValueError(f"Need at least 2 species, got {R}")
-
-    distances = [_SPECIES_DISTANCES.get(sp, default_distance) for sp in species_list]
-
-    n_total = 2 * R - 1
-    parent_index = np.full(n_total, -1, dtype=np.int32)
-    dist_to_parent = np.zeros(n_total, dtype=np.float64)
-
-    # Caterpillar layout:
-    # Internal nodes at even indices: 0, 2, 4, ...
-    # Leaf i at index 2*i+1 (for i < R-1), last leaf at 2*(R-1)
-    for i in range(R - 1):
-        internal = 2 * i
-        left_leaf = 2 * i + 1
-
-        parent_index[left_leaf] = internal
-        dist_to_parent[left_leaf] = distances[i]
-
-        if i < R - 2:
-            right = 2 * i + 2
-            parent_index[right] = internal
-            dist_to_parent[right] = 0.001
-        else:
-            right = 2 * i + 2
-            parent_index[right] = internal
-            dist_to_parent[right] = distances[R - 1]
-
-    parent_index[0] = -1
-    dist_to_parent[0] = 0.0
-
-    return Tree(parentIndex=parent_index, distanceToParent=dist_to_parent)
-
-
-def _expand_alignment_to_tree(alignment: np.ndarray, R: int) -> np.ndarray:
-    """Expand (R, C) leaf alignment into (2R-1, C) tree alignment.
-
-    Leaf i goes to node 2*i+1 (for i < R-1), last leaf to node 2*(R-1).
-    Internal nodes are filled with 5 (gap token for A=4 alphabet).
+    Args:
+        tree_data: dict from parse_newick (parentIndex, distanceToParent,
+                   leaf_names, node_names)
+        keep_leaves: set of leaf names to retain
 
     Returns:
-        (2R-1, C) int32 array
+        dict with same keys as tree_data, pruned to keep_leaves.
+        Returns None if fewer than 2 leaves remain.
     """
-    C = alignment.shape[1]
-    n_total = 2 * R - 1
-    expanded = np.full((n_total, C), 5, dtype=np.int32)
-    for i in range(R - 1):
-        expanded[2 * i + 1] = alignment[i]
-    expanded[2 * (R - 1)] = alignment[R - 1]
+    parent_index = tree_data["parentIndex"]
+    dist = tree_data["distanceToParent"]
+    node_names = tree_data["node_names"]
+    R = len(parent_index)
+
+    # Build children lists
+    children = [[] for _ in range(R)]
+    for i in range(1, R):
+        children[parent_index[i]].append(i)
+
+    # Mark which leaves to keep
+    is_leaf = [len(children[i]) == 0 for i in range(R)]
+    keep_node = [False] * R
+    for i in range(R):
+        if is_leaf[i] and node_names[i] in keep_leaves:
+            keep_node[i] = True
+
+    # Bottom-up: mark internal nodes that have >=1 kept descendant
+    def mark_ancestors(node):
+        if is_leaf[node]:
+            return keep_node[node]
+        has_kept = False
+        for c in children[node]:
+            if mark_ancestors(c):
+                has_kept = True
+        keep_node[node] = has_kept
+        return has_kept
+
+    mark_ancestors(0)  # root
+
+    # Build pruned tree in preorder, collapsing single-child nodes
+    new_parent = []
+    new_dist = []
+    new_names = []
+    new_leaf_names = []
+
+    def emit(old_idx, new_parent_idx, extra_dist):
+        """Emit a node or collapse if single-child internal."""
+        kept_children = [c for c in children[old_idx] if keep_node[c]]
+        total_dist = dist[old_idx] + extra_dist
+
+        if is_leaf[old_idx]:
+            # Leaf: always emit
+            new_idx = len(new_parent)
+            new_parent.append(new_parent_idx)
+            new_dist.append(total_dist if new_parent_idx >= 0 else 0.0)
+            new_names.append(node_names[old_idx])
+            new_leaf_names.append(node_names[old_idx])
+            return
+
+        if len(kept_children) == 1:
+            # Single child: collapse, pass accumulated distance
+            emit(kept_children[0], new_parent_idx, total_dist)
+            return
+
+        # Internal node with >=2 kept children: emit
+        new_idx = len(new_parent)
+        new_parent.append(new_parent_idx)
+        new_dist.append(total_dist if new_parent_idx >= 0 else 0.0)
+        new_names.append(node_names[old_idx])
+        for c in kept_children:
+            emit(c, new_idx, 0.0)
+
+    if not keep_node[0]:
+        return None
+
+    emit(0, -1, 0.0)
+
+    if len(new_leaf_names) < 2:
+        return None
+
+    return {
+        "parentIndex": np.array(new_parent, dtype=np.int32),
+        "distanceToParent": np.array(new_dist, dtype=np.float64),
+        "leaf_names": new_leaf_names,
+        "node_names": new_names,
+    }
+
+
+def _expand_alignment_to_tree(alignment: np.ndarray, species: list[str],
+                               pruned_tree: dict) -> np.ndarray:
+    """Map alignment rows to tree node positions.
+
+    Args:
+        alignment: (R_species, L) int32 in subby encoding
+        species: list of species names matching alignment rows
+        pruned_tree: dict from prune_tree with leaf_names
+
+    Returns:
+        (n_nodes, L) int32 array with internal nodes = gap token (5)
+    """
+    n_nodes = len(pruned_tree["parentIndex"])
+    L = alignment.shape[1]
+    expanded = np.full((n_nodes, L), 5, dtype=np.int32)  # gap token
+
+    # Map species name -> alignment row
+    species_to_row = {sp: i for i, sp in enumerate(species)}
+
+    # Map tree leaf positions to alignment rows
+    node_names = pruned_tree["node_names"]
+    parent_index = pruned_tree["parentIndex"]
+    # Leaves are nodes with no children
+    children_count = np.zeros(n_nodes, dtype=int)
+    for i in range(1, n_nodes):
+        children_count[parent_index[i]] += 1
+
+    for i in range(n_nodes):
+        if children_count[i] == 0:  # leaf
+            name = node_names[i]
+            if name in species_to_row:
+                expanded[i] = alignment[species_to_row[name]]
+
     return expanded
 
 
@@ -401,6 +424,7 @@ def precompute_maf_gpu(
     maf_path: str,
     output_dir: str,
     model,
+    guide_tree: dict,
     exclude_species: set[str] | None = None,
     min_species: int = 3,
     min_cols: int = 10,
@@ -409,8 +433,11 @@ def precompute_maf_gpu(
 ) -> list[dict]:
     """Pre-compute eigensub features for all blocks in a MAF file.
 
+    Uses the actual guide tree (pruned per block) instead of a star tree.
+
     Two-pass approach:
-    1. Scan MAF, filter excluded species, bucket blocks by tree node count
+    1. Scan MAF, filter excluded species, prune guide tree per species set,
+       bucket blocks by pruned tree node count
     2. For each bucket: concatenate columns within same-species groups,
        then vmap Counts() across groups with the same tree size
 
@@ -418,6 +445,7 @@ def precompute_maf_gpu(
         maf_path: path to .maf or .maf.gz file
         output_dir: directory for .npz output files
         model: subby DiagModel (e.g. from hky85_diag)
+        guide_tree: parsed Newick tree dict (from parse_newick)
         exclude_species: set of species names to exclude
         min_species: minimum species per block (after exclusion)
         min_cols: minimum alignment columns
@@ -433,7 +461,10 @@ def precompute_maf_gpu(
     os.makedirs(output_dir, exist_ok=True)
     t0 = time.time()
 
-    # --- Pass 1: scan, filter, bucket by tree node count ---
+    # Cache: species_key (sorted tuple) -> pruned_tree_dict or None
+    _prune_cache: dict[tuple, dict | None] = {}
+
+    # --- Pass 1: scan, filter, prune trees, bucket by node count ---
     print("  Pass 1: scanning and bucketing blocks...")
 
     buckets: dict[int, list[tuple]] = defaultdict(list)
@@ -457,12 +488,21 @@ def precompute_maf_gpu(
 
         species = [all_species[i] for i in keep]
         seqs = [all_seqs[i] for i in keep]
-        R = len(species)
-        n_nodes = 2 * R - 1
+        species_key = tuple(sorted(species))
+
+        # Prune guide tree to this species set (cached)
+        if species_key not in _prune_cache:
+            _prune_cache[species_key] = prune_tree(guide_tree, set(species))
+        pruned = _prune_cache[species_key]
+        if pruned is None:
+            n_skipped += 1
+            continue
+
+        n_nodes = len(pruned["parentIndex"])
 
         # Convert to subby alignment and expand to tree topology
         alignment = _seqs_to_subby_alignment(seqs)
-        expanded = _expand_alignment_to_tree(alignment, R)
+        expanded = _expand_alignment_to_tree(alignment, species, pruned)
 
         rec = (n_total, species, expanded, len(all_species))
         buckets[n_nodes].append(rec)
@@ -493,20 +533,19 @@ def precompute_maf_gpu(
 
     for bucket_idx, (n_nodes, recs) in enumerate(
             sorted(buckets.items(), key=lambda kv: -len(kv[1]))):
-        R = (n_nodes + 1) // 2
-
-        # Group by exact species set for column concatenation
+        # Group by exact species set (sorted) for column concatenation.
+        # Same species set -> same pruned tree -> can concatenate columns.
         species_groups: dict[tuple, list[int]] = defaultdict(list)
         for i, rec in enumerate(recs):
-            species_groups[tuple(rec[1])].append(i)
+            species_groups[tuple(sorted(rec[1]))].append(i)
 
         # Build per-group concatenated alignments
         group_data = []
         for species_key, indices in species_groups.items():
-            species = list(species_key)
-            tree_np = build_star_tree(species)
-            parent_idx = tree_np.parentIndex
-            dist = tree_np.distanceToParent
+            # Look up the cached pruned tree for this species set
+            pruned = _prune_cache[species_key]
+            parent_idx = pruned["parentIndex"]
+            dist = pruned["distanceToParent"]
 
             parts = [recs[i][2] for i in indices]
             lengths = [p.shape[1] for p in parts]
@@ -568,14 +607,15 @@ def precompute_maf_gpu(
                 for k, rec_idx in enumerate(indices):
                     L = lengths[k]
                     global_idx, species, _, n_species_orig = recs[rec_idx]
+                    n_sp = len(species)
                     block_counts = counts_group[:, :, col_offset:col_offset + L]
                     col_offset += L
 
                     features = _counts_to_features(block_counts, L)
 
                     if global_idx < validate_n:
-                        diag = validate_block(features, R, global_idx)
-                        diag['n_species_excluded'] = n_species_orig - R
+                        diag = validate_block(features, n_sp, global_idx)
+                        diag['n_species_excluded'] = n_species_orig - n_sp
                         diagnostics.append(diag)
                         print_diagnostics(diag)
 
@@ -585,14 +625,14 @@ def precompute_maf_gpu(
                         fpath,
                         features=features,
                         species=np.array(species),
-                        n_species=R,
+                        n_species=n_sp,
                         n_species_original=n_species_orig,
                         length=L,
                     )
 
                     manifest[global_idx] = {
                         'file': fname,
-                        'n_species': R,
+                        'n_species': n_sp,
                         'n_species_original': n_species_orig,
                         'length': L,
                     }
@@ -603,7 +643,7 @@ def precompute_maf_gpu(
         # Progress per bucket
         elapsed = time.time() - t1
         rate = cols_processed / elapsed if elapsed > 0 else 0
-        print(f"  tree={n_nodes:3d} nodes ({R:2d} sp): "
+        print(f"  tree={n_nodes:3d} nodes: "
               f"{len(recs):,} blocks in {len(species_groups):,} groups, "
               f"running total: {blocks_processed:,} blocks, "
               f"{cols_processed:,} cols, {rate:.0f} cols/s")
@@ -665,6 +705,8 @@ def main():
                         help="Path to MAF file (.maf or .maf.gz)")
     parser.add_argument("output_dir", type=str,
                         help="Output directory for .npz files and manifest")
+    parser.add_argument("--tree", type=str, required=True,
+                        help="Path to Newick guide tree file (.nh/.nwk)")
     parser.add_argument("--exclude-species", type=str, default="",
                         help="Comma-separated list of species to exclude")
     parser.add_argument("--min-species", type=int, default=3,
@@ -694,9 +736,16 @@ def main():
     if args.exclude_species:
         exclude_species = set(args.exclude_species.split(','))
 
+    # Load guide tree
+    with open(args.tree) as f:
+        tree_text = f.read()
+    tree_text = ''.join(tree_text.split())  # strip whitespace for multi-line Newick
+    guide_tree = parse_newick(tree_text)
+
     # Print config
     print(f"JAX devices: {jax.devices()}")
     print(f"JAX backend: {jax.default_backend()}")
+    print(f"Guide tree: {args.tree} ({len(guide_tree['leaf_names'])} leaves)")
     print(f"HKY85 model: kappa={args.kappa}, pi={pi}")
     print(f"Column bin size: {COL_BIN}")
     if exclude_species:
@@ -715,6 +764,7 @@ def main():
         args.maf_path,
         args.output_dir,
         model,
+        guide_tree=guide_tree,
         exclude_species=exclude_species,
         min_species=args.min_species,
         min_cols=args.min_cols,
