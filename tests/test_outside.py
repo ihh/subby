@@ -168,3 +168,83 @@ class TestDownwardPass:
         assert jnp.all(jnp.isfinite(D))
         assert jnp.all(D >= 0)
         assert jnp.all(jnp.isfinite(logNormD))
+
+
+class TestDownwardPassParallel:
+    """Tests for the parallel=True level-parallel downward pass."""
+
+    def test_parallel_matches_sequential(self):
+        """parallel=True should produce identical results to the default scan."""
+        tree = _make_7node_tree()
+        R = 7
+        C = 6
+        A = 4
+        key = jax.random.PRNGKey(123)
+        alignment = jax.random.randint(key, (R, C), -1, A).astype(jnp.int32)
+
+        model = jukes_cantor_model(A)
+        subMatrices = compute_sub_matrices(model, tree.distanceToParent)
+
+        U, logNormU, logLike = upward_pass(alignment, tree, subMatrices, model.pi)
+
+        D_seq, logNormD_seq = downward_pass(
+            U, logNormU, tree, subMatrices, model.pi, alignment)
+        D_par, logNormD_par = downward_pass(
+            U, logNormU, tree, subMatrices, model.pi, alignment, parallel=True)
+
+        np.testing.assert_allclose(D_par, D_seq, atol=1e-12)
+        np.testing.assert_allclose(logNormD_par, logNormD_seq, atol=1e-12)
+
+    def test_parallel_consistency_larger_tree(self):
+        """Consistency check with parallel=True on a 31-node balanced tree."""
+        R = 31
+        parentIndex = np.zeros(R, dtype=np.int32)
+        parentIndex[0] = -1
+        for i in range(1, R):
+            parentIndex[i] = (i - 1) // 2
+        parentIndex = jnp.array(parentIndex)
+        distances = jnp.ones(R) * 0.1
+        distances = distances.at[0].set(0.0)
+        tree = Tree(parentIndex=parentIndex, distanceToParent=distances)
+
+        C = 32
+        A = 4
+        key = jax.random.PRNGKey(999)
+        alignment = jax.random.randint(key, (R, C), -1, A).astype(jnp.int32)
+
+        model = jukes_cantor_model(A)
+        subMatrices = compute_sub_matrices(model, tree.distanceToParent)
+
+        U, logNormU, logLike = upward_pass(alignment, tree, subMatrices, model.pi)
+        D, logNormD = downward_pass(
+            U, logNormU, tree, subMatrices, model.pi, alignment, parallel=True)
+
+        for n in range(1, R):
+            MU = jnp.einsum('ij,cj->ci', subMatrices[n], U[n])
+            joint = jnp.sum(D[n] * MU, axis=-1)
+            log_joint = jnp.log(joint) + logNormD[n] + logNormU[n]
+            np.testing.assert_allclose(log_joint, logLike, atol=1e-4, rtol=1e-3,
+                                        err_msg=f"Node {n}")
+
+    def test_parallel_hky(self):
+        """parallel=True matches sequential with HKY85 model."""
+        tree = _make_7node_tree()
+        R = 7
+        C = 5
+        A = 4
+        pi = jnp.array([0.3, 0.2, 0.25, 0.25])
+        key = jax.random.PRNGKey(42)
+        alignment = jax.random.randint(key, (R, C), 0, A).astype(jnp.int32)
+
+        model = hky85_diag(2.0, pi)
+        subMatrices = compute_sub_matrices(model, tree.distanceToParent)
+
+        U, logNormU, logLike = upward_pass(alignment, tree, subMatrices, model.pi)
+
+        D_seq, logNormD_seq = downward_pass(
+            U, logNormU, tree, subMatrices, model.pi, alignment)
+        D_par, logNormD_par = downward_pass(
+            U, logNormU, tree, subMatrices, model.pi, alignment, parallel=True)
+
+        np.testing.assert_allclose(D_par, D_seq, atol=1e-12)
+        np.testing.assert_allclose(logNormD_par, logNormD_seq, atol=1e-12)
