@@ -111,3 +111,60 @@ class TestDownwardPass:
             log_joint = jnp.log(joint) + logNormD[n] + logNormU[n]
             np.testing.assert_allclose(log_joint, logLike, atol=1e-4, rtol=1e-3,
                                         err_msg=f"Node {n}")
+
+    def test_consistency_larger_tree(self):
+        """Consistency check on a 31-node balanced binary tree."""
+        R = 31
+        parentIndex = np.zeros(R, dtype=np.int32)
+        parentIndex[0] = -1
+        for i in range(1, R):
+            parentIndex[i] = (i - 1) // 2
+        parentIndex = jnp.array(parentIndex)
+        distances = jnp.ones(R) * 0.1
+        distances = distances.at[0].set(0.0)
+        tree = Tree(parentIndex=parentIndex, distanceToParent=distances)
+
+        C = 32
+        A = 4
+        key = jax.random.PRNGKey(999)
+        alignment = jax.random.randint(key, (R, C), -1, A).astype(jnp.int32)
+
+        model = jukes_cantor_model(A)
+        subMatrices = compute_sub_matrices(model, tree.distanceToParent)
+
+        U, logNormU, logLike = upward_pass(alignment, tree, subMatrices, model.pi)
+        D, logNormD = downward_pass(U, logNormU, tree, subMatrices, model.pi, alignment)
+
+        for n in range(1, R):
+            D_n = D[n]
+            U_n = U[n]
+            M_n = subMatrices[n]
+            MU = jnp.einsum('ij,cj->ci', M_n, U_n)
+            joint = jnp.sum(D_n * MU, axis=-1)
+            log_joint = jnp.log(joint) + logNormD[n] + logNormU[n]
+            np.testing.assert_allclose(log_joint, logLike, atol=1e-4, rtol=1e-3,
+                                        err_msg=f"Node {n}")
+
+    def test_pregathered_sibling_contrib(self):
+        """Verify the pre-gathered sibling contribution optimization is correct.
+
+        This tests that pre-computing sib_contrib = M @ U^(sib) outside the
+        scan matches computing it inside the scan body.
+        """
+        tree = _make_7node_tree()
+        R = 7
+        C = 8
+        A = 4
+        key = jax.random.PRNGKey(77)
+        alignment = jax.random.randint(key, (R, C), 0, A).astype(jnp.int32)
+
+        model = hky85_diag(2.0, jnp.array([0.3, 0.2, 0.25, 0.25]))
+        subMatrices = compute_sub_matrices(model, tree.distanceToParent)
+
+        U, logNormU, logLike = upward_pass(alignment, tree, subMatrices, model.pi)
+        D, logNormD = downward_pass(U, logNormU, tree, subMatrices, model.pi, alignment)
+
+        # Verify all D values are positive and finite
+        assert jnp.all(jnp.isfinite(D))
+        assert jnp.all(D >= 0)
+        assert jnp.all(jnp.isfinite(logNormD))

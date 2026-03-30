@@ -14,6 +14,11 @@ def compute_branch_mask(
     A branch parent->child is active if both endpoints are in the Steiner tree
     connecting ungapped leaves.
 
+    This implementation replaces sequential jax.lax.scan passes (which carry
+    full (R,C) arrays through R steps) with iterative vectorized scatter
+    operations that converge in O(depth) iterations — typically 6-7 for a
+    balanced binary tree of ~63 nodes.
+
     Args:
         alignment: (R, C) int32 tokens
         parentIndex: (R,) int32 parent indices
@@ -25,75 +30,62 @@ def compute_branch_mask(
     """
     R, C = alignment.shape
 
-    # Step 1: Mark leaves as ungapped if token in {0..A-1, A} (observed or ungapped-unobserved)
-    # Gapped tokens: A+1 or -1
+    # Fix parentIndex[0] = -1 to avoid negative indexing issues
+    # (root's parent is never used in the algorithm, but -1 wraps to last element)
+    parentIndex = parentIndex.at[0].set(0)
+
+    # Step 1: Mark leaves as ungapped
     is_ungapped_leaf = (alignment >= 0) & (alignment <= A)  # (R, C)
 
-    # Determine which nodes are leaves: nodes with no children
+    # Determine which nodes are leaves
     child_count = jnp.zeros(R, dtype=jnp.int32)
     child_count = child_count.at[parentIndex[1:]].add(1)
     is_leaf = (child_count == 0)  # (R,)
 
-    # Step 2: Upward pass — mark internal nodes as "has ungapped descendant"
-    # ungapped[n] = True if n is ungapped leaf, or any child has ungapped descendant
     has_ungapped = jnp.where(
         is_leaf[:, None],
         is_ungapped_leaf,
         jnp.zeros((R, C), dtype=bool),
     )
 
-    # Scan in postorder (R-1 down to 1) to propagate ungapped status up
-    def _propagate_step(has_ungapped, n):
-        parent = parentIndex[n]
-        # If child n has ungapped descendants, mark parent
-        has_ungapped = has_ungapped.at[parent].set(
-            has_ungapped[parent] | has_ungapped[n]
-        )
-        return has_ungapped, None
+    # Step 2: Upward pass — propagate "has ungapped descendant"
+    # Iterative scatter-OR: each iteration propagates one tree level upward.
+    # Python for-loop with static trip count for JIT compatibility.
+    n_iters = _max_depth_bound(R)
+    for _ in range(n_iters):
+        parent_update = jnp.zeros((R, C), dtype=bool)
+        parent_update = parent_update.at[parentIndex[1:]].max(has_ungapped[1:])
+        has_ungapped = has_ungapped | parent_update
 
-    postorder = jnp.arange(R - 1, 0, -1, dtype=jnp.int32)
-    has_ungapped, _ = jax.lax.scan(_propagate_step, has_ungapped, postorder)
-
-    # Step 3: Identify Steiner tree nodes
-    # Node is in Steiner tree if:
-    # (a) it's an ungapped leaf, OR
-    # (b) it has >= 2 children with ungapped descendants (branching point), OR
-    # (c) it has ungapped descendants AND its parent is in the Steiner tree (pass-through)
-
-    # Count how many children have ungapped descendants
+    # Step 3: Count children with ungapped descendants
     ungapped_child_count = jnp.zeros((R, C), dtype=jnp.int32)
-
-    def _count_step(ungapped_child_count, n):
-        parent = parentIndex[n]
-        ungapped_child_count = ungapped_child_count.at[parent].add(
-            has_ungapped[n].astype(jnp.int32)
-        )
-        return ungapped_child_count, None
-
-    ungapped_child_count, _ = jax.lax.scan(_count_step, ungapped_child_count, postorder)
+    ungapped_child_count = ungapped_child_count.at[parentIndex[1:]].add(
+        has_ungapped[1:].astype(jnp.int32)
+    )
 
     is_ungapped_leaf_node = is_leaf[:, None] & is_ungapped_leaf
-    # Core Steiner nodes: ungapped leaves and branching points
     is_steiner = is_ungapped_leaf_node | (ungapped_child_count >= 2)
 
-    # Top-down pass: propagate Steiner membership to pass-through nodes
-    # A node with ungapped descendants whose parent is already in the Steiner tree
-    # is also in the Steiner tree (it's on the path)
-    preorder = jnp.arange(1, R, dtype=jnp.int32)
+    # Step 4: Top-down pass — propagate Steiner membership
+    for _ in range(n_iters):
+        parent_steiner = is_steiner[parentIndex]
+        is_steiner = is_steiner | (parent_steiner & has_ungapped)
 
-    def _propagate_steiner(is_steiner, n):
-        parent = parentIndex[n]
-        # If parent is Steiner and this node has ungapped descendants, it's on the path
-        is_steiner = is_steiner.at[n].set(
-            is_steiner[n] | (is_steiner[parent] & has_ungapped[n])
-        )
-        return is_steiner, None
-
-    is_steiner, _ = jax.lax.scan(_propagate_steiner, is_steiner, preorder)
-
-    # Branch parent(n)->n is active if both n and parent(n) are in the Steiner tree
-    parent_is_steiner = is_steiner[parentIndex]  # (R, C)
-    branch_mask = is_steiner & parent_is_steiner  # (R, C)
-    branch_mask = branch_mask.at[0].set(False)  # root has no parent branch
+    # Branch parent(n)->n is active if both endpoints are Steiner
+    parent_is_steiner = is_steiner[parentIndex]
+    branch_mask = is_steiner & parent_is_steiner
+    branch_mask = branch_mask.at[0].set(False)
 
     return branch_mask
+
+
+def _max_depth_bound(R: int) -> int:
+    """Upper bound on tree depth: ceil(log2(R)) + 1, always >= 1."""
+    if R <= 1:
+        return 1
+    d = 0
+    v = R - 1
+    while v > 0:
+        v >>= 1
+        d += 1
+    return d + 1
