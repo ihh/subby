@@ -1,7 +1,30 @@
 from __future__ import annotations
 
+import numpy as np
 import jax
 import jax.numpy as jnp
+
+from ..formats import Tree
+
+
+# --- Geometric bin sizes for JIT cache reuse ---
+# Approximately 1.19^k, giving O(log n) distinct sizes up to any n.
+GEOM_BINS: list[int] = sorted(set(
+    max(1, round(1.19 ** k)) for k in range(120)
+))
+
+
+def pad_to_geom_bin(n: int) -> int:
+    """Return the smallest geometric bin size >= n.
+
+    Uses a precomputed sequence of ~1.19^k values so the number of distinct
+    padded sizes grows as O(log n), dramatically reducing JIT recompilation.
+    """
+    for b in GEOM_BINS:
+        if b >= n:
+            return b
+    # Beyond precomputed bins: round up to next power of 2
+    return int(2 ** np.ceil(np.log2(max(n, 1))))
 
 
 def validate_binary_tree(parentIndex: jnp.ndarray) -> None:
@@ -79,9 +102,11 @@ def token_to_likelihood(alignment: jnp.ndarray, A: int) -> jnp.ndarray:
 
 
 def pad_alignment(
-    alignment: jnp.ndarray, bin_size: int = 128,
+    alignment: jnp.ndarray,
+    bin_size: int = 128,
+    bin_fn=None,
 ) -> tuple[jnp.ndarray, int]:
-    """Pad alignment columns to the next multiple of bin_size with gap tokens.
+    """Pad alignment columns to a bin size with gap tokens.
 
     Gap-padded columns (-1) produce all-ones likelihood vectors, so they are
     mathematically neutral: logL=0, zero counts, root prior unchanged.
@@ -89,19 +114,101 @@ def pad_alignment(
 
     Args:
         alignment: (R, C) int32 tokens
-        bin_size: round C up to the next multiple of this
+        bin_size: round C up to the next multiple of this (used only when
+            bin_fn is None)
+        bin_fn: optional callable(int) -> int that returns padded size.
+            Pass ``pad_to_geom_bin`` for geometric bins.  When provided,
+            ``bin_size`` is ignored.
 
     Returns:
         (padded_alignment, C_original) where padded_alignment has
-        C_padded = ceil(C / bin_size) * bin_size columns.
+        C_padded columns.
     """
     C_original = alignment.shape[1]
-    remainder = C_original % bin_size
-    if remainder == 0:
+    if bin_fn is not None:
+        C_padded = bin_fn(C_original)
+    else:
+        remainder = C_original % bin_size
+        C_padded = C_original if remainder == 0 else C_original + bin_size - remainder
+    if C_padded == C_original:
         return alignment, C_original
-    pad_width = bin_size - remainder
+    pad_width = C_padded - C_original
     padding = jnp.full((alignment.shape[0], pad_width), -1, dtype=alignment.dtype)
     return jnp.concatenate([alignment, padding], axis=1), C_original
+
+
+def pad_tree(tree: Tree, n_nodes_padded: int) -> Tree:
+    """Pad a Tree to n_nodes_padded nodes.
+
+    Dummy nodes point to the root (parentIndex=0) with zero branch length.
+    They act as leaves with unobserved data (all-ones likelihood), so they
+    do not affect the pruning computation.
+
+    Args:
+        tree: Tree namedtuple with R nodes
+        n_nodes_padded: target number of nodes (>= R)
+
+    Returns:
+        Tree with n_nodes_padded nodes
+    """
+    R = tree.parentIndex.shape[0]
+    if n_nodes_padded <= R:
+        return tree
+    n_pad = n_nodes_padded - R
+    pad_parent = jnp.zeros(n_pad, dtype=tree.parentIndex.dtype)
+    pad_dist = jnp.zeros(n_pad, dtype=tree.distanceToParent.dtype)
+    return Tree(
+        parentIndex=jnp.concatenate([tree.parentIndex, pad_parent]),
+        distanceToParent=jnp.concatenate([tree.distanceToParent, pad_dist]),
+    )
+
+
+def pad_tree_and_alignment(
+    tree: Tree,
+    alignment: jnp.ndarray,
+    node_bin_fn=None,
+    col_bin_fn=None,
+) -> tuple[Tree, jnp.ndarray, int, int]:
+    """Pad both tree (nodes) and alignment (nodes + columns) to bin sizes.
+
+    Padded tree nodes are dummy leaves pointing to root with zero branch
+    length and unobserved (gap = -1) tokens, so they are mathematically
+    neutral in pruning.
+
+    Args:
+        tree: Tree namedtuple with R nodes
+        alignment: (R, C) int32 tokens
+        node_bin_fn: callable(int) -> int for node padding.
+            Default: ``pad_to_geom_bin``.
+        col_bin_fn: callable(int) -> int for column padding.
+            Default: ``pad_to_geom_bin``.
+
+    Returns:
+        (padded_tree, padded_alignment, n_real_nodes, n_real_cols)
+    """
+    if node_bin_fn is None:
+        node_bin_fn = pad_to_geom_bin
+    if col_bin_fn is None:
+        col_bin_fn = pad_to_geom_bin
+
+    R, C = alignment.shape[0], alignment.shape[1]
+    R_pad = node_bin_fn(R)
+    C_pad = col_bin_fn(C)
+
+    # Pad tree nodes
+    padded_tree = pad_tree(tree, R_pad)
+
+    # Pad alignment: first add rows (dummy nodes get gap tokens)
+    if R_pad > R:
+        row_padding = jnp.full((R_pad - R, C), -1, dtype=alignment.dtype)
+        alignment = jnp.concatenate([alignment, row_padding], axis=0)
+
+    # Then add columns
+    if C_pad > C:
+        col_padding = jnp.full((R_pad, C_pad - C), -1, dtype=alignment.dtype)
+        alignment = jnp.concatenate([alignment, col_padding], axis=1)
+
+    return padded_tree, alignment, R, C
 
 
 def unpad_columns(result: jnp.ndarray, C_original: int) -> jnp.ndarray:

@@ -20,7 +20,14 @@ from .eigensub import (
     eigenbasis_project_per_row, eigenbasis_project_per_row_irrev,
     back_transform_per_row, back_transform_per_row_irrev,
 )
-from ._utils import pad_alignment, unpad_columns
+from ._utils import (
+    GEOM_BINS,
+    pad_to_geom_bin,
+    pad_alignment,
+    pad_tree,
+    pad_tree_and_alignment,
+    unpad_columns,
+)
 from .f81_fast import f81_counts, f81_counts_per_branch
 from .mixture import mixture_posterior
 from .vjp import make_loglike_custom_grad, make_loglike_pade_grad, _extract_rate_matrix
